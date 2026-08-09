@@ -454,3 +454,364 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Build Checkpoints
+
+The sections above describe the *what*. This section describes the *order* — the project broken into
+ten checkpoints, each one a self-contained slice of work that ends in a demonstrable, verifiable
+state. Agents pick up the lowest-numbered incomplete checkpoint.
+
+### Definition of Done (applies to every checkpoint)
+
+Every checkpoint passes through three gates, **in order**. No gate may be skipped, and no checkpoint
+is marked ✅ until all three have passed. Work does not begin on checkpoint N+1 while N sits at an
+unpassed gate.
+
+#### Gate 1 — Test
+
+1. Every exit criterion listed for the checkpoint passes, verified by actually running the command —
+   not by reading the code and concluding it should work
+2. Unit tests covering the new code exist and pass (`uv run --extra dev pytest` for backend,
+   `npm test` for frontend)
+3. The **full** suite is green, not just the new tests — nothing from an earlier checkpoint regressed
+4. Linting is clean (`ruff check app/ tests/`; `npm run lint` and `tsc --noEmit` for frontend)
+5. Coverage has not dropped below the previous checkpoint's figure; record the new figure in the
+   status table
+
+Tests must be capable of failing for the right reason. A test that passes against a deliberately
+broken implementation is not coverage — see Checkpoint 1, where thirteen `MagicMock`-based tests
+passed against a client that could never populate the cache.
+
+#### Gate 2 — Review
+
+Only once Gate 1 is green, and before merge:
+
+1. Run `/code-review high` over the branch diff. Every **CONFIRMED** correctness finding is fixed;
+   every **PLAUSIBLE** one is either fixed or answered in writing on the PR — silently ignoring one
+   is not an outcome
+2. Run `/security-review` on any checkpoint handling untrusted input, money movement, or secrets.
+   Required for Checkpoints 3, 4, and 8; optional elsewhere
+3. Apply fixes, then **re-run Gate 1 in full**. Review fixes are code changes and break things like
+   any other
+4. Open a PR to `main`. `.github/workflows/claude-code-review.yml` reviews it automatically on open
+   and on every push. Unresolved review comments block merge
+5. Run `/simplify` on the diff before requesting merge, so the accumulated code stays legible to the
+   agents working on later checkpoints
+
+What each checkpoint's review should weight most heavily:
+
+| # | Review focus |
+|---|---|
+| 1 | Do the new tests fail when the extraction ladder, log-space shocks, or failover are reverted? |
+| 2 | Lazy DB init idempotency and concurrent first-request races; lifespan shutdown leaks |
+| 3 | Trade validation and money maths — rounding, fractional shares, avg-cost drift, oversell |
+| 4 | Untrusted LLM output reaching the trade path; prompt-injection via chat; key handling |
+| 5 | `EventSource` lifecycle — leaked connections, listeners, and timers across reconnects |
+| 6 | Render performance under a 500 ms tick; chart teardown on unmount |
+| 7 | Auto-executed actions rendered honestly, including partial and failed ones |
+| 8 | Secrets and `.env` not baked into the image; volume permissions; image size |
+| 9 | Flaky-test sources — fixed sleeps, unpinned versions, order dependence |
+| 10 | Stale claims in docs; dead code and abandoned scaffolding |
+
+#### Gate 3 — Record
+
+**This document is the project's record. It is updated as part of every checkpoint, never
+retroactively in a batch at the end.**
+
+1. Update the checkpoint's row in the status table — gates and coverage — in the same commit as the
+   work
+2. Append a **checkpoint log entry** (template and log below) recording what was actually built. Not
+   what was planned — what exists on disk when the checkpoint closed
+3. If the implementation diverged from the design, correct the affected section of this document and
+   any relevant `planning/` doc, so the spec describes the built system. An undocumented divergence
+   is how `MARKET_DATA_SUMMARY.md` came to describe a subsystem with a blocking bug as "Complete,
+   tested, reviewed"
+4. Branch name `checkpoint-N-<slug>`; merge to `main` only after Gates 1 and 2 have both passed
+
+Items 1–3 land in the same commit as the code, not a follow-up commit. A green checkpoint with a
+stale `PLAN.md` has not passed Gate 3.
+
+If an exit criterion or a gate cannot be met, do not mark the checkpoint done and move on. Set the
+row to ⛔, write a log entry describing how far it got and what blocked it, and raise it.
+
+### Status
+
+| # | Checkpoint | Depends on | G1 Test | G2 Review | G3 Record | Coverage | Status |
+|---|---|---|---|---|---|---|---|
+| 1 | Market data hardening | — | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 2 | Backend skeleton + database | 1 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 3 | Portfolio & watchlist API | 2 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 4 | LLM chat integration | 3 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 5 | Frontend scaffold + live prices | 2 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 6 | Charts, portfolio visualisation, trade bar | 3, 5 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 7 | Chat panel | 4, 6 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 8 | Docker packaging + start/stop scripts | 7 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 9 | End-to-end test suite | 8 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 10 | Polish, docs, and release readiness | 9 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+
+Legend: ⬜ not started · 🔨 in progress · ✅ complete · ⛔ blocked
+
+A checkpoint's Status may only read ✅ when G1, G2, and G3 all read ✅. Coverage records the backend
+figure at Gate 1, and must not fall from one checkpoint to the next.
+
+Checkpoints 5 and 2 unblock in parallel — frontend work can begin against the SSE endpoint as soon
+as the backend skeleton serves it, without waiting for the portfolio API.
+
+### Already built (pre-checkpoint baseline)
+
+`backend/app/market/` — the eight-module market data subsystem (models, cache, interface, seed
+prices, GBM simulator, Massive REST client, factory, SSE router) plus 73 unit tests. See
+`planning/MARKET_DATA_SUMMARY.md`. This is the starting point, not a finished component:
+Checkpoint 1 exists because `planning/MARKET_DATA_DESIGN.md` §17 identifies defects in it.
+
+---
+
+### Checkpoint 1 — Market data hardening
+
+**Goal:** bring `backend/app/market/` up to the target design before anything is built on top of it.
+Every later checkpoint reads prices from this layer, so its defects would propagate everywhere.
+
+**Scope:** the 17 changes in `planning/MARKET_DATA_DESIGN.md` §17. The highest-consequence ones:
+
+- The Massive client reads `snap.last_trade.timestamp`, which does not exist. Every snapshot raises
+  `AttributeError`, is swallowed, and skipped — with a real API key the cache stays permanently
+  empty while the app reports healthy. Replace with the `extract_price` / `extract_timestamp` ladder
+- Rebuild the Massive test fixtures from `TickerSnapshot.from_dict(...)`. `MagicMock` fabricates any
+  attribute, which is why thirteen passing tests missed the bug above
+- Drop `event_probability` to `2e-5` and apply shocks in log space, so `TICKER_PARAMS` volatility
+  is actually what the simulator produces
+- Add `start_market_data()` with fail-fast-then-fall-back-to-simulator, and classify permanent
+  (401/403) versus transient failures
+- Add `previous_close` to `PriceUpdate`, `MarketEvent` + `EventLog`, SSE heartbeats, and
+  `event: shock` / `event: status` frames
+
+**Exit criteria:**
+
+- A Massive test built from a recorded `TickerSnapshot.from_dict(...)` payload asserts the cache is
+  populated — and fails if the extraction ladder is reverted
+- Contract tests run against both `SimulatorDataSource` and `MassiveDataSource` and pass for both
+- An invalid `MASSIVE_API_KEY` logs a fallback and yields a running simulator, not an empty cache
+- A 30-second simulator run produces per-ticker realised volatility within a factor of two of the
+  configured `TICKER_PARAMS` value
+- `uv run --extra dev pytest` green; backend coverage ≥ 85% on `app/market/`
+
+---
+
+### Checkpoint 2 — Backend skeleton + database
+
+**Goal:** a running FastAPI application with a live SQLite database and a streaming price endpoint.
+
+**Scope:**
+
+- `app/main.py` — FastAPI app, lifespan handler that calls `start_market_data()` on startup and
+  stops the source on shutdown, mounts `create_stream_router()`
+- `app/db/` — `schema.sql` for the six tables in §7, a connection helper, and lazy initialisation
+  that creates and seeds on first use when the file is absent or the tables are missing
+- Seed data: the default profile at $10,000 and the ten default watchlist tickers
+- `GET /api/health`
+- Static file mount for the frontend export, tolerating an absent directory in local dev
+
+**Exit criteria:**
+
+- `uv run uvicorn app.main:app` starts and `GET /api/health` returns 200
+- Deleting `db/finally.db` and issuing any request recreates it with all six tables and the seed
+  rows — verified twice in a row, proving the path is genuinely idempotent
+- `curl -N localhost:8000/api/stream/prices` emits price frames within two seconds and a heartbeat
+  during an idle period
+- Watchlist tickers seeded in the database are the tickers the market data source was started with
+
+---
+
+### Checkpoint 3 — Portfolio & watchlist API
+
+**Goal:** the complete trading backend, so the frontend has real state to render.
+
+**Scope:**
+
+- `GET /api/portfolio` — positions with live marks, cash, total value, unrealised P&L
+- `POST /api/portfolio/trade` — validate, fill at the cached price, update position and cash, append
+  to `trades`, write a snapshot
+- `GET /api/portfolio/history` — snapshots for the P&L chart
+- `GET`/`POST`/`DELETE` watchlist, each mutation also calling `add_ticker()` / `remove_ticker()` on
+  the live source so a newly added ticker starts streaming immediately
+- Background task writing a `portfolio_snapshots` row every 30 seconds
+
+**Exit criteria:**
+
+- Unit tests cover: buy with insufficient cash rejected; sell of more shares than held rejected;
+  fractional quantities; weighted average cost after successive buys; average cost unchanged by a
+  sell; position row removed at quantity zero; zero and negative quantities rejected
+- Adding a ticker via `POST /api/watchlist` makes it appear in the SSE stream without a restart
+- Removing a ticker held as a position does not delete the position
+- A trade writes a snapshot immediately, so the P&L chart has a point at the trade time
+- Every endpoint returns the documented shape and correct status codes, including the error paths
+
+---
+
+### Checkpoint 4 — LLM chat integration
+
+**Goal:** `POST /api/chat` — the agentic core of the product.
+
+**Scope:**
+
+- LiteLLM → OpenRouter `openrouter/openai/gpt-oss-120b` with Cerebras as provider, via the
+  `cerebras` skill; structured outputs for the §9 schema
+- Portfolio context assembly, conversation history from `chat_messages`, system prompt per §9
+- Auto-execution of returned trades and watchlist changes through the *same* validation path as
+  Checkpoint 3 — no second implementation of trade logic
+- Per-action results fed back into the response so the user sees which actions succeeded or failed
+- `LLM_MOCK=true` deterministic mock path
+
+**Exit criteria:**
+
+- With `LLM_MOCK=true`, a chat request returns a schema-valid response and a mocked trade actually
+  moves cash and positions
+- A malformed or non-JSON model response produces a graceful error message to the user, never a 500
+- A trade the LLM requests that fails validation returns its error in the response rather than
+  silently vanishing
+- Messages and their actions persist to `chat_messages` and are replayed as history on the next call
+- One live (non-mocked) call succeeds against OpenRouter, confirming model id, provider routing, and
+  structured-output handling
+
+---
+
+### Checkpoint 5 — Frontend scaffold + live prices
+
+**Goal:** the terminal shell, streaming.
+
+**Scope:**
+
+- Next.js + TypeScript configured for `output: 'export'`, Tailwind with the §2 dark theme and the
+  three brand colours
+- `EventSource` hook for `/api/stream/prices` with reconnection state
+- Watchlist panel: symbol, price, daily change %, price flash on change, sparkline accumulated
+  client-side from the stream
+- Header with portfolio total, cash, and the connection status dot
+
+**Exit criteria:**
+
+- `npm run build` produces a static export in `out/` with no errors
+- Prices visibly stream and flash green/red, the flash fading rather than sticking
+- Stopping the backend turns the dot yellow then red; restarting it reconnects without a page reload
+- Sparklines accumulate progressively from page load rather than rendering empty or fabricated data
+- Component tests cover render-with-mock-data and that a flash class is applied on price change
+
+---
+
+### Checkpoint 6 — Charts, portfolio visualisation, trade bar
+
+**Goal:** the data-dense workstation of §10.
+
+**Scope:** main chart for the selected ticker, portfolio treemap heatmap, P&L line chart from
+`/api/portfolio/history`, positions table, and the trade bar.
+
+**Exit criteria:**
+
+- Clicking a watchlist row selects that ticker in the main chart
+- A buy from the trade bar updates cash, positions table, heatmap, and header total with no reload
+- The heatmap sizes by portfolio weight and colours by P&L sign, and survives an empty portfolio
+- The P&L chart renders the snapshot series and extends as new snapshots arrive
+- A rejected trade surfaces a visible error instead of failing silently
+
+---
+
+### Checkpoint 7 — Chat panel
+
+**Goal:** the AI copilot, wired end to end.
+
+**Scope:** docked collapsible sidebar, scrolling history, loading indicator, inline rendering of
+executed trades and watchlist changes.
+
+**Exit criteria:**
+
+- Sending a message shows a loading indicator, then the response
+- An LLM-executed trade appears inline as a confirmation *and* is reflected in the portfolio panels
+- An LLM watchlist addition appears in the watchlist and begins streaming
+- History survives a page reload
+- The panel collapses and expands without disturbing the rest of the layout
+
+---
+
+### Checkpoint 8 — Docker packaging + start/stop scripts
+
+**Goal:** the single-command launch promised in §2.
+
+**Scope:** the multi-stage Dockerfile of §11, `docker-compose.yml`, and the four start/stop scripts.
+
+**Exit criteria:**
+
+- `docker build .` succeeds from a clean clone with no local Node or Python toolchain assumed
+- The running container serves both the UI and the API on port 8000
+- A trade survives `stop_mac.sh` followed by `start_mac.sh` — the named volume genuinely persists
+- Running each script twice in a row is safe and produces no error
+- The container starts and functions with `MASSIVE_API_KEY` empty, and with no `.env` beyond
+  `OPENROUTER_API_KEY`
+
+---
+
+### Checkpoint 9 — End-to-end test suite
+
+**Goal:** the §12 scenarios, automated.
+
+**Scope:** `test/docker-compose.test.yml` bringing up the app container plus Playwright, and specs
+covering every scenario listed in §12, running with `LLM_MOCK=true`.
+
+**Exit criteria:**
+
+- `docker compose -f test/docker-compose.test.yml up --abort-on-container-exit` exits zero
+- Every §12 scenario has a spec: fresh start, watchlist add/remove, buy, sell, portfolio
+  visualisation, mocked chat with trade execution, and SSE reconnection
+- The suite passes three consecutive runs — flaky streaming assertions are failures, not noise
+- No test depends on a real OpenRouter or Massive key
+
+---
+
+### Checkpoint 10 — Polish, docs, and release readiness
+
+**Goal:** a project someone else can clone and run.
+
+**Scope:** README quickstart, `.env.example`, a summary doc for each subsystem matching the form of
+`MARKET_DATA_SUMMARY.md`, and a final visual pass against the §2 design intent.
+
+**Exit criteria:**
+
+- A clean clone, following only the README, reaches a working app at `localhost:8000`
+- `.env.example` documents every variable in §5 with safe defaults
+- Backend coverage ≥ 80%; `ruff`, `tsc --noEmit`, and `npm run lint` all clean
+- The UI matches §2: dark theme, brand colours, dense layout, no placeholder text or lorem ipsum
+- `planning/` docs describe what was actually built, with no stale claims left behind
+- The checkpoint log below has an entry for all ten checkpoints, and each one matches the code
+
+---
+
+### Checkpoint log
+
+Append-only. One entry per checkpoint, written at Gate 3, in the same commit as the code. Newest
+last. An agent picking up this project should be able to read the log and know the true state of the
+build without running anything.
+
+Write it as a record, not a status report: what exists, what was cut, what is known to be wrong.
+Anything a later checkpoint will trip over belongs in **Carried forward**, and every carried-forward
+item must be resolved or restated in a later entry — it does not expire by being ignored.
+
+#### Entry template
+
+```markdown
+#### Checkpoint N — <name>
+
+- **Closed:** YYYY-MM-DD · branch `checkpoint-N-<slug>` · PR #NN
+- **Built:** the modules, endpoints, and components that now exist, by path
+- **Exit criteria:** each one, with the command run and its result. Any not met, and why
+- **Tests:** counts added and total, full-suite result, backend coverage before → after
+- **Review:** `/code-review` findings by verdict, what was fixed, and the written disposition of
+  anything not fixed. `/security-review` result where required
+- **Diverged from plan:** what was built differently from the spec above, and why. "Nothing" is a
+  valid and expected answer — say it explicitly rather than omitting the field
+- **Carried forward:** known gaps, deferred work, and anything the next checkpoint must know
+```
+
+#### Entries
+
+*No checkpoints closed yet. The first entry lands with Checkpoint 1.*
