@@ -816,8 +816,9 @@ item must be resolved or restated in a later entry — it does not expire by bei
 
 #### Checkpoint 1 — Market data hardening
 
-- **Closed:** 2026-08-09 · branch `checkpoint-1-market-data-hardening` · PR #4 · all three gates
-  passed. PR open for merge; the automated review workflow runs on each push
+- **Closed:** 2026-08-09 · branch `checkpoint-1-market-data-hardening` · PR #4, squash-merged to
+  `main` · all three gates passed. The automated review workflow ran on each push and raised nothing
+  ("No buffered inline comments" on every run)
 - **Built:** all 17 changes from `MARKET_DATA_DESIGN.md` §17, across `backend/app/market/`
   - `models.py` — `normalize_ticker()`, `previous_close` + `day_change`/`day_change_percent` on
     `PriceUpdate`, new `MarketEvent`
