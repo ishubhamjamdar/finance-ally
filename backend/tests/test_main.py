@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.db import DEFAULT_USER_ID, connect, utc_now
+from app.db import connect
 from app.main import _current_market_status, _resolve_static_dir, create_app
-from app.market import MarketDataSource, create_simulator_source
+from app.market import MarketDataSource
 from app.market.simulator import SimulatorDataSource
+from tests.conftest import PLAN_DEFAULT_WATCHLIST
 
-DEFAULT_WATCHLIST = {"AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "NVDA", "META", "JPM", "V", "NFLX"}
+DEFAULT_WATCHLIST = set(PLAN_DEFAULT_WATCHLIST)
 
 
 @pytest.fixture
@@ -22,13 +22,23 @@ def fast_simulator(monkeypatch):
     monkeypatch.setenv("SIM_UPDATE_INTERVAL", "0.02")
 
 
-def add_position(ticker: str, quantity: float = 5.0) -> None:
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO positions (id, user_id, ticker, quantity, avg_cost, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), DEFAULT_USER_ID, ticker, quantity, 100.0, utc_now()),
-        )
+@pytest.fixture
+def revoked_key_source(monkeypatch):
+    """Install a source that fails permanently on demand, in place of the real
+    startup path. Shared by every failover test, so the stubbed signature of
+    start_market_data lives in one place rather than five."""
+
+    def _install(tickers: list[str]) -> "RevokedKeySource":
+        stub = RevokedKeySource(tickers)
+
+        async def fake_start(price_cache, tickers, event_log=None):
+            await stub.start(tickers)
+            return stub
+
+        monkeypatch.setattr("app.main.start_market_data", fake_start)
+        return stub
+
+    return _install
 
 
 class TestAppConstruction:
@@ -58,7 +68,7 @@ class TestLifespan:
             assert isinstance(source, SimulatorDataSource)
             assert set(source.get_tickers()) == DEFAULT_WATCHLIST
 
-    async def test_tracks_a_position_held_outside_the_watchlist(self):
+    async def test_tracks_a_position_held_outside_the_watchlist(self, add_position):
         with connect() as conn:
             conn.execute("DELETE FROM watchlist WHERE ticker = 'TSLA'")
         add_position("TSLA")
@@ -95,26 +105,20 @@ class TestLifespan:
         async with app.router.lifespan_context(app):
             app.state.market_source = None  # e.g. a failover that never completed
 
-    async def test_shutdown_stops_a_source_installed_while_it_was_stopping(self, fast_simulator):
-        """Shutdown races failover: reading app.state once would stop the dead
-        source and leave the replacement ticking forever."""
+    async def test_a_failover_completing_during_shutdown_retires_its_replacement(
+        self, fast_simulator
+    ):
+        """Shutdown and failover race. Shutdown stops one source and then ends,
+        so a replacement installed after that moment is one nothing will ever
+        stop — it would tick on past the end of the application's life."""
         app = create_app()
         cache = app.state.price_cache
 
         async with app.router.lifespan_context(app):
             original = app.state.market_source
-            replacement = create_simulator_source(cache)
-            await replacement.start(["AAPL"])
-
-            # Slip the replacement into app.state while the original is being
-            # stopped, exactly as a mid-shutdown failover would.
-            original_stop = original.stop
-
-            async def stop_then_swap():
-                app.state.market_source = replacement
-                await original_stop()
-
-            original.stop = stop_then_swap
+            app.state.shutting_down = True  # shutdown has begun
+            await original.on_permanent_failure(RuntimeError("key revoked"))
+            assert app.state.market_source is original, "installed a source during shutdown"
 
         version = cache.version
         await asyncio.sleep(0.1)
@@ -131,10 +135,11 @@ class TestLifespan:
 class RevokedKeySource(MarketDataSource):
     """Stands in for MassiveDataSource losing its key mid-session.
 
-    Reproduces the one structural detail that matters here: the failure
-    callback is awaited from *inside* this source's own background task, and
-    stop() cancels that task. A failover handler that stops the failed source
-    therefore cancels the very coroutine performing the failover.
+    Reproduces the structure that matters: the failure callback is awaited
+    from inside this source's own background task, and stop() cancels that
+    task — so it also honours the ABC's requirement to release the task before
+    awaiting the callback, which is what makes stop() safe to call from in
+    there. `stop_calls` records that the app does call it.
     """
 
     def __init__(self, tickers: list[str]) -> None:
@@ -147,12 +152,14 @@ class RevokedKeySource(MarketDataSource):
         self._tickers = list(tickers)
 
     async def trigger_permanent_failure(self) -> BaseException | None:
-        self._task = asyncio.create_task(self._fail())
-        result = await asyncio.gather(self._task, return_exceptions=True)
+        task = asyncio.create_task(self._fail())
+        self._task = task
+        result = await asyncio.gather(task, return_exceptions=True)
         return result[0] if isinstance(result[0], BaseException) else None
 
     async def _fail(self) -> None:
         assert self.on_permanent_failure is not None
+        self._task = None  # released before the callback, per the ABC
         await self.on_permanent_failure(RuntimeError("Unknown API Key"))
         self.callback_completed = True
 
@@ -181,14 +188,8 @@ class TestFailover:
         async with app.router.lifespan_context(app):
             assert app.state.market_source.on_permanent_failure is not None
 
-    async def test_swaps_in_a_running_simulator(self, monkeypatch, fast_simulator):
-        stub = RevokedKeySource(["AAPL", "PYPL"])
-
-        async def fake_start(price_cache, tickers, event_log=None):
-            await stub.start(tickers)
-            return stub
-
-        monkeypatch.setattr("app.main.start_market_data", fake_start)
+    async def test_swaps_in_a_running_simulator(self, revoked_key_source, fast_simulator):
+        stub = revoked_key_source(["AAPL", "PYPL"])
 
         app = create_app()
         async with app.router.lifespan_context(app):
@@ -198,7 +199,7 @@ class TestFailover:
             error = await stub.trigger_permanent_failure()
             assert error is None, f"the failover callback did not complete: {error!r}"
             assert stub.callback_completed is True
-            assert stub.stop_calls == 0, "stopping the failed source cancels the failover itself"
+            assert stub.stop_calls == 1, "the failed source must be stopped, not merely dropped"
 
             # The replacement inherits the live tracked set, not the startup
             # one — a ticker added mid-session must survive the swap.
@@ -211,14 +212,8 @@ class TestFailover:
             await asyncio.sleep(0.1)
             assert app.state.price_cache.version > before
 
-    async def test_shutdown_stops_the_replacement(self, monkeypatch, fast_simulator):
-        stub = RevokedKeySource(["AAPL"])
-
-        async def fake_start(price_cache, tickers, event_log=None):
-            await stub.start(tickers)
-            return stub
-
-        monkeypatch.setattr("app.main.start_market_data", fake_start)
+    async def test_shutdown_stops_the_replacement(self, revoked_key_source, fast_simulator):
+        stub = revoked_key_source(["AAPL"])
 
         app = create_app()
         async with app.router.lifespan_context(app):
@@ -229,7 +224,7 @@ class TestFailover:
         await asyncio.sleep(0.1)
         assert cache.version == version, "the replacement simulator outlived shutdown"
 
-    async def test_a_failing_failover_clears_the_dead_source(self, monkeypatch):
+    async def test_a_failing_failover_clears_the_dead_source(self, monkeypatch, revoked_key_source):
         """If the replacement cannot start, the app must not go on advertising
         the source that just died.
 
@@ -238,16 +233,10 @@ class TestFailover:
         but "Task exception was never retrieved" — while /api/health keeps
         reporting a live Massive feed that has not ticked in an hour.
         """
-        stub = RevokedKeySource(["AAPL"])
-
-        async def fake_start(price_cache, tickers, event_log=None):
-            await stub.start(tickers)
-            return stub
+        stub = revoked_key_source(["AAPL"])
 
         def exploding_simulator(price_cache, event_log=None):
             raise ValueError("degenerate SIM_UPDATE_INTERVAL")
-
-        monkeypatch.setattr("app.main.start_market_data", fake_start)
 
         app = create_app()
         async with app.router.lifespan_context(app):
@@ -257,32 +246,20 @@ class TestFailover:
             assert error is None, f"the exception escaped the callback: {error!r}"
             assert app.state.market_source is None
 
-    async def test_the_replacement_can_itself_fail_over(self, monkeypatch, fast_simulator):
+    async def test_the_replacement_can_itself_fail_over(self, revoked_key_source, fast_simulator):
         """The callback is reassigned to the replacement, so a future source
         installed by failover is no less protected than the first one."""
-        stub = RevokedKeySource(["AAPL"])
-
-        async def fake_start(price_cache, tickers, event_log=None):
-            await stub.start(tickers)
-            return stub
-
-        monkeypatch.setattr("app.main.start_market_data", fake_start)
+        stub = revoked_key_source(["AAPL"])
 
         app = create_app()
         async with app.router.lifespan_context(app):
             await stub.trigger_permanent_failure()
             assert app.state.market_source.on_permanent_failure is not None
 
-    async def test_status_provider_follows_the_swap(self, monkeypatch):
+    async def test_status_provider_follows_the_swap(self, revoked_key_source):
         """The SSE `status` frame must report the live source, not the dead one."""
-        stub = RevokedKeySource(["AAPL"])
+        stub = revoked_key_source(["AAPL"])
         stub.market_status = "closed"
-
-        async def fake_start(price_cache, tickers, event_log=None):
-            await stub.start(tickers)
-            return stub
-
-        monkeypatch.setattr("app.main.start_market_data", fake_start)
 
         app = create_app()
         async with app.router.lifespan_context(app):

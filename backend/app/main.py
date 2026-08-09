@@ -27,6 +27,7 @@ from app.market import (
     create_stream_router,
     start_market_data,
 )
+from app.paths import BACKEND_DIR, REPO_ROOT, is_source_checkout
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -36,10 +37,11 @@ logger = logging.getLogger(__name__)
 
 #: Where the built frontend is looked for, in order, when STATIC_DIR is unset.
 #: `backend/static/` is where the Dockerfile drops the Next.js export;
-#: `frontend/out/` is where `npm run build` leaves it during local development.
-_BACKEND_DIR = Path(__file__).resolve().parents[1]
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_STATIC_CANDIDATES = (_BACKEND_DIR / "static", _REPO_ROOT / "frontend" / "out")
+#: `frontend/out/` is where `npm run build` leaves it during local development,
+#: and is only a meaningful guess inside a source checkout.
+_STATIC_CANDIDATES = (BACKEND_DIR / "static",) + (
+    (REPO_ROOT / "frontend" / "out",) if is_source_checkout() else ()
+)
 
 
 def create_app() -> FastAPI:
@@ -60,6 +62,7 @@ def create_app() -> FastAPI:
     app.state.price_cache = price_cache
     app.state.event_log = event_log
     app.state.market_source = None
+    app.state.shutting_down = False
 
     app.include_router(health_router)
     app.include_router(
@@ -97,17 +100,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # Looped, because a failover can install a replacement while we are
-        # awaiting stop() on the source it replaced. Reading the state once
-        # would stop the dead source, null the slot, and leave the freshly
-        # started simulator ticking past shutdown.
-        while (current := app.state.market_source) is not None:
-            app.state.market_source = None
+        # Set before the first await: from here on no failover may install a
+        # replacement, so shutdown has one source to stop and cannot leave a
+        # freshly started simulator ticking behind it.
+        app.state.shutting_down = True
+        current = app.state.market_source
+        app.state.market_source = None
+        if current is not None:
             await current.stop()
 
 
 def _current_market_status(app: FastAPI) -> str | None:
-    source = getattr(app.state, "market_source", None)
+    source = app.state.market_source
     return source.market_status if source is not None else None
 
 
@@ -124,10 +128,6 @@ def _make_failover_handler(app: FastAPI) -> Callable[[Exception], Awaitable[None
         failed = app.state.market_source
         logger.error("Market data source failed permanently (%s) — switching to the simulator", exc)
 
-        # Deliberately NOT `await failed.stop()`. This callback runs inside the
-        # failed source's own polling task, and stop() cancels that task — the
-        # task would be cancelling itself mid-await. The poll loop returns as
-        # soon as this returns, so the task ends on its own anyway.
         tickers = failed.get_tickers() if failed is not None else []
 
         try:
@@ -143,7 +143,15 @@ def _make_failover_handler(app: FastAPI) -> Callable[[Exception], Awaitable[None
             app.state.market_source = None
             return
 
+        if app.state.shutting_down:
+            # Shutdown began while the replacement was starting. Nothing will
+            # ever stop a source installed now, so retire it here instead.
+            await fallback.stop()
+            return
+
         app.state.market_source = fallback
+        if failed is not None:
+            await failed.stop()  # safe from in here: see MarketDataSource.on_permanent_failure
         logger.info("Simulator took over for %d tickers", len(tickers))
 
     return on_permanent_failure

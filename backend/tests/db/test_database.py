@@ -24,36 +24,27 @@ from app.db import (
 )
 from app.db.database import _DEFAULT_DB_PATH, _SCHEMA_PATH
 from app.market import DEFAULT_TICKERS
+from tests.conftest import PLAN_DEFAULT_WATCHLIST
 
-# PLAN.md §7 spells these out. Written here as a literal, not imported, so that
-# a change to the market module's seed list cannot silently redefine what the
-# plan says the default watchlist is.
-PLAN_DEFAULT_WATCHLIST = (
-    "AAPL",
-    "GOOGL",
-    "MSFT",
-    "AMZN",
-    "TSLA",
-    "NVDA",
-    "META",
-    "JPM",
-    "V",
-    "NFLX",
-)
+
+class _WalAlwaysBusy(sqlite3.Connection):
+    """A connection that always loses the race to switch journal_mode.
+
+    Subclassed rather than monkeypatched: `Connection.execute` is read-only.
+    """
+
+    wal_attempts = 0
+
+    def execute(self, sql, *args):  # type: ignore[override]
+        if "journal_mode" in sql:
+            self.wal_attempts += 1
+            raise sqlite3.OperationalError("database is locked")
+        return super().execute(sql, *args)
 
 
 def table_names(conn: sqlite3.Connection) -> set[str]:
     rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     return {row[0] for row in rows}  # index, not key: also used on raw connections
-
-
-def add_position(ticker: str, quantity: float, user_id: str = DEFAULT_USER_ID) -> None:
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO positions (id, user_id, ticker, quantity, avg_cost, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), user_id, ticker, quantity, 100.0, utc_now()),
-        )
 
 
 class TestSchema:
@@ -102,6 +93,23 @@ class TestSchema:
                 "INSERT INTO trades (id, user_id, ticker, side, quantity, price, executed_at)"
                 " VALUES ('t', 'default', 'AAPL', 'hodl', 1, 1.0, 'now')"
             )
+
+    def test_a_contended_wal_switch_does_not_fail_the_connection(self):
+        """journal_mode is a property of the file, so switching it takes a brief
+        exclusive lock — and SQLite returns SQLITE_BUSY for that *without*
+        consulting the busy handler, so no timeout can absorb it. Losing that
+        race is harmless (the winner sets the same mode), and raising would turn
+        a burst of first requests into 500s.
+
+        Driven directly rather than by racing threads, which reproduced this
+        only about one run in six.
+        """
+        conn = sqlite3.connect(":memory:", factory=_WalAlwaysBusy)
+        try:
+            database._configure(conn)  # must not raise
+            assert conn.wal_attempts == 1, "the WAL switch was never attempted"
+        finally:
+            conn.close()
 
     def test_wal_mode_is_enabled(self):
         with connect() as conn:
@@ -170,8 +178,7 @@ class TestLazyInitialisation:
         with connect() as conn:
             conn.execute("UPDATE users_profile SET cash_balance = 1.0")
 
-        for path in temp_db.parent.glob("test.db*"):  # plus the -wal and -shm sidecars
-            path.unlink()
+        temp_db.delete()  # the file and its -wal / -shm sidecars
         assert not temp_db.exists()
 
         with connect() as conn:
@@ -207,7 +214,7 @@ class TestLazyInitialisation:
             lambda conn: pytest.fail("reseeded a database another thread had just created"),
         )
 
-        conn = sqlite3.connect(temp_db)
+        conn = sqlite3.connect(temp_db.path)
         try:
             ensure_initialized(conn)
         finally:
@@ -237,8 +244,8 @@ class TestLazyInitialisation:
                 with connect():
                     pass
 
-        assert get_db_path() == temp_db, "the seed patch must not revert DB_PATH"
-        leftover = sqlite3.connect(temp_db)
+        assert get_db_path() == temp_db.path, "the seed patch must not revert DB_PATH"
+        leftover = sqlite3.connect(temp_db.path)
         try:
             assert table_names(leftover) & set(REQUIRED_TABLES) == set()
         finally:
@@ -345,22 +352,22 @@ class TestLoadTrackedTickers:
     def test_returns_the_seeded_watchlist(self):
         assert load_tracked_tickers() == sorted(PLAN_DEFAULT_WATCHLIST)
 
-    def test_includes_held_positions_outside_the_watchlist(self):
+    def test_includes_held_positions_outside_the_watchlist(self, add_position):
         """MARKET_DATA_DESIGN.md §13.4: a position outlives its watchlist row,
         and must keep being priced or the portfolio total silently loses it."""
         add_position("PYPL", 5.0)
         assert "PYPL" in load_tracked_tickers()
 
-    def test_does_not_duplicate_a_ticker_that_is_both(self):
+    def test_does_not_duplicate_a_ticker_that_is_both(self, add_position):
         add_position("AAPL", 3.0)
         tickers = load_tracked_tickers()
         assert tickers.count("AAPL") == 1
 
-    def test_excludes_a_fully_sold_position(self):
+    def test_excludes_a_fully_sold_position(self, add_position):
         add_position("ZZZZ", 0.0)
         assert "ZZZZ" not in load_tracked_tickers()
 
-    def test_deduplicates_case_variants_of_the_same_ticker(self):
+    def test_deduplicates_case_variants_of_the_same_ticker(self, add_position):
         """UNION compares raw strings and the UNIQUE constraint is
         case-sensitive, so 'aapl' alongside 'AAPL' reaches the query as two
         rows — and would be streamed, priced and requested twice."""
@@ -386,7 +393,7 @@ class TestLoadTrackedTickers:
         assert "PYPL" in tickers
         assert tickers == sorted(tickers)
 
-    def test_ignores_another_users_rows(self):
+    def test_ignores_another_users_rows(self, add_position):
         add_position("OTHR", 5.0, user_id="someone-else")
         assert "OTHR" not in load_tracked_tickers()
 

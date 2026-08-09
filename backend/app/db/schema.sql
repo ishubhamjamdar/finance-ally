@@ -11,9 +11,13 @@
 -- Money and quantities are REAL. Fractional shares are supported by design
 -- (PLAN.md §7), so an integer quantity column would be wrong.
 
+-- cash_balance has no SQL default on purpose: _seed() always passes
+-- STARTING_CASH explicitly, so a default here would be a second, unexercised
+-- definition of the opening balance, free to drift from the Python one with no
+-- test able to notice.
 CREATE TABLE IF NOT EXISTS users_profile (
     id           TEXT PRIMARY KEY DEFAULT 'default',
-    cash_balance REAL NOT NULL DEFAULT 10000.0,
+    cash_balance REAL NOT NULL,
     created_at   TEXT NOT NULL
 );
 

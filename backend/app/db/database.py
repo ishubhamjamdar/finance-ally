@@ -8,7 +8,13 @@ all behave identically.
 Threading model: one connection per operation, closed when the operation ends.
 FastAPI runs `def` handlers in a worker thread, so a shared connection would
 need `check_same_thread=False` plus external serialisation; opening a fresh one
-costs microseconds against a local file and sidesteps the whole question.
+sidesteps the whole question.
+
+That costs about 500 µs, measured — not the "microseconds" one might assume.
+Most of it is WAL: because no connection is ever held open, every operation is
+the last one to close, so it creates the `-wal`/`-shm` sidecars, checkpoints,
+and unlinks them again. Fine for endpoints at human cadence, which is all of
+them; worth remembering before putting a database read on the 500 ms tick.
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.market import DEFAULT_TICKERS, normalize_ticker
+from app.paths import REPO_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +42,7 @@ _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 #: Repo-root `db/finally.db` — the directory PLAN.md §11 volume-mounts to
 #: /app/db in the container. In the image the package does not sit under the
 #: repo root, so the Dockerfile sets DB_PATH explicitly.
-_DEFAULT_DB_PATH = Path(__file__).resolve().parents[3] / "db" / "finally.db"
+_DEFAULT_DB_PATH = REPO_ROOT / "db" / "finally.db"
 
 #: The tables `_is_initialized` looks for. Checked per connection rather than
 #: cached in a module flag: a flag would make the process believe a database it
@@ -84,16 +91,37 @@ def connect() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(path, timeout=10.0, isolation_level=None)
     try:
         conn.row_factory = sqlite3.Row
-        # WAL lets the SSE stream and snapshot writer read while a trade
-        # writes. busy_timeout covers the writer-vs-writer case that WAL does
-        # not: block for up to 5 s rather than raising "database is locked".
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("PRAGMA foreign_keys=ON")
+        _configure(conn)
         ensure_initialized(conn)
         yield conn
     finally:
         conn.close()
+
+
+def _configure(conn: sqlite3.Connection) -> None:
+    """Per-connection PRAGMAs.
+
+    Order matters. busy_timeout comes first because the WAL switch below is
+    what needs it: journal_mode is a property of the *file*, so changing it
+    takes a brief exclusive lock, and several threads opening a cold database
+    at once will collide over it.
+
+    WAL itself lets the SSE stream and the snapshot writer read while a trade
+    writes; busy_timeout covers the writer-versus-writer case WAL does not,
+    blocking for up to 5 s instead of raising "database is locked".
+    """
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        # SQLite returns SQLITE_BUSY for a contended journal_mode change
+        # *without* consulting the busy handler, so the timeout above cannot
+        # help here. Losing the race is harmless: the connection that won is
+        # setting the very same mode on the very same file. Raising instead
+        # would turn a burst of first requests into 500s — a browser opening
+        # the page fires several before the first one finishes.
+        logger.debug("journal_mode=WAL is busy; another connection is setting it")
 
 
 @contextmanager
@@ -228,14 +256,16 @@ def load_tracked_tickers(user_id: str = DEFAULT_USER_ID) -> list[str]:
         rows = conn.execute(
             """
             SELECT ticker FROM watchlist WHERE user_id = ?
-            UNION
+            UNION ALL
             SELECT ticker FROM positions WHERE user_id = ? AND quantity != 0
             """,
             (user_id, user_id),
         ).fetchall()
 
-    # Deduplicated AFTER normalising, not by the UNION. UNION compares the raw
-    # strings and the UNIQUE (user_id, ticker) constraint is case-sensitive, so
-    # 'aapl' and 'AAPL' both survive the query and both normalise to AAPL —
-    # which would price the same ticker twice and bloat every Massive request.
+    # Deduplicated here, not by the query — hence UNION ALL above rather than
+    # UNION, which would sort and dedupe on the raw strings only to have it
+    # redone. SQL comparison is case-sensitive, as is the UNIQUE (user_id,
+    # ticker) constraint, so 'aapl' and 'AAPL' would both survive it and both
+    # normalise to AAPL: the same ticker priced twice, and sent twice in every
+    # Massive request.
     return sorted({normalize_ticker(row["ticker"]) for row in rows})

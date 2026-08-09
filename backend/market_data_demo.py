@@ -21,14 +21,14 @@ from rich.text import Text
 
 from app.market.cache import PriceCache
 from app.market.events import EventLog
-from app.market.seed_prices import SEED_PRICES
+from app.market.seed_prices import DEFAULT_TICKERS, SEED_PRICES
 from app.market.simulator import SimulatorDataSource
 
 # Sparkline characters, low to high
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
 # Ordered ticker list matching the default watchlist
-TICKERS = ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "NVDA", "META", "JPM", "V", "NFLX"]
+TICKERS = list(DEFAULT_TICKERS)  # the seeded watchlist, not a hand-copied echo of it
 
 DURATION = 60  # seconds
 

@@ -14,18 +14,39 @@ uv sync --extra dev   # Install all dependencies including test/lint tools
 database's tracked tickers, wires `on_permanent_failure` so a dying Massive key
 hot-swaps to the simulator, and stops the source on shutdown.
 
-Reach the live objects through `request.app.state`, never a module global:
+Reach the live objects through `request.app.state`, never a module global — and
+re-read them per request, because failover replaces `market_source` mid-session.
+`market_source` is also `None` before startup, after shutdown, and after a
+failover that could not start a replacement.
+
+**Checkpoint 3 should add `app/api/deps.py`** with the two providers
+`MARKET_DATA_DESIGN.md` §13.1 specifies — `get_price_cache(request)` and
+`get_market_source(request)`, the latter raising `HTTPException(503)` on the
+`None` case — rather than each of its six handlers repeating that check. They
+also make `app.dependency_overrides` available for pointing trade tests at a
+stub cache. `/api/health` is the deliberate exception: reporting "no source" is
+its job, so it reads `app.state` directly.
+
+### Handler colour: `async def`, with blocking work offloaded
+
+Database calls block and `source.add_ticker()` is a coroutine, so a watchlist
+handler needs both. Write handlers `async def` and push the SQLite work to a
+thread:
 
 ```python
-@router.post("/portfolio/trade")
-def execute_trade(payload: TradeRequest, request: Request):
-    price_cache = request.app.state.price_cache
-    source = request.app.state.market_source   # replaced on failover — re-read it
+from fastapi.concurrency import run_in_threadpool
+
+@router.post("/watchlist")
+async def add_to_watchlist(payload: WatchlistAdd, request: Request):
+    ticker = normalize_ticker(payload.ticker)
+    await run_in_threadpool(db.add_watchlist_entry, ticker)
+    await request.app.state.market_source.add_ticker(ticker)
 ```
 
-`market_source` is `None` before startup and after shutdown. Handlers that
-mutate the watchlist must call `source.add_ticker()` / `remove_ticker()` in the
-same handler as the database write (MARKET_DATA_DESIGN.md §13.4).
+A plain `def` handler would run in a worker thread automatically but cannot
+`await` the source, and mutating the watchlist without telling the source is
+what leaves a newly added ticker permanently unpriced
+(MARKET_DATA_DESIGN.md §13.4). Database write first, source second, one handler.
 
 Static files are mounted at `/` **after** every router. `StaticFiles` at the
 root matches every path, so mounting it earlier would swallow `/api/*`.
@@ -48,10 +69,11 @@ Import from `app.db` only, the same contract `app.market` keeps.
   must keep being priced or the portfolio total silently loses it
 - **`utc_now()`** — the ISO-8601 string every `*_at` column stores
 
-One connection per operation, opened and closed inside the helper. Write route
-handlers as `def`, not `async def`, so FastAPI runs the blocking query in a
-worker thread instead of stalling the event loop that drives the simulator tick
-and every open SSE stream.
+One connection per operation, opened and closed inside the helper — about
+500 µs each, most of it WAL sidecar setup, since no connection is held open.
+Fine at human cadence; never put one on the 500 ms tick. Offload it from async
+handlers with `run_in_threadpool` so it does not stall the event loop that
+drives the simulator and every open SSE stream.
 
 ### Lazy initialisation
 

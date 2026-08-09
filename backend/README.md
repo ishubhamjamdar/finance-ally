@@ -47,14 +47,9 @@ per-test temporary file and clears `MASSIVE_API_KEY`.
 
 ## Environment Variables
 
-| Var | Default | Meaning |
-|---|---|---|
-| `DB_PATH` | `<repo>/db/finally.db` | SQLite file. The container sets it to `/app/db/finally.db`, the volume mount |
-| `STATIC_DIR` | `backend/static`, then `frontend/out` | Built frontend. Absent is fine — the API still serves |
-| `LOG_LEVEL` | `INFO` | Root log level |
-| `MASSIVE_API_KEY` | *(empty)* | Non-empty selects real market data; otherwise the simulator |
-
-See `CLAUDE.md` for the market data subsystem's own variables.
+Every one has a working default: the app runs with no `.env` at all. The full
+table — paths, logging, and the market data tuning knobs — is in `CLAUDE.md`,
+kept in one place so the two documents cannot drift.
 
 ## Development
 
