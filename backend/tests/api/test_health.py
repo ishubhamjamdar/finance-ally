@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import sqlite3
+from contextlib import contextmanager
+
 import pytest
 from fastapi.testclient import TestClient
 
+from app.db import connect
 from app.main import create_app
 
 
@@ -39,6 +43,33 @@ def test_creates_the_database_on_first_request(client, temp_db):
 
         assert client.get("/api/health").status_code == 200
         assert temp_db.exists()
+
+
+def test_reports_503_when_the_profile_row_is_missing(client, temp_db, monkeypatch):
+    """Structure is not health. A database whose tables exist but whose seed
+    never landed answers `SELECT 1 ... LIMIT 1` without error and can still
+    serve nothing.
+
+    Handed a raw connection deliberately: `connect()` repairs this state on its
+    own, and the point here is that the probe reports honestly on whatever
+    database it is given rather than relying on that repair.
+    """
+    with connect() as conn:
+        conn.execute("DELETE FROM users_profile")
+
+    @contextmanager
+    def unseeded():
+        conn = sqlite3.connect(temp_db)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    monkeypatch.setattr("app.api.health.connect", unseeded)
+
+    response = client.get("/api/health")
+    assert response.status_code == 503
+    assert response.json()["database"] == "error"
 
 
 def test_reports_503_when_the_database_is_unusable(client, monkeypatch):

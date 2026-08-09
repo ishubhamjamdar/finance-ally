@@ -97,10 +97,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        current = app.state.market_source
-        if current is not None:
+        # Looped, because a failover can install a replacement while we are
+        # awaiting stop() on the source it replaced. Reading the state once
+        # would stop the dead source, null the slot, and leave the freshly
+        # started simulator ticking past shutdown.
+        while (current := app.state.market_source) is not None:
+            app.state.market_source = None
             await current.stop()
-        app.state.market_source = None
 
 
 def _current_market_status(app: FastAPI) -> str | None:
@@ -127,8 +130,19 @@ def _make_failover_handler(app: FastAPI) -> Callable[[Exception], Awaitable[None
         # soon as this returns, so the task ends on its own anyway.
         tickers = failed.get_tickers() if failed is not None else []
 
-        fallback = create_simulator_source(app.state.price_cache, event_log=app.state.event_log)
-        await fallback.start(tickers)
+        try:
+            fallback = create_simulator_source(app.state.price_cache, event_log=app.state.event_log)
+            fallback.on_permanent_failure = on_permanent_failure
+            await fallback.start(tickers)
+        except Exception:
+            # The caller is an `except` block in the failed source's task, so an
+            # exception here escapes as nothing more than "Task exception was
+            # never retrieved" — and leaves app.state pointing at the dead
+            # source, which /api/health would go on reporting as the live one.
+            logger.exception("Failover to the simulator failed; no market data source is running")
+            app.state.market_source = None
+            return
+
         app.state.market_source = fallback
         logger.info("Simulator took over for %d tickers", len(tickers))
 

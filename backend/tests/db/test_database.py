@@ -44,7 +44,7 @@ PLAN_DEFAULT_WATCHLIST = (
 
 def table_names(conn: sqlite3.Connection) -> set[str]:
     rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-    return {row["name"] for row in rows}
+    return {row[0] for row in rows}  # index, not key: also used on raw connections
 
 
 def add_position(ticker: str, quantity: float, user_id: str = DEFAULT_USER_ID) -> None:
@@ -200,7 +200,7 @@ class TestLazyInitialisation:
         a database that is already in use.
         """
         looks = iter([False, True])
-        monkeypatch.setattr(database, "_tables_present", lambda conn: next(looks))
+        monkeypatch.setattr(database, "_is_initialized", lambda conn: next(looks))
         monkeypatch.setattr(
             database,
             "_seed",
@@ -213,28 +213,64 @@ class TestLazyInitialisation:
         finally:
             conn.close()
 
-    def test_a_failure_mid_initialisation_leaves_no_half_built_schema(self, monkeypatch):
+    def test_a_failure_mid_initialisation_leaves_no_half_built_schema(self, temp_db):
         """Schema and seed land together or not at all.
 
-        SQLite makes DDL transactional, so rolling back really does drop the
-        tables. Without the rollback the next request would find all six tables
-        present, skip initialisation, and run against an unseeded database with
-        no profile row and an empty watchlist.
+        SQLite makes DDL transactional, so a genuine rollback drops the tables
+        again. Without it the next request finds all six tables present, skips
+        initialisation, and runs forever against a database with no cash
+        balance and an empty watchlist.
+
+        The `_seed` patch uses its own MonkeyPatch context. Undoing the shared
+        function-scoped one would also revert the autouse DB_PATH fixture, and
+        every assertion below would silently run against — and write to — the
+        developer's real database, which is how this test first passed against
+        an implementation that did not roll back at all.
         """
 
         def failing_seed(conn):
             raise sqlite3.OperationalError("disk I/O error")
 
-        monkeypatch.setattr("app.db.database._seed", failing_seed)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(database, "_seed", failing_seed)
+            with pytest.raises(sqlite3.OperationalError):
+                with connect():
+                    pass
 
-        with pytest.raises(sqlite3.OperationalError):
-            with connect():
-                pass
+        assert get_db_path() == temp_db, "the seed patch must not revert DB_PATH"
+        leftover = sqlite3.connect(temp_db)
+        try:
+            assert table_names(leftover) & set(REQUIRED_TABLES) == set()
+        finally:
+            leftover.close()
 
-        monkeypatch.undo()
+        # And the retry succeeds, rather than finding a poisoned database.
         with connect() as conn:
             assert set(REQUIRED_TABLES) <= table_names(conn)
             assert conn.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0] == 10
+
+    def test_repairs_a_database_with_tables_but_no_profile(self, temp_db):
+        """Tables alone do not mean initialised.
+
+        Any database that reaches this state — an older build, a restore, a
+        process killed mid-init — must heal on the next connection instead of
+        serving requests with no cash balance.
+        """
+        with connect() as conn:
+            conn.execute("DELETE FROM users_profile")
+            conn.execute("DELETE FROM watchlist")
+
+        with connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM users_profile").fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0] == 10
+
+    def test_schema_is_executed_statement_by_statement(self):
+        """`executescript` would commit the enclosing transaction out from
+        under initialisation, so the schema is split and executed directly."""
+        statements = database._schema_statements()
+        assert len(statements) == len(REQUIRED_TABLES) + 3  # six tables, three indexes
+        assert all(s.count("CREATE ") == 1 for s in statements)
+        assert all(s.rstrip().endswith(";") for s in statements)
 
     def test_concurrent_first_requests_initialise_once(self):
         """Ten threads racing on a cold database must not seed ten times.
@@ -323,6 +359,21 @@ class TestLoadTrackedTickers:
     def test_excludes_a_fully_sold_position(self):
         add_position("ZZZZ", 0.0)
         assert "ZZZZ" not in load_tracked_tickers()
+
+    def test_deduplicates_case_variants_of_the_same_ticker(self):
+        """UNION compares raw strings and the UNIQUE constraint is
+        case-sensitive, so 'aapl' alongside 'AAPL' reaches the query as two
+        rows — and would be streamed, priced and requested twice."""
+        with connect() as conn:
+            conn.execute(
+                "INSERT INTO watchlist (id, user_id, ticker, added_at) VALUES (?,?,?,?)",
+                (str(uuid.uuid4()), DEFAULT_USER_ID, "aapl", utc_now()),
+            )
+        add_position("Aapl", 2.0)
+
+        tickers = load_tracked_tickers()
+        assert tickers.count("AAPL") == 1
+        assert len(tickers) == 10
 
     def test_normalises_and_sorts(self):
         """A lower-case row from any writer must not reach a case-sensitive API."""

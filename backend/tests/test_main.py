@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.db import DEFAULT_USER_ID, connect, utc_now
 from app.main import _current_market_status, _resolve_static_dir, create_app
-from app.market import MarketDataSource
+from app.market import MarketDataSource, create_simulator_source
 from app.market.simulator import SimulatorDataSource
 
 DEFAULT_WATCHLIST = {"AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "NVDA", "META", "JPM", "V", "NFLX"}
@@ -94,6 +94,31 @@ class TestLifespan:
         app = create_app()
         async with app.router.lifespan_context(app):
             app.state.market_source = None  # e.g. a failover that never completed
+
+    async def test_shutdown_stops_a_source_installed_while_it_was_stopping(self, fast_simulator):
+        """Shutdown races failover: reading app.state once would stop the dead
+        source and leave the replacement ticking forever."""
+        app = create_app()
+        cache = app.state.price_cache
+
+        async with app.router.lifespan_context(app):
+            original = app.state.market_source
+            replacement = create_simulator_source(cache)
+            await replacement.start(["AAPL"])
+
+            # Slip the replacement into app.state while the original is being
+            # stopped, exactly as a mid-shutdown failover would.
+            original_stop = original.stop
+
+            async def stop_then_swap():
+                app.state.market_source = replacement
+                await original_stop()
+
+            original.stop = stop_then_swap
+
+        version = cache.version
+        await asyncio.sleep(0.1)
+        assert cache.version == version, "the replacement outlived shutdown"
 
     async def test_creates_the_database_on_a_cold_start(self, temp_db):
         assert not temp_db.exists()
@@ -203,6 +228,50 @@ class TestFailover:
         version = cache.version
         await asyncio.sleep(0.1)
         assert cache.version == version, "the replacement simulator outlived shutdown"
+
+    async def test_a_failing_failover_clears_the_dead_source(self, monkeypatch):
+        """If the replacement cannot start, the app must not go on advertising
+        the source that just died.
+
+        The callback is awaited from an `except` block inside the failed
+        source's own task, so an exception escaping here surfaces as nothing
+        but "Task exception was never retrieved" — while /api/health keeps
+        reporting a live Massive feed that has not ticked in an hour.
+        """
+        stub = RevokedKeySource(["AAPL"])
+
+        async def fake_start(price_cache, tickers, event_log=None):
+            await stub.start(tickers)
+            return stub
+
+        def exploding_simulator(price_cache, event_log=None):
+            raise ValueError("degenerate SIM_UPDATE_INTERVAL")
+
+        monkeypatch.setattr("app.main.start_market_data", fake_start)
+
+        app = create_app()
+        async with app.router.lifespan_context(app):
+            monkeypatch.setattr("app.main.create_simulator_source", exploding_simulator)
+
+            error = await stub.trigger_permanent_failure()
+            assert error is None, f"the exception escaped the callback: {error!r}"
+            assert app.state.market_source is None
+
+    async def test_the_replacement_can_itself_fail_over(self, monkeypatch, fast_simulator):
+        """The callback is reassigned to the replacement, so a future source
+        installed by failover is no less protected than the first one."""
+        stub = RevokedKeySource(["AAPL"])
+
+        async def fake_start(price_cache, tickers, event_log=None):
+            await stub.start(tickers)
+            return stub
+
+        monkeypatch.setattr("app.main.start_market_data", fake_start)
+
+        app = create_app()
+        async with app.router.lifespan_context(app):
+            await stub.trigger_permanent_failure()
+            assert app.state.market_source.on_permanent_failure is not None
 
     async def test_status_provider_follows_the_swap(self, monkeypatch):
         """The SSE `status` frame must report the live source, not the dead one."""

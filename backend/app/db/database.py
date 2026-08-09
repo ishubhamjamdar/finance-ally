@@ -37,10 +37,10 @@ _SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 #: repo root, so the Dockerfile sets DB_PATH explicitly.
 _DEFAULT_DB_PATH = Path(__file__).resolve().parents[3] / "db" / "finally.db"
 
-#: Presence of all of these is what "initialised" means. Checked per
-#: connection rather than cached in a module flag: a flag would make the
-#: process believe a database it created still exists, and serve `no such
-#: table` for the rest of its life once the file was deleted underneath it.
+#: The tables `_is_initialized` looks for. Checked per connection rather than
+#: cached in a module flag: a flag would make the process believe a database it
+#: created still exists, and serve `no such table` for the rest of its life
+#: once the file was deleted underneath it.
 REQUIRED_TABLES = (
     "users_profile",
     "watchlist",
@@ -115,22 +115,26 @@ def transaction() -> Iterator[sqlite3.Connection]:
 
 
 def ensure_initialized(conn: sqlite3.Connection) -> None:
-    """Create and seed the schema if any required table is absent.
+    """Create and seed the schema if the database is not usable yet.
 
     Double-checked under a lock so that N threads racing on the first request
     of a cold start run the schema once, and the N-1 that lose the race do not
     return before it finishes.
+
+    Schema and seed land in one transaction, so a crash or an I/O error part
+    way through leaves nothing behind to be mistaken for a working database.
     """
-    if _tables_present(conn):
+    if _is_initialized(conn):
         return
 
     with _init_lock:
-        if _tables_present(conn):
+        if _is_initialized(conn):
             return
         logger.info("Initialising database at %s", get_db_path())
         conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.executescript(_SCHEMA_PATH.read_text())
+            for statement in _schema_statements():
+                conn.execute(statement)
             _seed(conn)
         except BaseException:
             conn.rollback()
@@ -141,6 +145,45 @@ def ensure_initialized(conn: sqlite3.Connection) -> None:
             len(REQUIRED_TABLES),
             len(DEFAULT_TICKERS),
         )
+
+
+def _schema_statements() -> list[str]:
+    """schema.sql split into individual statements.
+
+    Deliberately not `executescript()`. That method issues an implicit COMMIT
+    before it runs, which ends the BEGIN IMMEDIATE above and leaves each CREATE
+    TABLE committing on its own — so a seed that then failed would leave six
+    empty tables behind, permanently, because the presence of those tables is
+    what tells the next connection there is nothing to do. `rollback()` in that
+    world rolls back nothing at all.
+
+    `complete_statement` is quote- and comment-aware, unlike splitting on ";".
+    """
+    statements: list[str] = []
+    buffer = ""
+    for line in _SCHEMA_PATH.read_text().splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            statements.append(buffer)
+            buffer = ""
+    return statements
+
+
+def _is_initialized(conn: sqlite3.Connection) -> bool:
+    """Whether the database is both structured and seeded.
+
+    The seed row is part of the test, not just the tables. A database with all
+    six tables and no profile row cannot serve a single request — checking only
+    for tables is what would let a half-built one be treated as finished, and
+    the app would run forever with no cash balance.
+
+    Only the profile row is required, not the watchlist: removing every ticker
+    is something a user may legitimately do, and must not trigger a reseed.
+    """
+    if not _tables_present(conn):
+        return False
+    row = conn.execute("SELECT 1 FROM users_profile WHERE id = ?", (DEFAULT_USER_ID,)).fetchone()
+    return row is not None
 
 
 def _tables_present(conn: sqlite3.Connection) -> bool:
@@ -156,9 +199,11 @@ def _seed(conn: sqlite3.Connection) -> None:
     """Insert the PLAN.md §7 default rows: one profile, ten watchlist tickers.
 
     INSERT OR IGNORE throughout, so seeding a database another process seeded
-    a millisecond earlier is a no-op rather than a constraint violation. This
-    only runs on a database with missing tables, so it cannot resurrect a
-    ticker the user deleted.
+    a millisecond earlier is a no-op rather than a constraint violation.
+
+    Reached only when `_is_initialized` says no — a missing table or a missing
+    profile row. Deleting every watchlist entry is not one of those conditions,
+    so a ticker the user removed stays removed.
     """
     now = utc_now()
     conn.execute(
@@ -188,4 +233,9 @@ def load_tracked_tickers(user_id: str = DEFAULT_USER_ID) -> list[str]:
             """,
             (user_id, user_id),
         ).fetchall()
-    return sorted(normalize_ticker(row["ticker"]) for row in rows)
+
+    # Deduplicated AFTER normalising, not by the UNION. UNION compares the raw
+    # strings and the UNIQUE (user_id, ticker) constraint is case-sensitive, so
+    # 'aapl' and 'AAPL' both survive the query and both normalise to AAPL —
+    # which would price the same ticker twice and bloat every Massive request.
+    return sorted({normalize_ticker(row["ticker"]) for row in rows})

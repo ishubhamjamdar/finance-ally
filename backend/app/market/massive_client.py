@@ -255,6 +255,10 @@ class MassiveDataSource(MarketDataSource):
                 # becomes a permanently empty UI with no signal. Stop, shout,
                 # and let the app fail over.
                 logger.error("Massive permanently unavailable, stopping poller: %s", exc)
+                # Released here rather than in stop(): the callback below may
+                # replace this source, after which nothing will ever call
+                # stop() on it, and the RESTClient holds a urllib3 pool.
+                self._client = None
                 if self.on_permanent_failure is not None:
                     await self.on_permanent_failure(exc)
                 return

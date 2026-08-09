@@ -7,7 +7,7 @@ import logging
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from app.db import connect
+from app.db import DEFAULT_USER_ID, connect
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,16 @@ def health(request: Request) -> JSONResponse:
     database_ok = True
     try:
         with connect() as conn:
-            conn.execute("SELECT 1 FROM users_profile LIMIT 1").fetchone()
+            # The row, not just the query. `SELECT 1 ... LIMIT 1` succeeds and
+            # returns None against an empty table, so a database that had its
+            # schema created but never seeded would report perfect health while
+            # being unable to serve a single portfolio request.
+            row = conn.execute(
+                "SELECT 1 FROM users_profile WHERE id = ?", (DEFAULT_USER_ID,)
+            ).fetchone()
+        if row is None:
+            logger.error("Health check: no profile row for %r", DEFAULT_USER_ID)
+            database_ok = False
     except Exception:
         logger.exception("Health check: database probe failed")
         database_ok = False
