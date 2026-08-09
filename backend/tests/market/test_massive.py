@@ -302,6 +302,23 @@ class TestLifecycle:
         assert source.get_tickers() == []
         assert cache.get("AAPL") is None
 
+    async def test_market_status_refresh_is_a_silent_noop_before_start(self, caplog):
+        """`_poll_loop` refreshes status on a timer, but the client only exists
+        after `start()`. Called before that it must return early.
+
+        Asserting only "does not raise" would pass without the guard too — the
+        AttributeError would just be swallowed by the catch-all below it. So
+        assert the *silence*: no attempt was made, hence nothing to report.
+        """
+        source = MassiveDataSource(api_key="k", price_cache=PriceCache())
+        assert source._client is None
+
+        with caplog.at_level("DEBUG", logger="app.market.massive_client"):
+            await source._refresh_market_status()
+
+        assert source.market_status is None
+        assert "Market status unavailable" not in caplog.text
+
     async def test_market_status_refresh_swallows_errors(self):
         source = MassiveDataSource(api_key="k", price_cache=PriceCache())
         source._client = object()  # has no get_market_status

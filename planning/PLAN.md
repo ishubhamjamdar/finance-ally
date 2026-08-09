@@ -540,7 +540,7 @@ row to ⛔, write a log entry describing how far it got and what blocked it, and
 
 | # | Checkpoint | Depends on | G1 Test | G2 Review | G3 Record | Coverage | Status |
 |---|---|---|---|---|---|---|---|
-| 1 | Market data hardening | — | ✅ | ✅ | ✅ | 99% | ✅ Complete (PR #4 open) |
+| 1 | Market data hardening | — | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #4) |
 | 2 | Backend skeleton + database | 1 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 3 | Portfolio & watchlist API | 2 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 4 | LLM chat integration | 3 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
@@ -844,10 +844,10 @@ item must be resolved or restated in a later entry — it does not expire by bei
   - *Realised volatility within a factor of two of `TICKER_PARAMS`* — measured over a full
     46,800-tick session per ticker, shocks disabled: every ticker lands at **1.00–1.07×** its
     configured sigma (AAPL 0.230 vs 0.22, TSLA 0.501 vs 0.50, JPM 0.193 vs 0.18)
-  - *Suite green, coverage ≥ 85% on `app/market/`* — **210 passed, 99%**
-- **Tests:** 73 → **225** (+152). Three consecutive full runs green after every pass, no flakes.
-  `ruff check` and `ruff format --check` clean. Coverage 84% → **99%**; every module at 100% except
-  `massive_client` 99% and `stream` 97%. Runtime 6.5 s → **2.0 s**, with no network access at all
+  - *Suite green, coverage ≥ 85% on `app/market/`* — **228 passed, 100%**
+- **Tests:** 73 → **228** (+155). Three consecutive full runs green after every pass, no flakes.
+  `ruff check` and `ruff format --check` clean. Coverage 84% → **100%** on `app/market/`, every
+  module at 100%. Runtime 6.5 s → **2.0 s**, with no network access at all
 
   One test of mine was itself wrong and was rewritten: the first log-space-shock test derived the
   magnitude from the result and inverted it, so it passed under `*= (1 ± m)` too. Mutation testing
@@ -899,18 +899,33 @@ item must be resolved or restated in a later entry — it does not expire by bei
   instead drives `_generate_events` directly with a stub request that disconnects after N ticks, and
   asserts the HTTP wiring off the router. Deterministic, no sleeps, and it reaches 97% on a module
   that had none. §16.4 of the design doc has been corrected to match
+- **Closing pass (2026-08-09, same branch):** the three loose ends that were CP1's own rather than
+  CP2's were closed before merge, taking `app/market/` to **100%** coverage:
+  - The two uncovered lines are now tested, and both tests were **mutation-verified**. Removing the
+    `CancelledError` handler fails the two new stream tests. The `_refresh_market_status` guard
+    needed the stronger assertion: a plain "does not raise" test *survived* removing the guard,
+    because the catch-all below swallows the resulting `AttributeError`. It now asserts the silence
+    — no "Market status unavailable" log — and that kills the mutation. Note the log entry above
+    misdescribed this line as "the `get_market_status` success path"; it is the `self._client is
+    None` early return, which is reached when `_poll_loop` refreshes status before `start()`
+  - `market_data_demo.py` now consumes `EventLog` instead of its own `abs(change_percent) > 1.0`
+    heuristic. That heuristic was effectively dead: tick-over-tick change at 500 ms is ~0.02%, so
+    the panel never populated. The demo also raises `event_probability` to `2.5e-3` — at the 2e-5
+    production default a 60-second run expects 0.02 shocks. Measured over 30 seeded runs the demo
+    now averages **3.2 shocks per run** (min 0, max 6)
+  - `httpx` is **kept, not dropped**: starlette's `TestClient` requires it, and Checkpoint 2 needs
+    that for `GET /api/health`. Its `pyproject.toml` comment, which still claimed it was for the
+    SSE integration tests, has been corrected
 - **Carried forward:**
-  - `httpx` added to the backend dev dependencies; it is now unused after the §16.4 divergence and
-    can be dropped if no later checkpoint needs it
   - `on_permanent_failure` is now a public attribute on the `MarketDataSource` ABC and is
     unit-tested, but nothing assigns it yet — Checkpoint 2's lifespan must, so mid-run failover
     reassigns the active source. **This is review finding #2, deferred rather than resolved; it must
     not be lost**
   - `status_provider` can now be wired as plain `lambda: source.market_status` — `market_status` is
     on the ABC, so the old `getattr` workaround is no longer needed
-  - `EventLog` is threaded through simulator → factory → stream, but no consumer constructs one
-    yet; Checkpoint 2 must create it in the lifespan and pass it to both
-  - `market_data_demo.py` still detects notable moves with its own `abs(change_percent) > 1.0`
-    heuristic rather than consuming `EventLog`. It runs correctly; worth switching when convenient
-  - `massive_client.py` line 250 and `stream.py` lines 128-129 are the only uncovered lines — the
-    `get_market_status` success path inside `to_thread` and the `CancelledError` handler
+  - `EventLog` is threaded through simulator → factory → stream, and `market_data_demo.py` now
+    constructs one, but no *server* consumer does; Checkpoint 2 must create it in the lifespan and
+    pass it to both the source and the stream router
+  - `app/market/` is at 100% line coverage. That is a floor to hold, not a target reached: it says
+    every line runs, not that every line is pinned. Two of the newest tests only became meaningful
+    once mutation testing showed the obvious version passing against broken code

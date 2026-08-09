@@ -1,6 +1,7 @@
 # Market Data Backend — Summary
 
-**Status:** Hardened in Checkpoint 1 (see `PLAN.md` §13). Gate 1 passed — 210 tests, 99% coverage.
+**Status:** Hardened in Checkpoint 1 (see `PLAN.md` §13). All three gates passed — 228 tests, 100%
+coverage on `app/market/`.
 **Gate 2 code review is still outstanding**, so the checkpoint is not closed.
 
 > This document previously read "Complete, tested, reviewed, all issues resolved" while
@@ -56,7 +57,8 @@ MarketDataSource (ABC)
 
 ## Test Suite
 
-**210 tests, all passing.** 9 test modules in `backend/tests/market/`.
+**228 tests, all passing** in ~2 s, with no network access. 9 test modules in
+`backend/tests/market/`.
 
 | Module | Coverage of |
 |--------|-------------|
@@ -66,11 +68,13 @@ MarketDataSource (ABC)
 | test_simulator.py | simulator.py: 100% |
 | test_simulator_source.py | (integration) |
 | test_source_contract.py | both sources against one contract |
-| test_massive.py | massive_client.py: 99% |
-| test_stream.py | stream.py: 97% |
+| test_massive.py | massive_client.py: 100% |
+| test_stream.py | stream.py: 100% |
 | test_factory.py | factory.py: 100% |
 
-Overall coverage: 99%.
+Overall coverage: 100% on `app/market/`. Treat that as a floor to hold, not proof of thoroughness —
+line coverage says every line ran, not that its behaviour is pinned. Several of these tests only
+became meaningful after mutation testing showed an earlier version passing against broken code.
 
 Fixtures are built from `TickerSnapshot.from_dict(...)`, never `MagicMock` — see the note at the
 top of this file for why.

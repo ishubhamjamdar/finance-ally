@@ -13,6 +13,7 @@ HTTP wiring — route, media type, headers — is asserted separately off the
 router itself.
 """
 
+import asyncio
 import json
 
 import pytest
@@ -198,6 +199,43 @@ class TestHeartbeat:
     async def test_heartbeat_suppressed_until_the_interval_elapses(self):
         frames = await collect(PriceCache(), ticks=3, heartbeat=3600.0)
         assert [f for f in frames if f.startswith(": ")] == []
+
+
+@pytest.mark.asyncio
+class TestCancellation:
+    async def test_cancellation_exits_cleanly_instead_of_propagating(self):
+        """A client vanishing mid-`await` cancels the task rather than setting
+        `is_disconnected()`. The generator must absorb that and return, so the
+        ASGI server sees a finished response instead of an escaping
+        CancelledError.
+        """
+        cache = PriceCache()
+        cache.update("AAPL", 190.0)
+        agen = _generate_events(cache, StubRequest(ticks=10), interval=0)
+
+        # Advance past the preamble to a yield inside the streaming loop —
+        # cancellation lands wherever the generator is suspended, and only the
+        # loop is guarded.
+        assert await agen.asend(None) == "retry: 1000\n\n"
+        assert (await agen.asend(None)).startswith("data: ")
+
+        # Generator caught CancelledError and returned, so athrow reports
+        # exhaustion. Were it re-raised, this would fail with CancelledError.
+        with pytest.raises(StopAsyncIteration):
+            await agen.athrow(asyncio.CancelledError())
+
+    async def test_cancellation_is_logged(self, caplog):
+        cache = PriceCache()
+        cache.update("AAPL", 190.0)
+        agen = _generate_events(cache, StubRequest(ticks=10), interval=0)
+        await agen.asend(None)
+        await agen.asend(None)
+
+        with caplog.at_level("INFO", logger="app.market.stream"):
+            with pytest.raises(StopAsyncIteration):
+                await agen.athrow(asyncio.CancelledError())
+
+        assert "SSE stream cancelled" in caplog.text
 
 
 class TestRouterWiring:

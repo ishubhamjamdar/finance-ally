@@ -20,6 +20,7 @@ from rich.table import Table
 from rich.text import Text
 
 from app.market.cache import PriceCache
+from app.market.events import EventLog
 from app.market.seed_prices import SEED_PRICES
 from app.market.simulator import SimulatorDataSource
 
@@ -30,6 +31,14 @@ SPARK_CHARS = "▁▂▃▄▅▆▇█"
 TICKERS = ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "NVDA", "META", "JPM", "V", "NFLX"]
 
 DURATION = 60  # seconds
+
+UPDATE_INTERVAL = 0.5  # seconds between simulator ticks
+
+# Dialled far above the 2e-5 production default. That default is calibrated to
+# roughly one shock per ticker per trading session (46,800 ticks); across a
+# 60-second demo it works out to ~0.02 shocks total, so the event panel would
+# sit empty for the entire run. This gives a handful instead.
+DEMO_EVENT_PROBABILITY = 0.0025
 
 
 def sparkline(values: list[float]) -> str:
@@ -109,7 +118,7 @@ def build_event_log(events: deque) -> Panel:
         text.append(evt)
         text.append("\n")
     if not events:
-        text.append("Watching for notable moves (>1% change)...", style="bright_black italic")
+        text.append("Watching for shock events...", style="bright_black italic")
     return Panel(
         text,
         title="[bold bright_yellow]Recent Events[/]",
@@ -207,13 +216,22 @@ def print_summary(cache: PriceCache) -> None:
 async def run() -> None:
     """Main demo loop."""
     cache = PriceCache()
-    source = SimulatorDataSource(price_cache=cache, update_interval=0.5)
+    # The simulator publishes its shocks here; this is the same EventLog the
+    # SSE layer reads, rather than a second guess at what counts as notable.
+    event_log = EventLog()
+    source = SimulatorDataSource(
+        price_cache=cache,
+        update_interval=UPDATE_INTERVAL,
+        event_probability=DEMO_EVENT_PROBABILITY,
+        event_log=event_log,
+    )
 
     # Per-ticker price history for sparklines
     history: dict[str, deque] = {t: deque(maxlen=40) for t in TICKERS}
 
-    # Recent event log
+    # Formatted lines for the event panel, newest first
     events: deque = deque(maxlen=12)
+    cursor = event_log.cursor
 
     await source.start(TICKERS)
     start_time = time.time()
@@ -239,24 +257,26 @@ async def run() -> None:
                     continue
                 last_version = cache.version
 
-                # Record history & detect events
+                # Record history
                 for ticker in TICKERS:
                     update = cache.get(ticker)
                     if update is None:
                         continue
                     history[ticker].append(update.price)
 
-                    # Log notable moves
-                    if abs(update.change_percent) > 1.0:
-                        direction = "\u25b2" if update.direction == "up" else "\u25bc"
-                        color = "green" if update.direction == "up" else "red"
-                        timestamp = time.strftime("%H:%M:%S")
-                        events.appendleft(
-                            f"[bright_black]{timestamp}[/]  "
-                            f"[bold {color}]{direction} {ticker}[/]  "
-                            f"[{color}]{update.change_percent:+.2f}%[/]  "
-                            f"${format_price(update.price)}"
-                        )
+                # Drain shocks the simulator published, by cursor
+                cursor, fresh = event_log.since(cursor)
+                for event in fresh:
+                    up = event.magnitude_percent >= 0
+                    arrow = "\u25b2" if up else "\u25bc"
+                    color = "green" if up else "red"
+                    timestamp = time.strftime("%H:%M:%S", time.localtime(event.timestamp))
+                    events.appendleft(
+                        f"[bright_black]{timestamp}[/]  "
+                        f"[bold {color}]{arrow} {event.ticker}[/]  "
+                        f"[{color}]{event.magnitude_percent:+.2f}%[/]  "
+                        f"${format_price(event.price)}"
+                    )
 
                 live.update(build_dashboard(cache, history, events, start_time))
 
