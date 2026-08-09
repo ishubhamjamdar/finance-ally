@@ -43,12 +43,20 @@ Import from `app.market` only — never from a submodule. `__init__.py` is the s
   - `remove(ticker)`
   - `version` property — monotonic counter, increments on every update (for SSE change detection)
 
-- **`MarketDataSource`** — Abstract interface implemented by `SimulatorDataSource` and `MassiveDataSource`. Lifecycle: `start(tickers)` -> `add_ticker()` / `remove_ticker()` -> `stop()`.
+- **`MarketDataSource`** — Abstract interface implemented by `SimulatorDataSource` and
+  `MassiveDataSource`. Lifecycle: `start(tickers)` -> `add_ticker()` / `remove_ticker()` -> `stop()`.
+  Two public attributes every source carries, so consumers never need `getattr` or `isinstance`:
+  - `market_status` — `"open"`/`"closed"`/`"extended-hours"`, or `None` where the concept does not
+    apply (the simulator always trades)
+  - `on_permanent_failure` — assign an async callback after construction to be told when a source
+    hits a failure retrying cannot fix, so the app can swap in a working one mid-session
+
+  `start()` does **not** promise any ticker got a price — a transient fetch failure is worth
+  retrying, not aborting. Verify by reading the cache; `start_market_data` already does.
 
 - **`EventLog`** — Bounded ring buffer of `MarketEvent`s (simulator shocks). Read by cursor:
   `since(cursor) -> (next_cursor, events)`, so every SSE client sees every event. Pass `cursor=-1`
-  on connect to skip the backlog. **Defines `__len__`, so an empty log is falsy — always test it
-  with `is not None`, never truthiness.**
+  on connect to skip the backlog.
 
 - **`start_market_data(cache, tickers, event_log=None)`** — Use this, not the bare factory. Creates
   and starts a source, and falls back to the simulator when Massive is unusable (bad key, or a
@@ -60,11 +68,8 @@ Import from `app.market` only — never from a submodule. `__init__.py` is the s
 ```python
 router = create_stream_router(
     price_cache,
-    event_log=event_log,   # optional: publishes `event: shock`
-    # optional: publishes `event: status`. Use getattr — only MassiveDataSource
-    # has `market_status`, and the simulator is both the default source and the
-    # fallback, so `source.market_status` would raise.
-    status_provider=lambda: getattr(source, "market_status", None),
+    event_log=event_log,                           # optional: publishes `event: shock`
+    status_provider=lambda: source.market_status,  # optional: publishes `event: status`
 )
 # Endpoint: GET /api/stream/prices (text/event-stream)
 ```

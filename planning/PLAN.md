@@ -540,7 +540,7 @@ row to ⛔, write a log entry describing how far it got and what blocked it, and
 
 | # | Checkpoint | Depends on | G1 Test | G2 Review | G3 Record | Coverage | Status |
 |---|---|---|---|---|---|---|---|
-| 1 | Market data hardening | — | ✅ | ⬜ | ✅ | 99% | 🔨 Awaiting Gate 2 |
+| 1 | Market data hardening | — | ✅ | ✅ | ✅ | 99% | ✅ Complete (PR #4 open) |
 | 2 | Backend skeleton + database | 1 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 3 | Portfolio & watchlist API | 2 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 4 | LLM chat integration | 3 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
@@ -816,8 +816,8 @@ item must be resolved or restated in a later entry — it does not expire by bei
 
 #### Checkpoint 1 — Market data hardening
 
-- **Closed:** Gate 1 and Gate 3 complete 2026-08-09 · branch `checkpoint-1-market-data-hardening` ·
-  **Gate 2 not yet run** — `/code-review` is user-triggered, so this checkpoint is not ✅ yet
+- **Closed:** 2026-08-09 · branch `checkpoint-1-market-data-hardening` · PR #4 · all three gates
+  passed. PR open for merge; the automated review workflow runs on each push
 - **Built:** all 17 changes from `MARKET_DATA_DESIGN.md` §17, across `backend/app/market/`
   - `models.py` — `normalize_ticker()`, `previous_close` + `day_change`/`day_change_percent` on
     `PriceUpdate`, new `MarketEvent`
@@ -845,9 +845,9 @@ item must be resolved or restated in a later entry — it does not expire by bei
     46,800-tick session per ticker, shocks disabled: every ticker lands at **1.00–1.07×** its
     configured sigma (AAPL 0.230 vs 0.22, TSLA 0.501 vs 0.50, JPM 0.193 vs 0.18)
   - *Suite green, coverage ≥ 85% on `app/market/`* — **210 passed, 99%**
-- **Tests:** 73 → **225** (+152, including 15 added for the review fixes). Three consecutive full
-  runs green after the fixes, no flakes. `ruff check` clean; `ruff format` applied. Coverage
-  84% → **99%**; every module at 100% except `massive_client` 99% and `stream` 97%
+- **Tests:** 73 → **225** (+152). Three consecutive full runs green after every pass, no flakes.
+  `ruff check` and `ruff format --check` clean. Coverage 84% → **99%**; every module at 100% except
+  `massive_client` 99% and `stream` 97%. Runtime 6.5 s → **2.0 s**, with no network access at all
 
   One test of mine was itself wrong and was rewritten: the first log-space-shock test derived the
   magnitude from the result and inverted it, so it passed under `*= (1 ± m)` too. Mutation testing
@@ -870,6 +870,28 @@ item must be resolved or restated in a later entry — it does not expire by bei
   Fixes verified by mutation in both directions: restoring whole-body matching fails the
   `request_id` test; restoring the original marker list fails 3 tests including a real 401 body.
   `/security-review` not run — optional for this checkpoint per the gate definition.
+
+  `/simplify` (4 agents) then found one thing that mattered and several that tightened the design:
+
+  - **The `[massive]` contract tests were making real HTTPS calls to `api.massive.com`.** Stubbing
+    the instance was never enough — `start()` overwrites `_client` with a real `RESTClient` and then
+    polls market status. Seven round trips, ~4.5 s of a 6.4 s suite, and the tests failed offline.
+    Now patched at the class level: **suite 6.5 s → 2.0 s, zero network access**
+  - `market_status` and `on_permanent_failure` moved onto the `MarketDataSource` ABC. Consumers stop
+    needing `getattr`, the SSE guard stops being load-bearing, and Checkpoint 2's lifespan will not
+    have to reach into a private attribute to wire failover
+  - `EventLog.__len__` deleted — no production caller, and its only legacy was the falsy-empty-log
+    trap that had already caused one silent bug plus three documented workarounds
+  - `start_market_data` now starts and verifies every source identically; `isinstance` guards only
+    the recursion. Tuning defaults have one owner each; test builders and real error bodies moved to
+    `conftest.py`; `extract_price` reuses `extract_previous_close`
+  - The ABC's `start()` docstring promised "populate the cache or raise", which `MassiveDataSource`
+    does not honour — which is exactly why the factory re-verifies. Corrected to match reality
+
+  Skipped, with reasons: hoisting the duplicated `stop()` into the ABC (§7 deliberately chose
+  contract over inheritance); deleting `_classifiable_text` (it keeps classification off the opaque
+  `request_id` by construction, rather than by luck about which markers happen to be hex);
+  parametrising the seven pre-existing factory tests (outside this diff).
 - **Diverged from plan:** one deliberate divergence. §16.4 specified SSE tests driven through
   `httpx.ASGITransport`; that cannot work, because the SSE generator is infinite by design and
   ASGITransport never delivers an `http.disconnect`, so `request.is_disconnected()` stays False and
@@ -880,11 +902,12 @@ item must be resolved or restated in a later entry — it does not expire by bei
 - **Carried forward:**
   - `httpx` added to the backend dev dependencies; it is now unused after the §16.4 divergence and
     can be dropped if no later checkpoint needs it
-  - `MassiveDataSource.on_permanent_failure` exists and is unit-tested, but nothing wires it yet —
-    Checkpoint 2's lifespan must connect it so mid-run failover reassigns the active source.
-    **This is review finding #2, deferred rather than resolved; it must not be lost**
-  - When Checkpoint 2 wires `status_provider`, use `getattr(source, "market_status", None)` — only
-    `MassiveDataSource` has that attribute, and the simulator is both the default and the fallback
+  - `on_permanent_failure` is now a public attribute on the `MarketDataSource` ABC and is
+    unit-tested, but nothing assigns it yet — Checkpoint 2's lifespan must, so mid-run failover
+    reassigns the active source. **This is review finding #2, deferred rather than resolved; it must
+    not be lost**
+  - `status_provider` can now be wired as plain `lambda: source.market_status` — `market_status` is
+    on the ABC, so the old `getattr` workaround is no longer needed
   - `EventLog` is threaded through simulator → factory → stream, but no consumer constructs one
     yet; Checkpoint 2 must create it in the lifespan and pass it to both
   - `market_data_demo.py` still detects notable moves with its own `abs(change_percent) > 1.0`
