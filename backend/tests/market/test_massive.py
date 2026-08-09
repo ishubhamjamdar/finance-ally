@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from massive.exceptions import AuthError
 from massive.rest.models import SnapshotMarketType
 
 from app.market.cache import PriceCache
@@ -23,15 +24,19 @@ from app.market.massive_client import (
     to_epoch_seconds,
 )
 
-from .conftest import make_snapshot
+from .conftest import (
+    NOT_AUTHORIZED_BODY,
+    RATE_LIMITED_BODY,
+    UNKNOWN_KEY_BODY,
+    make_snapshot,
+    massive_source,
+    offline_massive,
+)
 
 
 def _source(cache: PriceCache, tickers: list[str] | None = None) -> MassiveDataSource:
     """A source wired for polling without a real client."""
-    source = MassiveDataSource(api_key="k", price_cache=cache, poll_interval=60.0)
-    source._tickers = tickers if tickers is not None else ["AAPL"]
-    source._client = object()  # only truthiness is checked
-    return source
+    return massive_source(cache, tickers=tickers)
 
 
 class TestExtraction:
@@ -94,25 +99,54 @@ class TestExtraction:
 
 
 class TestFailureClassification:
-    @pytest.mark.parametrize(
-        "message",
-        [
-            "401 Unauthorized",
-            "403 Forbidden",
-            "invalid api key",
-            "NOT ENTITLED for this plan",
-        ],
-    )
-    def test_permanent_failures(self, message):
-        assert is_permanent_failure(Exception(message)) is True
+    """The SDK raises BadResponse(body) and throws away resp.status, so these
+    fixtures are real Polygon response bodies. Matching on "401"/"403" cannot
+    work: a genuine 401 body contains neither.
+    """
 
     @pytest.mark.parametrize(
-        "message",
-        ["429 Too Many Requests", "503 upstream", "connection timed out"],
+        "body",
+        [
+            UNKNOWN_KEY_BODY,
+            NOT_AUTHORIZED_BODY,
+            '{"status":"ERROR","message":"Invalid API Key"}',
+            "403 Forbidden",  # plain-text body from a proxy
+        ],
     )
-    def test_transient_failures(self, message):
-        """429 and 5xx must stay transient — the SDK already retries them."""
-        assert is_permanent_failure(Exception(message)) is False
+    def test_permanent_failures(self, body):
+        assert is_permanent_failure(Exception(body)) is True
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            RATE_LIMITED_BODY,
+            '{"status":"ERROR","message":"internal server error"}',
+            "connection timed out",
+        ],
+    )
+    def test_transient_failures(self, body):
+        """Rate limits and 5xx must stay transient — the SDK already retries them."""
+        assert is_permanent_failure(Exception(body)) is False
+
+    def test_request_id_containing_a_status_code_is_not_permanent(self):
+        """Every Polygon body carries a 32-char hex request_id. Matching markers
+        against the whole string promotes a transient 429 to permanent roughly
+        1.5% of the time — a poller that stops for good on a random hex run."""
+        body = (
+            '{"status":"ERROR","request_id":"403401aabbccddeeff00112233445566",'
+            '"message":"You have exceeded the maximum requests per minute"}'
+        )
+        assert is_permanent_failure(Exception(body)) is False
+
+    def test_auth_error_is_permanent(self):
+        """AuthError means an empty key at construction — no retry fixes that."""
+        assert is_permanent_failure(AuthError("no api key")) is True
+
+    def test_malformed_body_falls_back_to_whole_text(self):
+        assert is_permanent_failure(Exception("<html>403 Forbidden</html>")) is True
+
+    def test_non_dict_json_body_is_handled(self):
+        assert is_permanent_failure(Exception("[1, 2, 3]")) is False
 
 
 @pytest.mark.asyncio
@@ -148,9 +182,7 @@ class TestPolling:
     async def test_permanent_error_raises(self):
         cache = PriceCache()
         source = _source(cache)
-        source._fetch_snapshots = lambda: (_ for _ in ()).throw(
-            Exception("401 Unauthorized: invalid API key")
-        )
+        source._fetch_snapshots = lambda: (_ for _ in ()).throw(Exception(UNKNOWN_KEY_BODY))
 
         with pytest.raises(PermanentMarketDataError):
             await source._poll_once()
@@ -181,13 +213,29 @@ class TestPolling:
         source._tickers = ["AAPL"]
         assert await source._poll_once() == 0
 
-    async def test_last_poll_at_recorded(self):
+    async def test_one_bad_snapshot_does_not_lose_the_others(self):
+        """Per-snapshot guarding: a malformed entry costs one ticker for one
+        poll, not every ticker for the life of the process."""
+
+        class Exploding:
+            ticker = "BAD"
+
+            @property
+            def last_trade(self):
+                raise ValueError("malformed field")
+
         cache = PriceCache()
-        source = _source(cache)
-        source._fetch_snapshots = lambda: [make_snapshot()]
-        assert source.last_poll_at is None
-        await source._poll_once()
-        assert source.last_poll_at is not None
+        source = _source(cache, ["AAPL", "BAD", "GOOGL"])
+        source._fetch_snapshots = lambda: [
+            make_snapshot("AAPL", price=190.5),
+            Exploding(),
+            make_snapshot("GOOGL", price=175.0),
+        ]
+
+        assert await source._poll_once() == 2
+        assert cache.get_price("AAPL") == 190.5
+        assert cache.get_price("GOOGL") == 175.0
+        assert cache.get("BAD") is None
 
 
 @pytest.mark.asyncio
@@ -196,9 +244,8 @@ class TestLifecycle:
         cache = PriceCache()
         source = MassiveDataSource(api_key="k", price_cache=cache, poll_interval=60.0)
 
-        with patch("app.market.massive_client.RESTClient"):
-            with patch.object(source, "_fetch_snapshots", return_value=[make_snapshot()]):
-                await source.start(["AAPL"])
+        with offline_massive(snapshots=[make_snapshot()]):
+            await source.start(["AAPL"])
 
         assert cache.get_price("AAPL") == 190.5  # priced before start() returned
         await source.stop()
@@ -209,9 +256,8 @@ class TestLifecycle:
         cache = PriceCache()
         source = MassiveDataSource(api_key="k", price_cache=cache, poll_interval=60.0)
 
-        with patch("app.market.massive_client.RESTClient"):
-            with patch.object(source, "_fetch_snapshots", return_value=[]):
-                await source.start([" aapl ", "googl"])
+        with offline_massive():
+            await source.start([" aapl ", "googl"])
 
         assert source.get_tickers() == ["AAPL", "GOOGL"]
         await source.stop()
@@ -220,10 +266,9 @@ class TestLifecycle:
         """So the factory can fall back rather than poll a dead key forever."""
         source = MassiveDataSource(api_key="bad", price_cache=PriceCache())
 
-        with patch("app.market.massive_client.RESTClient"):
-            with patch.object(source, "_fetch_snapshots", side_effect=Exception("403 Forbidden")):
-                with pytest.raises(PermanentMarketDataError):
-                    await source.start(["AAPL"])
+        with offline_massive(error=NOT_AUTHORIZED_BODY):
+            with pytest.raises(PermanentMarketDataError):
+                await source.start(["AAPL"])
 
     async def test_stop_is_idempotent_and_safe_before_start(self):
         source = MassiveDataSource(api_key="k", price_cache=PriceCache())
@@ -235,9 +280,8 @@ class TestLifecycle:
         cache = PriceCache()
         source = MassiveDataSource(api_key="k", price_cache=cache, poll_interval=10.0)
 
-        with patch("app.market.massive_client.RESTClient"):
-            with patch.object(source, "_fetch_snapshots", return_value=[make_snapshot()]):
-                await source.start(["AAPL"])
+        with offline_massive(snapshots=[make_snapshot()]):
+            await source.start(["AAPL"])
 
         assert source._task is not None and not source._task.done()
         await source.stop()
@@ -308,9 +352,12 @@ class TestPollLoop:
         )
         source._tickers = ["AAPL"]
         source._client = object()
-        source._fetch_snapshots = lambda: (_ for _ in ()).throw(Exception("403 Forbidden"))
+        source._fetch_snapshots = lambda: (_ for _ in ()).throw(Exception(NOT_AUTHORIZED_BODY))
 
-        await source._poll_loop()  # returns rather than looping forever
+        # wait_for, not a bare await: if the classifier stops recognising this
+        # body the loop runs forever, and a hung suite is a far worse failure
+        # signal than an assertion.
+        await asyncio.wait_for(source._poll_loop(), timeout=5)
 
         assert len(notified) == 1
         assert isinstance(notified[0], PermanentMarketDataError)
@@ -319,9 +366,9 @@ class TestPollLoop:
         source = MassiveDataSource(api_key="bad", price_cache=PriceCache(), poll_interval=0.01)
         source._tickers = ["AAPL"]
         source._client = object()
-        source._fetch_snapshots = lambda: (_ for _ in ()).throw(Exception("401"))
+        source._fetch_snapshots = lambda: (_ for _ in ()).throw(Exception(UNKNOWN_KEY_BODY))
 
-        await source._poll_loop()  # must not raise
+        await asyncio.wait_for(source._poll_loop(), timeout=5)  # must not raise
 
     async def test_transient_failures_keep_the_loop_running(self):
         source = MassiveDataSource(api_key="k", price_cache=PriceCache(), poll_interval=0.01)
@@ -333,6 +380,29 @@ class TestPollLoop:
         await asyncio.sleep(0.05)
         assert not task.done()  # still retrying
         task.cancel()
+
+    async def test_unexpected_error_does_not_kill_the_poller(self):
+        """Only PermanentMarketDataError should end the task. Anything else must
+        be logged and retried — otherwise prices freeze with no fallback and the
+        only trace is a 'Task exception was never retrieved' warning at GC."""
+        source = MassiveDataSource(api_key="k", price_cache=PriceCache(), poll_interval=0.01)
+        source._tickers = ["AAPL"]
+        source._client = object()
+        calls = {"n": 0}
+
+        async def exploding_poll():
+            calls["n"] += 1
+            raise RuntimeError("unexpected")
+
+        source._poll_once = exploding_poll
+
+        task = asyncio.create_task(source._poll_loop())
+        await asyncio.sleep(0.06)
+        still_running = not task.done()
+        task.cancel()
+
+        assert still_running
+        assert calls["n"] > 1  # retried rather than died on the first failure
 
     async def test_status_refreshed_on_the_configured_cadence(self):
         source = MassiveDataSource(

@@ -76,8 +76,6 @@ async def _generate_events(
 
     last_version = -1
     last_status: str | None = None
-    # `is not None`: EventLog defines __len__, so an empty log is falsy and a
-    # truthiness test would silently reset the cursor.
     cursor = event_log.cursor if event_log is not None else 0  # start at 'now'
     last_sent = time.monotonic()
     client_ip = request.client.host if request.client else "unknown"
@@ -108,13 +106,23 @@ async def _generate_events(
                     yield f"event: shock\ndata: {json.dumps(event.to_dict())}\n\n"
                     sent = True
 
-            # 3. Market status transitions (real data only; None under the simulator).
+            # 3. Market status transitions (None under the simulator).
+            #
+            # The provider is caller-supplied, and this generator's only other
+            # handler is CancelledError — an exception here would escape
+            # mid-body, abort the response, and leave EventSource reconnecting
+            # into the same crash forever. Cheap insurance for a callback we
+            # do not control.
             if status_provider is not None:
-                status = status_provider()
-                if status != last_status:
-                    last_status = status
-                    yield f"event: status\ndata: {json.dumps({'market': status})}\n\n"
-                    sent = True
+                try:
+                    status = status_provider()
+                except Exception:
+                    logger.debug("Status provider failed; leaving status unchanged", exc_info=True)
+                else:
+                    if status != last_status:
+                        last_status = status
+                        yield f"event: status\ndata: {json.dumps({'market': status})}\n\n"
+                        sent = True
 
             # 4. Comment-only heartbeat so idle proxies don't drop the connection.
             now = time.monotonic()

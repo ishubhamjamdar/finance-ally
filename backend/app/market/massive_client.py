@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
 
 from massive import RESTClient
+from massive.exceptions import AuthError
 from massive.rest.models import SnapshotMarketType
 
 from .cache import PriceCache
-from .events import EventLog
 from .interface import MarketDataSource, PermanentMarketDataError
 from .models import normalize_ticker
 
 logger = logging.getLogger(__name__)
+
+# Right for Starter/Developer (15-min delayed); Advanced+ can poll at 2-5 s.
+DEFAULT_POLL_INTERVAL = 15.0
 
 
 def to_epoch_seconds(raw: int | float | None) -> float | None:
@@ -43,9 +47,7 @@ def extract_price(snap) -> float | None:
         return snap.min.close  # Starter    : latest minute bar
     if snap.day is not None and snap.day.close:
         return snap.day.close  # today's bar so far
-    if snap.prev_day is not None and snap.prev_day.close:
-        return snap.prev_day.close  # pre-open / stale fallback
-    return None
+    return extract_previous_close(snap)  # pre-open / stale fallback
 
 
 def extract_timestamp(snap) -> float | None:
@@ -69,27 +71,84 @@ def extract_previous_close(snap) -> float | None:
     return None
 
 
+def parse_snapshot(snap) -> dict | None:
+    """One snapshot to PriceCache.update() kwargs, or None if unusable.
+
+    The single seam where foreign SDK objects are tolerated: every attribute
+    read on `snap` happens under this try. Keeping it here rather than around
+    the caller's loop body means a fault in our own cache write still surfaces
+    as a crash instead of being downgraded to a per-ticker warning.
+    """
+    try:
+        ticker = getattr(snap, "ticker", None)
+        price = extract_price(snap)
+        if not ticker or price is None:
+            logger.warning("No usable price for %s", ticker or "???")
+            return None
+        return {
+            "ticker": ticker,
+            "price": price,
+            "timestamp": extract_timestamp(snap) or time.time(),
+            "previous_close": extract_previous_close(snap),
+        }
+    except Exception as exc:
+        logger.warning("Skipping snapshot for %s: %s", getattr(snap, "ticker", "???"), exc)
+        return None
+
+
 _PERMANENT_MARKERS = (
-    "401",
-    "403",
-    "unauthorized",
+    "not_authorized",
     "not authorized",
     "not entitled",
-    "forbidden",
+    "unknown api key",
     "invalid api key",
+    "unauthorized",
+    "forbidden",
+    "upgrade your plan",
 )
+
+
+def _classifiable_text(raw: str) -> str:
+    """The parts of an error body that actually describe the failure.
+
+    Polygon bodies are JSON carrying an opaque 32-character hex `request_id`.
+    Classification must never depend on it: a marker that happened to be hex —
+    "401" and "403" were, before this was fixed — matches a random request_id
+    around 1.5% of the time and stops the poller for good on a transient error.
+    Narrowing to `status`/`message`/`error` makes that impossible by
+    construction rather than by luck about which markers are in the list.
+
+    Non-JSON bodies (a proxy's plain-text "403 Forbidden") carry no request_id
+    to trip over, so they are matched whole.
+    """
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return raw.lower()
+    if not isinstance(payload, dict):
+        return raw.lower()
+    fields = (payload.get("status"), payload.get("message"), payload.get("error"))
+    return " ".join(str(f) for f in fields if f is not None).lower()
 
 
 def is_permanent_failure(exc: Exception) -> bool:
     """Whether an error is worth retrying.
 
-    BadResponse is a single flat type whose message is the raw body, so the
-    only way to distinguish 'bad key / no entitlement' from 'try again later'
-    is to inspect the text. 429 and 5xx are deliberately NOT listed — those are
-    transient and the SDK already retries them.
+    The SDK raises `BadResponse(resp.data.decode("utf-8"))` and discards
+    `resp.status`, so the HTTP code is genuinely unavailable — the body is all
+    there is. That rules out matching on status codes: a real 401 body reads
+    `{"status":"ERROR","request_id":"...","message":"Unknown API Key"}` and
+    contains no "401" anywhere.
+
+    AuthError means an empty key at construction, which no retry can fix.
+
+    Rate limits and 5xx are deliberately absent from the markers — the SDK
+    already retries them (urllib3 Retry, status_forcelist includes 429/5xx),
+    and their bodies talk about exceeding request limits, not authorisation.
     """
-    text = str(exc).lower()
-    return any(marker in text for marker in _PERMANENT_MARKERS)
+    if isinstance(exc, AuthError):
+        return True
+    return any(marker in _classifiable_text(str(exc)) for marker in _PERMANENT_MARKERS)
 
 
 class MassiveDataSource(MarketDataSource):
@@ -108,11 +167,10 @@ class MassiveDataSource(MarketDataSource):
         self,
         api_key: str,
         price_cache: PriceCache,
-        poll_interval: float = 15.0,
+        poll_interval: float = DEFAULT_POLL_INTERVAL,
         connect_timeout: float = 5.0,
         read_timeout: float = 5.0,
         status_refresh_polls: int = 20,
-        event_log: EventLog | None = None,
         on_permanent_failure: Callable[[Exception], Awaitable[None]] | None = None,
     ) -> None:
         self._api_key = api_key
@@ -121,15 +179,15 @@ class MassiveDataSource(MarketDataSource):
         self._connect_timeout = connect_timeout
         self._read_timeout = read_timeout
         self._status_refresh_polls = status_refresh_polls
-        self._event_log = event_log
-        self._on_permanent_failure = on_permanent_failure
+        # Public, and declared on the ABC: the lifespan assigns it after
+        # construction without reaching into a private attribute.
+        self.on_permanent_failure = on_permanent_failure
 
         self._tickers: list[str] = []
         self._task: asyncio.Task | None = None
         self._client: RESTClient | None = None
         self._poll_count = 0
         self.market_status: str | None = None  # "open" | "closed" | "extended-hours"
-        self.last_poll_at: float | None = None
 
     async def start(self, tickers: list[str]) -> None:
         # Normalised HERE too, not only in add/remove — a lower-case watchlist
@@ -197,9 +255,15 @@ class MassiveDataSource(MarketDataSource):
                 # becomes a permanently empty UI with no signal. Stop, shout,
                 # and let the app fail over.
                 logger.error("Massive permanently unavailable, stopping poller: %s", exc)
-                if self._on_permanent_failure:
-                    await self._on_permanent_failure(exc)
+                if self.on_permanent_failure is not None:
+                    await self.on_permanent_failure(exc)
                 return
+            except Exception:
+                # Anything else must not end the task. Without this the poller
+                # dies silently on one unexpected error — prices freeze, no
+                # retry, no fallback, and the only trace is a "Task exception
+                # was never retrieved" warning whenever the task is collected.
+                logger.exception("Massive poll cycle failed; continuing")
 
     async def _poll_once(self) -> int:
         """One poll cycle. Returns the number of tickers updated.
@@ -223,20 +287,12 @@ class MassiveDataSource(MarketDataSource):
 
         processed = 0
         for snap in snapshots:
-            ticker = getattr(snap, "ticker", None)
-            price = extract_price(snap)
-            if not ticker or price is None:
-                logger.warning("No usable price for %s", ticker or "???")
+            parsed = parse_snapshot(snap)
+            if parsed is None:
                 continue
-            self._cache.update(
-                ticker=ticker,
-                price=price,
-                timestamp=extract_timestamp(snap) or time.time(),
-                previous_close=extract_previous_close(snap),
-            )
+            self._cache.update(**parsed)
             processed += 1
 
-        self.last_poll_at = time.time()
         logger.debug("Massive poll: updated %d/%d tickers", processed, len(self._tickers))
         return processed
 

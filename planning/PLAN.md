@@ -845,11 +845,31 @@ item must be resolved or restated in a later entry — it does not expire by bei
     46,800-tick session per ticker, shocks disabled: every ticker lands at **1.00–1.07×** its
     configured sigma (AAPL 0.230 vs 0.22, TSLA 0.501 vs 0.50, JPM 0.193 vs 0.18)
   - *Suite green, coverage ≥ 85% on `app/market/`* — **210 passed, 99%**
-- **Tests:** 73 → 210 (+137). Three consecutive full runs green, no flakes. `ruff check` clean;
-  `ruff format` applied to the 6 files it flagged. Coverage 84% → **99%**; every module at 100%
-  except `massive_client` 99% and `stream` 97%
-- **Review:** **Gate 2 has not been run.** No `/code-review` or `/security-review` output exists for
-  this branch. Do not mark the checkpoint ✅ until both have run and their findings are dispositioned
+- **Tests:** 73 → **225** (+152, including 15 added for the review fixes). Three consecutive full
+  runs green after the fixes, no flakes. `ruff check` clean; `ruff format` applied. Coverage
+  84% → **99%**; every module at 100% except `massive_client` 99% and `stream` 97%
+
+  One test of mine was itself wrong and was rewritten: the first log-space-shock test derived the
+  magnitude from the result and inverted it, so it passed under `*= (1 ± m)` too. Mutation testing
+  is what caught it. A second used `"401"` as an error body — which the corrected classifier rightly
+  treats as transient — and hung the suite rather than failing; the permanent-failure loop tests now
+  use real bodies and `asyncio.wait_for`, so a regression fails instead of hanging
+- **Review:** `/code-review high` returned 8 findings — **7 fixed, 1 deferred with reason.**
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | 1 | `is_permanent_failure` classified on the raw body, so `"401"`/`"403"` could never match a real Polygon body (false negative on a dead key) while a random hex `request_id` could match one (false positive on a 429) | **Fixed.** The SDK raises `BadResponse(resp.data.decode())` and discards `resp.status` — verified in `massive/rest/base.py` — so the HTTP code is genuinely unavailable. Now parses the body's `status`/`message`/`error` fields and matches on real wording (`Unknown API Key`, `NOT_AUTHORIZED`); `AuthError` is permanent. Test bodies replaced with real ones |
+  | 2 | `on_permanent_failure` accepted but never wired, so mid-run failover doesn't happen | **Deferred to Checkpoint 2.** `MARKET_DATA_DESIGN.md` §11 specifies it is wired in the lifespan (§13), which does not exist until Checkpoint 2. Already listed under Carried forward |
+  | 3 | `status_provider()` unguarded, and the wiring documented in `backend/CLAUDE.md` raises `AttributeError` under the default simulator — escaping the generator, aborting the response, and putting `EventSource` into an infinite reconnect loop | **Fixed** in both places: guarded in `stream.py`, and the documented snippet now uses `getattr(source, "market_status", None)` |
+  | 4 | `_poll_loop` handled only `PermanentMarketDataError`; anything else silently killed the poller for the life of the process | **Fixed.** Catch-all in the loop, plus per-snapshot guarding in `_poll_once` so one malformed entry costs one ticker for one poll |
+  | 5 | Usability check was `len(price_cache) == 0`, which passes vacuously on a shared cache and accepts 1-of-10 tickers priced | **Fixed.** Checks the requested tickers specifically; warns and names the missing ones on partial coverage rather than forcing a fallback |
+  | 6 | Fallback simulator ignored `SIM_UPDATE_INTERVAL` / `SIM_EVENT_PROBABILITY` | **Fixed.** Both paths go through one `_create_simulator` helper |
+  | 7 | Bare `float(os.environ.get(...))` crashed startup on `MASSIVE_POLL_INTERVAL=` | **Fixed.** `_env_float` falls back to the default with a warning |
+  | 8 | `update_interval` not propagated to `dt`, so `SIM_UPDATE_INTERVAL` silently mis-scaled volatility | **Fixed.** `dt` is derived from the tick rate, so `sigma` stays annualised at any interval |
+
+  Fixes verified by mutation in both directions: restoring whole-body matching fails the
+  `request_id` test; restoring the original marker list fails 3 tests including a real 401 body.
+  `/security-review` not run — optional for this checkpoint per the gate definition.
 - **Diverged from plan:** one deliberate divergence. §16.4 specified SSE tests driven through
   `httpx.ASGITransport`; that cannot work, because the SSE generator is infinite by design and
   ASGITransport never delivers an `http.disconnect`, so `request.is_disconnected()` stays False and
@@ -858,11 +878,13 @@ item must be resolved or restated in a later entry — it does not expire by bei
   asserts the HTTP wiring off the router. Deterministic, no sleeps, and it reaches 97% on a module
   that had none. §16.4 of the design doc has been corrected to match
 - **Carried forward:**
-  - Gate 2 review is outstanding and blocks this checkpoint
   - `httpx` added to the backend dev dependencies; it is now unused after the §16.4 divergence and
     can be dropped if no later checkpoint needs it
   - `MassiveDataSource.on_permanent_failure` exists and is unit-tested, but nothing wires it yet —
-    Checkpoint 2's lifespan must connect it so mid-run failover reassigns the active source
+    Checkpoint 2's lifespan must connect it so mid-run failover reassigns the active source.
+    **This is review finding #2, deferred rather than resolved; it must not be lost**
+  - When Checkpoint 2 wires `status_provider`, use `getattr(source, "market_status", None)` — only
+    `MassiveDataSource` has that attribute, and the simulator is both the default and the fallback
   - `EventLog` is threaded through simulator → factory → stream, but no consumer constructs one
     yet; Checkpoint 2 must create it in the lifespan and pass it to both
   - `market_data_demo.py` still detects notable moves with its own `abs(change_percent) > 1.0`

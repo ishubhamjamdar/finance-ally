@@ -13,12 +13,24 @@ from app.market.simulator import SimulatorDataSource
 from .conftest import make_snapshot
 
 
+@pytest.fixture(autouse=True)
+def _no_network():
+    """These tests call start(), which builds a real RESTClient and then polls
+    market status over the wire. Patch the class, not the instance — stubbing
+    `source._client` does nothing because start() overwrites it."""
+    from unittest.mock import patch
+
+    def fetch(self):
+        return [make_snapshot(t) for t in self._tickers]
+
+    with patch("app.market.massive_client.RESTClient"):
+        with patch.object(MassiveDataSource, "_fetch_snapshots", fetch):
+            yield
+
+
 def _make_massive(cache: PriceCache) -> MassiveDataSource:
     """A Massive source that answers from fixtures instead of the network."""
-    source = MassiveDataSource(api_key="k", price_cache=cache, poll_interval=60.0)
-    source._client = object()
-    source._fetch_snapshots = lambda: [make_snapshot(t) for t in source._tickers]
-    return source
+    return MassiveDataSource(api_key="k", price_cache=cache, poll_interval=60.0)
 
 
 def _make_simulator(cache: PriceCache) -> SimulatorDataSource:

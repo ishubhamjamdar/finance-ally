@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 
 
 class PermanentMarketDataError(RuntimeError):
@@ -27,12 +28,29 @@ class MarketDataSource(ABC):
         await source.stop()
     """
 
+    #: Venue state, where the source knows it: "open" | "closed" |
+    #: "extended-hours", or None when the concept does not apply (the
+    #: simulator always trades). Declared here rather than on the one
+    #: implementation that populates it, so consumers can read
+    #: `source.market_status` without getattr() or isinstance().
+    market_status: str | None = None
+
+    #: Called when a source hits a failure that retrying cannot fix, to let the
+    #: application swap in a working source mid-session. Assign after
+    #: construction. A source that cannot fail permanently simply never calls it.
+    on_permanent_failure: Callable[[Exception], Awaitable[None]] | None = None
+
     @abstractmethod
     async def start(self, tickers: list[str]) -> None:
         """Begin producing updates. Call exactly once; twice is undefined.
 
-        Must populate the cache for at least one ticker before returning, or
-        raise, so the caller can decide whether the source is usable.
+        Populates the cache for as many tickers as it can before returning.
+        Raises on a failure that retrying cannot fix.
+
+        It deliberately does NOT promise that any ticker got a price: a
+        transient fetch failure leaves the cache empty and is worth retrying
+        rather than aborting. Callers that need prices must verify by reading
+        the cache — see `factory.start_market_data`.
         """
 
     @abstractmethod
@@ -44,7 +62,12 @@ class MarketDataSource(ABC):
 
     @abstractmethod
     async def add_ticker(self, ticker: str) -> None:
-        """Add to the active set. No-op if already present."""
+        """Add to the active set. No-op if already present.
+
+        When a price appears is source-specific: immediately for the simulator,
+        up to one poll interval later for a polling source. Callers must not
+        assume the ticker is priceable the moment this returns.
+        """
 
     @abstractmethod
     async def remove_ticker(self, ticker: str) -> None:

@@ -47,7 +47,3 @@ class EventLog:
     def cursor(self) -> int:
         with self._lock:
             return self._next_id
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._events)

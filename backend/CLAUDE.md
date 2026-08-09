@@ -60,8 +60,11 @@ Import from `app.market` only — never from a submodule. `__init__.py` is the s
 ```python
 router = create_stream_router(
     price_cache,
-    event_log=event_log,                    # optional: publishes `event: shock`
-    status_provider=lambda: source.market_status,  # optional: publishes `event: status`
+    event_log=event_log,   # optional: publishes `event: shock`
+    # optional: publishes `event: status`. Use getattr — only MassiveDataSource
+    # has `market_status`, and the simulator is both the default source and the
+    # fallback, so `source.market_status` would raise.
+    status_provider=lambda: getattr(source, "market_status", None),
 )
 # Endpoint: GET /api/stream/prices (text/event-stream)
 ```
@@ -81,10 +84,11 @@ per-ticker volatility/drift params are in `app/market/seed_prices.py`.
 |---|---|---|
 | `MASSIVE_API_KEY` | *(empty)* | Non-empty after `.strip()` selects Massive; else the simulator |
 | `MASSIVE_POLL_INTERVAL` | `15` | Seconds between polls (2-5 on Advanced+) |
-| `SIM_UPDATE_INTERVAL` | `0.5` | Simulator tick, seconds |
-| `SIM_EVENT_PROBABILITY` | `2e-5` | Shock chance per ticker per tick |
+| `SIM_UPDATE_INTERVAL` | `0.5` | Simulator tick, seconds. `dt` is derived from it, so `sigma` stays annualised volatility at any rate |
+| `SIM_EVENT_PROBABILITY` | `2e-5` | Shock chance per ticker **per tick** — so the per-hour shock rate scales with `SIM_UPDATE_INTERVAL`; the ~1-per-session figure assumes the 0.5 s default |
 
-`factory.py` is the only module that reads the environment.
+`factory.py` is the only module that reads the environment. Blank or malformed
+numeric values fall back to the default with a warning rather than crashing startup.
 
 ## Testing rules for this subsystem
 

@@ -181,8 +181,8 @@ class TestEventPublication:
         await asyncio.sleep(0.05)
         await source.stop()
 
-        assert len(log) > 0
         _, events = log.since(0)
+        assert events
         assert events[0].ticker == "AAPL"
 
     async def test_loop_survives_a_failing_step(self):
@@ -206,3 +206,22 @@ class TestEventPublication:
         await source.stop()
 
         assert calls["n"] > 3  # kept stepping after the failures
+
+
+@pytest.mark.asyncio
+class TestTimestepScaling:
+    """dt must follow the actual tick rate, or `sigma` stops meaning annualised
+    volatility the moment SIM_UPDATE_INTERVAL is changed."""
+
+    async def test_dt_matches_the_update_interval(self):
+        source = SimulatorDataSource(price_cache=PriceCache(), update_interval=2.0)
+        await source.start(["AAPL"])
+        expected = 2.0 / source._sim.TRADING_SECONDS_PER_YEAR
+        assert source._sim._dt == pytest.approx(expected)
+        await source.stop()
+
+    async def test_default_interval_keeps_the_default_dt(self):
+        source = SimulatorDataSource(price_cache=PriceCache())
+        await source.start(["AAPL"])
+        assert source._sim._dt == pytest.approx(source._sim.DEFAULT_DT)
+        await source.stop()

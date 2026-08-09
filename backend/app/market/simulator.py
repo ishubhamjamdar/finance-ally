@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 # sigma and making TICKER_PARAMS dead config.
 DEFAULT_EVENT_PROBABILITY = 2e-5
 
+# Simulator tick, seconds. GBMSimulator.DEFAULT_DT is derived from it.
+DEFAULT_UPDATE_INTERVAL = 0.5
+
 
 class GBMSimulator:
     """Geometric Brownian Motion simulator for correlated stock prices.
@@ -44,7 +47,7 @@ class GBMSimulator:
     """
 
     TRADING_SECONDS_PER_YEAR = 252 * 6.5 * 3600  # 5,896,800
-    DEFAULT_DT = 0.5 / TRADING_SECONDS_PER_YEAR  # ~8.48e-8
+    DEFAULT_DT = DEFAULT_UPDATE_INTERVAL / TRADING_SECONDS_PER_YEAR  # ~8.48e-8
 
     def __init__(
         self,
@@ -225,7 +228,7 @@ class SimulatorDataSource(MarketDataSource):
     def __init__(
         self,
         price_cache: PriceCache,
-        update_interval: float = 0.5,
+        update_interval: float = DEFAULT_UPDATE_INTERVAL,
         event_probability: float = DEFAULT_EVENT_PROBABILITY,
         event_log: EventLog | None = None,
     ) -> None:
@@ -238,7 +241,15 @@ class SimulatorDataSource(MarketDataSource):
 
     async def start(self, tickers: list[str]) -> None:
         tickers = [normalize_ticker(t) for t in tickers]
-        self._sim = GBMSimulator(tickers=tickers, event_probability=self._event_prob)
+        # dt is derived from the actual tick rate, not left at the 500 ms
+        # default. Otherwise SIM_UPDATE_INTERVAL=2 keeps 500 ms-sized moves but
+        # applies them a quarter as often, halving realised volatility so
+        # `sigma` no longer means annualised volatility.
+        self._sim = GBMSimulator(
+            tickers=tickers,
+            dt=self._interval / GBMSimulator.TRADING_SECONDS_PER_YEAR,
+            event_probability=self._event_prob,
+        )
 
         # Seed the cache BEFORE the loop spawns, so the first SSE frame and the
         # first trade both have prices — no empty-watchlist flash on load.
@@ -303,8 +314,6 @@ class SimulatorDataSource(MarketDataSource):
                 if self._sim:
                     for ticker, price in self._sim.step().items():
                         self._write(ticker, price)
-                    # `is not None`, not truthiness: EventLog defines __len__,
-                    # so an empty log is falsy and would never be published to.
                     if self._event_log is not None:
                         self._event_log.extend(self._sim.drain_events())
             except Exception:

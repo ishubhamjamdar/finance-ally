@@ -161,6 +161,23 @@ class TestNamedEvents:
         frames = await collect(PriceCache(), ticks=3)
         assert [f for f in frames if f.startswith("event: status")] == []
 
+    async def test_a_failing_status_provider_does_not_abort_the_stream(self):
+        """This generator's only other handler is CancelledError, so an
+        exception here would escape mid-body, abort the response, and put
+        EventSource into an infinite reconnect loop with no prices. The obvious
+        wiring — `lambda: source.market_status` — raises AttributeError whenever
+        the active source is the simulator, which is the default."""
+        cache = PriceCache()
+        cache.update("AAPL", 190.0)
+
+        def boom():
+            raise AttributeError("'SimulatorDataSource' object has no attribute 'market_status'")
+
+        frames = await collect(cache, ticks=4, status_provider=boom)
+
+        assert data_frames(frames)[0]["AAPL"]["price"] == 190.0  # prices still flow
+        assert [f for f in frames if f.startswith("event: status")] == []
+
 
 @pytest.mark.asyncio
 class TestHeartbeat:

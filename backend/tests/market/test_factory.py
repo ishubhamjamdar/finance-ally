@@ -10,7 +10,12 @@ from app.market.factory import create_market_data_source, start_market_data
 from app.market.massive_client import MassiveDataSource
 from app.market.simulator import SimulatorDataSource
 
-from .conftest import make_snapshot
+from .conftest import (
+    NOT_AUTHORIZED_BODY,
+    UNKNOWN_KEY_BODY,
+    make_snapshot,
+    offline_massive,
+)
 
 
 class TestFactory:
@@ -114,6 +119,24 @@ class TestEnvironmentTuning:
         assert source._interval == 0.5
         assert source._event_prob == 2e-5
 
+    @pytest.mark.parametrize("blank", ["", "   "])
+    def test_blank_numeric_env_falls_back_to_default(self, blank):
+        """`.env` files routinely carry `MASSIVE_POLL_INTERVAL=` with no value.
+        float("") raises, which would take startup down over a tuning knob."""
+        with patch.dict(
+            os.environ, {"MASSIVE_API_KEY": "k", "MASSIVE_POLL_INTERVAL": blank}, clear=True
+        ):
+            source = create_market_data_source(PriceCache())
+        assert source._interval == 15.0
+
+    def test_malformed_numeric_env_falls_back_to_default(self):
+        with patch.dict(
+            os.environ, {"SIM_UPDATE_INTERVAL": "fast", "SIM_EVENT_PROBABILITY": "?"}, clear=True
+        ):
+            source = create_market_data_source(PriceCache())
+        assert source._interval == 0.5
+        assert source._event_prob == 2e-5
+
     def test_event_log_is_passed_through(self):
         from app.market.events import EventLog
 
@@ -137,16 +160,22 @@ class TestStartMarketData:
         assert cache.get_price("AAPL") is not None
         await source.stop()
 
+    async def test_simulator_failure_propagates_rather_than_recursing(self):
+        """The simulator IS the fallback — when it is what failed there is
+        nothing left to swap in, so the error must surface."""
+        cache = PriceCache()
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(
+                SimulatorDataSource, "start", side_effect=RuntimeError("simulator broken")
+            ):
+                with pytest.raises(RuntimeError, match="simulator broken"):
+                    await start_market_data(cache, ["AAPL"])
+
     async def test_uses_massive_when_it_works(self):
         cache = PriceCache()
         with patch.dict(os.environ, {"MASSIVE_API_KEY": "k"}, clear=True):
-            with patch("app.market.massive_client.RESTClient"):
-                with patch.object(
-                    MassiveDataSource,
-                    "_fetch_snapshots",
-                    lambda self: [make_snapshot(t) for t in self._tickers],
-                ):
-                    source = await start_market_data(cache, ["AAPL"])
+            with offline_massive(snapshots=[make_snapshot("AAPL")]):
+                source = await start_market_data(cache, ["AAPL"])
 
         assert isinstance(source, MassiveDataSource)
         assert cache.get_price("AAPL") == 190.5
@@ -156,13 +185,8 @@ class TestStartMarketData:
         """An invalid key must yield a running simulator, not an empty cache."""
         cache = PriceCache()
         with patch.dict(os.environ, {"MASSIVE_API_KEY": "bad"}, clear=True):
-            with patch("app.market.massive_client.RESTClient"):
-                with patch.object(
-                    MassiveDataSource,
-                    "_fetch_snapshots",
-                    side_effect=Exception("401 Unauthorized"),
-                ):
-                    source = await start_market_data(cache, ["AAPL"])
+            with offline_massive(error=UNKNOWN_KEY_BODY):
+                source = await start_market_data(cache, ["AAPL"])
 
         assert isinstance(source, SimulatorDataSource)
         assert cache.get_price("AAPL") is not None
@@ -173,12 +197,51 @@ class TestStartMarketData:
         entitlement, no error anywhere — indistinguishable from a healthy app."""
         cache = PriceCache()
         with patch.dict(os.environ, {"MASSIVE_API_KEY": "basic"}, clear=True):
-            with patch("app.market.massive_client.RESTClient"):
-                with patch.object(MassiveDataSource, "_fetch_snapshots", lambda self: []):
-                    source = await start_market_data(cache, ["AAPL"])
+            with offline_massive(snapshots=[]):
+                source = await start_market_data(cache, ["AAPL"])
 
         assert isinstance(source, SimulatorDataSource)
         assert cache.get_price("AAPL") is not None
+        await source.stop()
+
+    async def test_falls_back_when_none_of_the_requested_tickers_priced(self):
+        """A pre-populated cache must not vouch for a source that priced nothing
+        the caller asked for."""
+        cache = PriceCache()
+        cache.update("STALE", 1.0)  # left over from an earlier run / shared cache
+
+        with patch.dict(os.environ, {"MASSIVE_API_KEY": "k"}, clear=True):
+            with offline_massive(snapshots=[]):
+                source = await start_market_data(cache, ["AAPL"])
+
+        assert isinstance(source, SimulatorDataSource)
+        assert cache.get_price("AAPL") is not None
+        await source.stop()
+
+    async def test_partial_coverage_keeps_massive_but_warns(self, caplog):
+        """One delisted ticker should not force everyone onto the simulator —
+        but the gap must be visible."""
+        cache = PriceCache()
+        with patch.dict(os.environ, {"MASSIVE_API_KEY": "k"}, clear=True):
+            with offline_massive(snapshots=[make_snapshot("AAPL")]):
+                with caplog.at_level("WARNING"):
+                    source = await start_market_data(cache, ["AAPL", "NOSUCH"])
+
+        assert isinstance(source, MassiveDataSource)
+        assert "NOSUCH" in caplog.text
+        await source.stop()
+
+    async def test_fallback_simulator_honours_env_tuning(self):
+        """A user who sets SIM_UPDATE_INTERVAL should not silently get stock
+        defaults the moment their API key stops working."""
+        cache = PriceCache()
+        env = {"MASSIVE_API_KEY": "bad", "SIM_UPDATE_INTERVAL": "0.05"}
+        with patch.dict(os.environ, env, clear=True):
+            with offline_massive(error=UNKNOWN_KEY_BODY):
+                source = await start_market_data(cache, ["AAPL"])
+
+        assert isinstance(source, SimulatorDataSource)
+        assert source._interval == 0.05
         await source.stop()
 
     async def test_fallback_receives_event_log(self):
@@ -187,11 +250,8 @@ class TestStartMarketData:
         cache = PriceCache()
         log = EventLog()
         with patch.dict(os.environ, {"MASSIVE_API_KEY": "bad"}, clear=True):
-            with patch("app.market.massive_client.RESTClient"):
-                with patch.object(
-                    MassiveDataSource, "_fetch_snapshots", side_effect=Exception("403 Forbidden")
-                ):
-                    source = await start_market_data(cache, ["AAPL"], event_log=log)
+            with offline_massive(error=NOT_AUTHORIZED_BODY):
+                source = await start_market_data(cache, ["AAPL"], event_log=log)
 
         assert source._event_log is log
         await source.stop()
