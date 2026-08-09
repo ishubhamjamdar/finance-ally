@@ -10,7 +10,9 @@ import random
 import numpy as np
 
 from .cache import PriceCache
+from .events import EventLog
 from .interface import MarketDataSource
+from .models import MarketEvent, normalize_ticker
 from .seed_prices import (
     CORRELATION_GROUPS,
     CROSS_GROUP_CORR,
@@ -20,105 +22,101 @@ from .seed_prices import (
     SEED_PRICES,
     TICKER_PARAMS,
     TSLA_CORR,
+    UNKNOWN_PRICE_RANGE,
 )
 
 logger = logging.getLogger(__name__)
+
+# ~1 event per ticker per 46,800-tick session. At the previous 0.001 the shock
+# process contributed ~24% daily volatility to every ticker alike, swamping
+# sigma and making TICKER_PARAMS dead config.
+DEFAULT_EVENT_PROBABILITY = 2e-5
+
+# Simulator tick, seconds. GBMSimulator.DEFAULT_DT is derived from it.
+DEFAULT_UPDATE_INTERVAL = 0.5
 
 
 class GBMSimulator:
     """Geometric Brownian Motion simulator for correlated stock prices.
 
-    Math:
         S(t+dt) = S(t) * exp((mu - sigma^2/2) * dt + sigma * sqrt(dt) * Z)
 
-    Where:
-        S(t)   = current price
-        mu     = annualized drift (expected return)
-        sigma  = annualized volatility
-        dt     = time step as fraction of a trading year
-        Z      = correlated standard normal random variable
-
-    The tiny dt (~8.5e-8 for 500ms ticks over 252 trading days * 6.5h/day)
-    produces sub-cent moves per tick that accumulate naturally over time.
+    Z is correlated across tickers via the Cholesky factor of a sector-based
+    correlation matrix. State is one float per ticker, so step() stays cheap at
+    2 Hz regardless of how long the process has been running.
     """
 
-    # 500ms expressed as a fraction of a trading year
-    # 252 trading days * 6.5 hours/day * 3600 seconds/hour = 5,896,800 seconds
     TRADING_SECONDS_PER_YEAR = 252 * 6.5 * 3600  # 5,896,800
-    DEFAULT_DT = 0.5 / TRADING_SECONDS_PER_YEAR  # ~8.48e-8
+    DEFAULT_DT = DEFAULT_UPDATE_INTERVAL / TRADING_SECONDS_PER_YEAR  # ~8.48e-8
 
     def __init__(
         self,
         tickers: list[str],
         dt: float = DEFAULT_DT,
-        event_probability: float = 0.001,
+        event_probability: float = DEFAULT_EVENT_PROBABILITY,
+        rng: np.random.Generator | None = None,
+        py_rng: random.Random | None = None,
     ) -> None:
         self._dt = dt
         self._event_prob = event_probability
+        # Injected RNGs so tests get deterministic paths without seeding globals.
+        self._rng = rng if rng is not None else np.random.default_rng()
+        self._py_rng = py_rng if py_rng is not None else random.Random()
 
-        # Per-ticker state
+        # _tickers is ORDERED and indexes the rows of the Cholesky factor:
+        # z_correlated[i] must line up with _tickers[i]. Any reordering must
+        # rebuild the factor.
         self._tickers: list[str] = []
         self._prices: dict[str, float] = {}
         self._params: dict[str, dict[str, float]] = {}
-
-        # Cholesky decomposition of the correlation matrix (for correlated moves)
+        self._session_open: dict[str, float] = {}  # serves as previous_close
+        self._events: list[MarketEvent] = []
         self._cholesky: np.ndarray | None = None
 
-        # Initialize all starting tickers
         for ticker in tickers:
             self._add_ticker_internal(ticker)
-        self._rebuild_cholesky()
+        self._rebuild_cholesky()  # once, not once per ticker
 
     # --- Public API ---
 
     def step(self) -> dict[str, float]:
-        """Advance all tickers by one time step. Returns {ticker: new_price}.
+        """Advance all tickers one step. Returns {ticker: new_price}.
 
-        This is the hot path — called every 500ms. Keep it fast.
+        Hot path — called every 500 ms. Shocks generated here are appended to an
+        internal buffer; call drain_events() to collect them.
         """
         n = len(self._tickers)
         if n == 0:
             return {}
 
-        # Generate n independent standard normal draws
-        z_independent = np.random.standard_normal(n)
-
-        # Apply Cholesky to get correlated draws
+        z = self._rng.standard_normal(n)
         if self._cholesky is not None:
-            z_correlated = self._cholesky @ z_independent
-        else:
-            z_correlated = z_independent
+            z = self._cholesky @ z
 
         result: dict[str, float] = {}
         for i, ticker in enumerate(self._tickers):
             params = self._params[ticker]
-            mu = params["mu"]
-            sigma = params["sigma"]
+            mu, sigma = params["mu"], params["sigma"]
 
-            # GBM: S(t+dt) = S(t) * exp((mu - 0.5*sigma^2)*dt + sigma*sqrt(dt)*Z)
             drift = (mu - 0.5 * sigma**2) * self._dt
-            diffusion = sigma * math.sqrt(self._dt) * z_correlated[i]
+            diffusion = sigma * math.sqrt(self._dt) * z[i]
             self._prices[ticker] *= math.exp(drift + diffusion)
 
-            # Random event: ~0.1% chance per tick per ticker
-            # With 10 tickers at 2 ticks/sec, expect an event ~every 50 seconds
-            if random.random() < self._event_prob:
-                shock_magnitude = random.uniform(0.02, 0.05)
-                shock_sign = random.choice([-1, 1])
-                self._prices[ticker] *= 1 + shock_magnitude * shock_sign
-                logger.debug(
-                    "Random event on %s: %.1f%% %s",
-                    ticker,
-                    shock_magnitude * 100,
-                    "up" if shock_sign > 0 else "down",
-                )
+            if self._py_rng.random() < self._event_prob:
+                self._apply_shock(ticker)
 
             result[ticker] = round(self._prices[ticker], 2)
 
         return result
 
+    def drain_events(self) -> list[MarketEvent]:
+        """Take the shocks generated since the last call."""
+        events, self._events = self._events, []
+        return events
+
     def add_ticker(self, ticker: str) -> None:
         """Add a ticker to the simulation. Rebuilds the correlation matrix."""
+        ticker = normalize_ticker(ticker)
         if ticker in self._prices:
             return
         self._add_ticker_internal(ticker)
@@ -126,106 +124,138 @@ class GBMSimulator:
 
     def remove_ticker(self, ticker: str) -> None:
         """Remove a ticker from the simulation. Rebuilds the correlation matrix."""
+        ticker = normalize_ticker(ticker)
         if ticker not in self._prices:
             return
         self._tickers.remove(ticker)
         del self._prices[ticker]
         del self._params[ticker]
+        self._session_open.pop(ticker, None)
         self._rebuild_cholesky()
 
     def get_price(self, ticker: str) -> float | None:
         """Current price for a ticker, or None if not tracked."""
-        return self._prices.get(ticker)
+        return self._prices.get(normalize_ticker(ticker))
+
+    def get_previous_close(self, ticker: str) -> float | None:
+        """The price this ticker opened the session at — the day-change baseline."""
+        return self._session_open.get(normalize_ticker(ticker))
 
     def get_tickers(self) -> list[str]:
-        """Return the list of currently tracked tickers."""
+        """Public so SimulatorDataSource never reaches into _tickers."""
         return list(self._tickers)
 
     # --- Internals ---
 
+    def _apply_shock(self, ticker: str) -> None:
+        """A sudden 2-5% move. Log-space so up and down are mirror images.
+
+        `*= (1 ± m)` would compound with a positive skew: a +5% followed by a
+        -5% does not return to the starting price.
+        """
+        magnitude = self._py_rng.uniform(0.02, 0.05)
+        sign = self._py_rng.choice((-1.0, 1.0))
+        self._prices[ticker] *= math.exp(magnitude * sign)
+        event = MarketEvent(
+            ticker=ticker,
+            magnitude_percent=round(sign * magnitude * 100, 2),
+            price=round(self._prices[ticker], 2),
+        )
+        self._events.append(event)
+        logger.info("Market event: %s %+.1f%%", ticker, event.magnitude_percent)
+
     def _add_ticker_internal(self, ticker: str) -> None:
-        """Add a ticker without rebuilding Cholesky (for batch initialization)."""
+        """Add without rebuilding Cholesky — lets __init__ rebuild once for N tickers."""
+        ticker = normalize_ticker(ticker)
         if ticker in self._prices:
             return
+        price = SEED_PRICES.get(ticker) or self._py_rng.uniform(*UNKNOWN_PRICE_RANGE)
         self._tickers.append(ticker)
-        self._prices[ticker] = SEED_PRICES.get(ticker, random.uniform(50.0, 300.0))
-        self._params[ticker] = TICKER_PARAMS.get(ticker, dict(DEFAULT_PARAMS))
+        self._prices[ticker] = price
+        self._session_open[ticker] = round(price, 2)
+        # dict(...) — a shared reference would let tuning one runtime ticker
+        # mutate the defaults for every other one.
+        self._params[ticker] = dict(TICKER_PARAMS.get(ticker, DEFAULT_PARAMS))
 
     def _rebuild_cholesky(self) -> None:
-        """Rebuild the Cholesky decomposition of the ticker correlation matrix.
-
-        Called whenever tickers are added or removed. O(n^2) but n < 50.
-        """
+        """O(n^2) build + O(n^3) factor, on add/remove only — never on the hot path."""
         n = len(self._tickers)
         if n <= 1:
-            self._cholesky = None
+            self._cholesky = None  # cholesky of 1x1 is pointless, of 0x0 raises
             return
 
-        # Build the correlation matrix
         corr = np.eye(n)
         for i in range(n):
             for j in range(i + 1, n):
                 rho = self._pairwise_correlation(self._tickers[i], self._tickers[j])
-                corr[i, j] = rho
-                corr[j, i] = rho
+                corr[i, j] = corr[j, i] = rho
 
-        self._cholesky = np.linalg.cholesky(corr)
+        try:
+            self._cholesky = np.linalg.cholesky(corr)
+        except np.linalg.LinAlgError:
+            # Cannot happen with the group-based rule, but a crash on
+            # add_ticker() would be user-visible. Degrade to independent draws.
+            logger.error("Correlation matrix not positive-definite — using independent draws")
+            self._cholesky = None
 
     @staticmethod
     def _pairwise_correlation(t1: str, t2: str) -> float:
-        """Determine correlation between two tickers based on sector grouping.
+        """Correlation between two tickers, from sector membership only.
 
-        Correlation structure:
-          - Same tech sector:   0.6
-          - Same finance sector: 0.5
-          - TSLA with anything: 0.3 (it does its own thing)
-          - Cross-sector:       0.3
-          - Unknown tickers:    0.3
+        Hand-editing individual pairs can break positive-definiteness and crash
+        the next add_ticker(); keep this a function of group membership.
         """
         tech = CORRELATION_GROUPS["tech"]
         finance = CORRELATION_GROUPS["finance"]
 
-        # TSLA is in tech set but behaves independently
+        # Checked FIRST: TSLA is in the tech set but stays weakly correlated.
         if t1 == "TSLA" or t2 == "TSLA":
             return TSLA_CORR
-
         if t1 in tech and t2 in tech:
             return INTRA_TECH_CORR
         if t1 in finance and t2 in finance:
             return INTRA_FINANCE_CORR
-
         return CROSS_GROUP_CORR
 
 
 class SimulatorDataSource(MarketDataSource):
     """MarketDataSource backed by the GBM simulator.
 
-    Runs a background asyncio task that calls GBMSimulator.step() every
-    `update_interval` seconds and writes results to the PriceCache.
+    Runs a background asyncio task that steps the simulation every
+    `update_interval` seconds and writes the results to the PriceCache.
     """
 
     def __init__(
         self,
         price_cache: PriceCache,
-        update_interval: float = 0.5,
-        event_probability: float = 0.001,
+        update_interval: float = DEFAULT_UPDATE_INTERVAL,
+        event_probability: float = DEFAULT_EVENT_PROBABILITY,
+        event_log: EventLog | None = None,
     ) -> None:
         self._cache = price_cache
         self._interval = update_interval
         self._event_prob = event_probability
+        self._event_log = event_log
         self._sim: GBMSimulator | None = None
         self._task: asyncio.Task | None = None
 
     async def start(self, tickers: list[str]) -> None:
+        tickers = [normalize_ticker(t) for t in tickers]
+        # dt is derived from the actual tick rate, not left at the 500 ms
+        # default. Otherwise SIM_UPDATE_INTERVAL=2 keeps 500 ms-sized moves but
+        # applies them a quarter as often, halving realised volatility so
+        # `sigma` no longer means annualised volatility.
         self._sim = GBMSimulator(
             tickers=tickers,
+            dt=self._interval / GBMSimulator.TRADING_SECONDS_PER_YEAR,
             event_probability=self._event_prob,
         )
-        # Seed the cache with initial prices so SSE has data immediately
+
+        # Seed the cache BEFORE the loop spawns, so the first SSE frame and the
+        # first trade both have prices — no empty-watchlist flash on load.
         for ticker in tickers:
-            price = self._sim.get_price(ticker)
-            if price is not None:
-                self._cache.update(ticker=ticker, price=price)
+            self._write(ticker)
+
         self._task = asyncio.create_task(self._run_loop(), name="simulator-loop")
         logger.info("Simulator started with %d tickers", len(tickers))
 
@@ -235,20 +265,20 @@ class SimulatorDataSource(MarketDataSource):
             try:
                 await self._task
             except asyncio.CancelledError:
-                pass
+                pass  # expected: we cancelled it
         self._task = None
         logger.info("Simulator stopped")
 
     async def add_ticker(self, ticker: str) -> None:
-        if self._sim:
-            self._sim.add_ticker(ticker)
-            # Seed cache immediately so the ticker has a price right away
-            price = self._sim.get_price(ticker)
-            if price is not None:
-                self._cache.update(ticker=ticker, price=price)
-            logger.info("Simulator: added ticker %s", ticker)
+        ticker = normalize_ticker(ticker)
+        if not self._sim:
+            return
+        self._sim.add_ticker(ticker)
+        self._write(ticker)  # priceable at once, not after up to 500 ms
+        logger.info("Simulator: added ticker %s", ticker)
 
     async def remove_ticker(self, ticker: str) -> None:
+        ticker = normalize_ticker(ticker)
         if self._sim:
             self._sim.remove_ticker(ticker)
         self._cache.remove(ticker)
@@ -257,14 +287,35 @@ class SimulatorDataSource(MarketDataSource):
     def get_tickers(self) -> list[str]:
         return self._sim.get_tickers() if self._sim else []
 
+    # --- Internals ---
+
+    def _write(self, ticker: str, price: float | None = None) -> None:
+        """Write one ticker to the cache, carrying its session-open baseline."""
+        if not self._sim:
+            return
+        value = price if price is not None else self._sim.get_price(ticker)
+        if value is None:
+            return
+        self._cache.update(
+            ticker=ticker,
+            price=value,
+            previous_close=self._sim.get_previous_close(ticker),
+        )
+
     async def _run_loop(self) -> None:
-        """Core loop: step the simulation, write to cache, sleep."""
+        """Step, write, publish events, sleep.
+
+        The try/except is INSIDE the while, not around it: a single bad step
+        logs and the loop survives. Wrapping the while would silently end all
+        price updates for the lifetime of the process.
+        """
         while True:
             try:
                 if self._sim:
-                    prices = self._sim.step()
-                    for ticker, price in prices.items():
-                        self._cache.update(ticker=ticker, price=price)
+                    for ticker, price in self._sim.step().items():
+                        self._write(ticker, price)
+                    if self._event_log is not None:
+                        self._event_log.extend(self._sim.drain_events())
             except Exception:
                 logger.exception("Simulator step failed")
             await asyncio.sleep(self._interval)

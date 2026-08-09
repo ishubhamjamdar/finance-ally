@@ -540,7 +540,7 @@ row to ⛔, write a log entry describing how far it got and what blocked it, and
 
 | # | Checkpoint | Depends on | G1 Test | G2 Review | G3 Record | Coverage | Status |
 |---|---|---|---|---|---|---|---|
-| 1 | Market data hardening | — | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 1 | Market data hardening | — | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #4) |
 | 2 | Backend skeleton + database | 1 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 3 | Portfolio & watchlist API | 2 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 4 | LLM chat integration | 3 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
@@ -814,4 +814,119 @@ item must be resolved or restated in a later entry — it does not expire by bei
 
 #### Entries
 
-*No checkpoints closed yet. The first entry lands with Checkpoint 1.*
+#### Checkpoint 1 — Market data hardening
+
+- **Closed:** 2026-08-09 · branch `checkpoint-1-market-data-hardening` · PR #4, squash-merged to
+  `main` · all three gates passed. The automated review workflow ran on each push and raised nothing
+  ("No buffered inline comments" on every run)
+- **Built:** all 17 changes from `MARKET_DATA_DESIGN.md` §17, across `backend/app/market/`
+  - `models.py` — `normalize_ticker()`, `previous_close` + `day_change`/`day_change_percent` on
+    `PriceUpdate`, new `MarketEvent`
+  - `events.py` — **new**: `EventLog`, a bounded ring buffer with per-client cursors
+  - `cache.py` — normalisation at every entry point, sticky `previous_close`, `is None` timestamp
+    check, `version` read under the lock
+  - `interface.py` — `PermanentMarketDataError`
+  - `simulator.py` — injected RNGs, log-space shocks, `event_probability` 0.001 → 2e-5,
+    session-open baseline, `drain_events()`, Cholesky `LinAlgError` degradation
+  - `massive_client.py` — the `extract_price`/`extract_timestamp`/`extract_previous_close` ladder,
+    permanent-vs-transient classification, 5 s timeouts, `get_market_status()` polling
+  - `factory.py` — `start_market_data()` with fail-fast-then-fallback, `MASSIVE_POLL_INTERVAL` /
+    `SIM_UPDATE_INTERVAL` / `SIM_EVENT_PROBABILITY`
+  - `stream.py` — router built inside the factory, heartbeat comments, `event: shock` and
+    `event: status` frames
+- **Exit criteria:**
+  - *Massive fixture test fails if the ladder is reverted* — **verified by mutation.** Restoring
+    `snap.last_trade.timestamp / 1000.0` fails 16 tests; the previous `MagicMock` suite passed that
+    same mutation. Two further mutations run: removing the Cholesky multiply fails 2 correlation
+    tests; switching shocks back to `*= (1 ± m)` fails 2 shock tests
+  - *Contract tests pass for both sources* — `test_source_contract.py`, 7 tests × 2 sources
+  - *Invalid key yields a running simulator* — `test_falls_back_on_permanent_failure`, plus
+    `test_falls_back_when_authenticated_but_no_prices` for the Basic-plan case
+  - *Realised volatility within a factor of two of `TICKER_PARAMS`* — measured over a full
+    46,800-tick session per ticker, shocks disabled: every ticker lands at **1.00–1.07×** its
+    configured sigma (AAPL 0.230 vs 0.22, TSLA 0.501 vs 0.50, JPM 0.193 vs 0.18)
+  - *Suite green, coverage ≥ 85% on `app/market/`* — **228 passed, 100%**
+- **Tests:** 73 → **228** (+155). Three consecutive full runs green after every pass, no flakes.
+  `ruff check` and `ruff format --check` clean. Coverage 84% → **100%** on `app/market/`, every
+  module at 100%. Runtime 6.5 s → **2.0 s**, with no network access at all
+
+  One test of mine was itself wrong and was rewritten: the first log-space-shock test derived the
+  magnitude from the result and inverted it, so it passed under `*= (1 ± m)` too. Mutation testing
+  is what caught it. A second used `"401"` as an error body — which the corrected classifier rightly
+  treats as transient — and hung the suite rather than failing; the permanent-failure loop tests now
+  use real bodies and `asyncio.wait_for`, so a regression fails instead of hanging
+- **Review:** `/code-review high` returned 8 findings — **7 fixed, 1 deferred with reason.**
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | 1 | `is_permanent_failure` classified on the raw body, so `"401"`/`"403"` could never match a real Polygon body (false negative on a dead key) while a random hex `request_id` could match one (false positive on a 429) | **Fixed.** The SDK raises `BadResponse(resp.data.decode())` and discards `resp.status` — verified in `massive/rest/base.py` — so the HTTP code is genuinely unavailable. Now parses the body's `status`/`message`/`error` fields and matches on real wording (`Unknown API Key`, `NOT_AUTHORIZED`); `AuthError` is permanent. Test bodies replaced with real ones |
+  | 2 | `on_permanent_failure` accepted but never wired, so mid-run failover doesn't happen | **Deferred to Checkpoint 2.** `MARKET_DATA_DESIGN.md` §11 specifies it is wired in the lifespan (§13), which does not exist until Checkpoint 2. Already listed under Carried forward |
+  | 3 | `status_provider()` unguarded, and the wiring documented in `backend/CLAUDE.md` raises `AttributeError` under the default simulator — escaping the generator, aborting the response, and putting `EventSource` into an infinite reconnect loop | **Fixed** in both places: guarded in `stream.py`, and the documented snippet now uses `getattr(source, "market_status", None)` |
+  | 4 | `_poll_loop` handled only `PermanentMarketDataError`; anything else silently killed the poller for the life of the process | **Fixed.** Catch-all in the loop, plus per-snapshot guarding in `_poll_once` so one malformed entry costs one ticker for one poll |
+  | 5 | Usability check was `len(price_cache) == 0`, which passes vacuously on a shared cache and accepts 1-of-10 tickers priced | **Fixed.** Checks the requested tickers specifically; warns and names the missing ones on partial coverage rather than forcing a fallback |
+  | 6 | Fallback simulator ignored `SIM_UPDATE_INTERVAL` / `SIM_EVENT_PROBABILITY` | **Fixed.** Both paths go through one `_create_simulator` helper |
+  | 7 | Bare `float(os.environ.get(...))` crashed startup on `MASSIVE_POLL_INTERVAL=` | **Fixed.** `_env_float` falls back to the default with a warning |
+  | 8 | `update_interval` not propagated to `dt`, so `SIM_UPDATE_INTERVAL` silently mis-scaled volatility | **Fixed.** `dt` is derived from the tick rate, so `sigma` stays annualised at any interval |
+
+  Fixes verified by mutation in both directions: restoring whole-body matching fails the
+  `request_id` test; restoring the original marker list fails 3 tests including a real 401 body.
+  `/security-review` not run — optional for this checkpoint per the gate definition.
+
+  `/simplify` (4 agents) then found one thing that mattered and several that tightened the design:
+
+  - **The `[massive]` contract tests were making real HTTPS calls to `api.massive.com`.** Stubbing
+    the instance was never enough — `start()` overwrites `_client` with a real `RESTClient` and then
+    polls market status. Seven round trips, ~4.5 s of a 6.4 s suite, and the tests failed offline.
+    Now patched at the class level: **suite 6.5 s → 2.0 s, zero network access**
+  - `market_status` and `on_permanent_failure` moved onto the `MarketDataSource` ABC. Consumers stop
+    needing `getattr`, the SSE guard stops being load-bearing, and Checkpoint 2's lifespan will not
+    have to reach into a private attribute to wire failover
+  - `EventLog.__len__` deleted — no production caller, and its only legacy was the falsy-empty-log
+    trap that had already caused one silent bug plus three documented workarounds
+  - `start_market_data` now starts and verifies every source identically; `isinstance` guards only
+    the recursion. Tuning defaults have one owner each; test builders and real error bodies moved to
+    `conftest.py`; `extract_price` reuses `extract_previous_close`
+  - The ABC's `start()` docstring promised "populate the cache or raise", which `MassiveDataSource`
+    does not honour — which is exactly why the factory re-verifies. Corrected to match reality
+
+  Skipped, with reasons: hoisting the duplicated `stop()` into the ABC (§7 deliberately chose
+  contract over inheritance); deleting `_classifiable_text` (it keeps classification off the opaque
+  `request_id` by construction, rather than by luck about which markers happen to be hex);
+  parametrising the seven pre-existing factory tests (outside this diff).
+- **Diverged from plan:** one deliberate divergence. §16.4 specified SSE tests driven through
+  `httpx.ASGITransport`; that cannot work, because the SSE generator is infinite by design and
+  ASGITransport never delivers an `http.disconnect`, so `request.is_disconnected()` stays False and
+  closing the response hangs forever (verified — it blocks before the first frame). `test_stream.py`
+  instead drives `_generate_events` directly with a stub request that disconnects after N ticks, and
+  asserts the HTTP wiring off the router. Deterministic, no sleeps, and it reaches 97% on a module
+  that had none. §16.4 of the design doc has been corrected to match
+- **Closing pass (2026-08-09, same branch):** the three loose ends that were CP1's own rather than
+  CP2's were closed before merge, taking `app/market/` to **100%** coverage:
+  - The two uncovered lines are now tested, and both tests were **mutation-verified**. Removing the
+    `CancelledError` handler fails the two new stream tests. The `_refresh_market_status` guard
+    needed the stronger assertion: a plain "does not raise" test *survived* removing the guard,
+    because the catch-all below swallows the resulting `AttributeError`. It now asserts the silence
+    — no "Market status unavailable" log — and that kills the mutation. Note the log entry above
+    misdescribed this line as "the `get_market_status` success path"; it is the `self._client is
+    None` early return, which is reached when `_poll_loop` refreshes status before `start()`
+  - `market_data_demo.py` now consumes `EventLog` instead of its own `abs(change_percent) > 1.0`
+    heuristic. That heuristic was effectively dead: tick-over-tick change at 500 ms is ~0.02%, so
+    the panel never populated. The demo also raises `event_probability` to `2.5e-3` — at the 2e-5
+    production default a 60-second run expects 0.02 shocks. Measured over 30 seeded runs the demo
+    now averages **3.2 shocks per run** (min 0, max 6)
+  - `httpx` is **kept, not dropped**: starlette's `TestClient` requires it, and Checkpoint 2 needs
+    that for `GET /api/health`. Its `pyproject.toml` comment, which still claimed it was for the
+    SSE integration tests, has been corrected
+- **Carried forward:**
+  - `on_permanent_failure` is now a public attribute on the `MarketDataSource` ABC and is
+    unit-tested, but nothing assigns it yet — Checkpoint 2's lifespan must, so mid-run failover
+    reassigns the active source. **This is review finding #2, deferred rather than resolved; it must
+    not be lost**
+  - `status_provider` can now be wired as plain `lambda: source.market_status` — `market_status` is
+    on the ABC, so the old `getattr` workaround is no longer needed
+  - `EventLog` is threaded through simulator → factory → stream, and `market_data_demo.py` now
+    constructs one, but no *server* consumer does; Checkpoint 2 must create it in the lifespan and
+    pass it to both the source and the stream router
+  - `app/market/` is at 100% line coverage. That is a floor to hold, not a target reached: it says
+    every line runs, not that every line is pinned. Two of the newest tests only became meaningful
+    once mutation testing showed the obvious version passing against broken code

@@ -1927,6 +1927,16 @@ def test_shock_rate_matches_configuration():
 
 ### 16.4 SSE integration test
 
+> **Corrected during Checkpoint 1.** The `httpx.ASGITransport` approach below **does not work** and
+> was not shipped. The SSE generator is infinite by design, and ASGITransport never delivers an
+> `http.disconnect` message, so `request.is_disconnected()` never returns True and closing the
+> response blocks forever — verified: the client hangs before receiving even the first frame.
+>
+> The shipped `tests/market/test_stream.py` instead drives `_generate_events` directly with a stub
+> request that reports disconnected after N loop iterations, and asserts the HTTP wiring (route
+> path, media type, headers) off the router object. That is deterministic, needs no sleeps, and
+> takes `stream.py` from 31% to 97%. The code below is retained only to record what was tried.
+
 `stream.py` sat at 31% coverage with no dedicated tests, despite being the primary consumer of the
 cache. An ASGI transport tests it without a real server:
 
