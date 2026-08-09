@@ -220,9 +220,14 @@ class MassiveDataSource(MarketDataSource):
                 await self._task
             except asyncio.CancelledError:
                 pass
+        self._teardown()
+        logger.info("Massive poller stopped")
+
+    def _teardown(self) -> None:
+        """Drop everything that outlives a finished poller. One definition of
+        "this source is done", so the two paths that reach it cannot diverge."""
         self._task = None
         self._client = None
-        logger.info("Massive poller stopped")
 
     async def add_ticker(self, ticker: str) -> None:
         ticker = normalize_ticker(ticker)
@@ -255,6 +260,13 @@ class MassiveDataSource(MarketDataSource):
                 # becomes a permanently empty UI with no signal. Stop, shout,
                 # and let the app fail over.
                 logger.error("Massive permanently unavailable, stopping poller: %s", exc)
+                # Torn down BEFORE the callback, not after, so the ABC's promise
+                # that stop() is always safe holds even when it is called from
+                # inside the callback — which runs in this very task. With
+                # _task already cleared there is nothing left for stop() to
+                # cancel, so a handler doing the obvious thing cannot cancel the
+                # coroutine performing the failover.
+                self._teardown()
                 if self.on_permanent_failure is not None:
                     await self.on_permanent_failure(exc)
                 return

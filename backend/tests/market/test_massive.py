@@ -379,6 +379,50 @@ class TestPollLoop:
         assert len(notified) == 1
         assert isinstance(notified[0], PermanentMarketDataError)
 
+    async def test_stop_is_safe_from_inside_the_failure_callback(self):
+        """The ABC lets a handler call stop() on the source that just failed —
+        the obvious thing to do — even though the callback runs inside that
+        source's own task. Honouring it is the source's job: it must release
+        the task before awaiting the callback, or stop() cancels the very
+        coroutine performing the failover.
+        """
+        stopped = []
+        task_when_called = []
+
+        source = MassiveDataSource(api_key="bad", price_cache=PriceCache(), poll_interval=0.01)
+
+        async def on_failure(exc: Exception) -> None:
+            task_when_called.append(source._task)
+            await source.stop()
+            # The real handler awaits `fallback.start()` here, so keep an await
+            # after stop() — that is where a scheduled cancellation lands.
+            await asyncio.sleep(0)
+            stopped.append(exc)
+
+        source.on_permanent_failure = on_failure
+        source._tickers = ["AAPL"]
+        source._client = object()
+        source._fetch_snapshots = lambda: (_ for _ in ()).throw(Exception(NOT_AUTHORIZED_BODY))
+
+        # The loop must run AS the task stop() would cancel — exactly how
+        # start() launches it. Awaiting _poll_loop() directly leaves _task
+        # unset, so stop() finds nothing to cancel and the test passes against
+        # a source that never releases its task at all.
+        task = asyncio.create_task(source._poll_loop())
+        source._task = task
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+        assert len(stopped) == 1, "the callback did not run to completion"
+        assert task_when_called == [None], "the task was not released before the callback"
+        # The decisive one. stop()'s own `except CancelledError` absorbs a
+        # self-cancel, so the callback finishes either way and no amount of
+        # asserting on its result can tell the two apart. cancelling() records
+        # that a cancellation was *requested* at all — it stays 0 only if the
+        # task really was released first, and a swallowed cancel never gets
+        # uncancel()ed back down.
+        assert task.cancelling() == 0, "stop() cancelled the task performing the failover"
+        assert source._client is None  # the RESTClient's pool is released either way
+
     async def test_permanent_failure_without_a_callback_still_stops(self):
         source = MassiveDataSource(api_key="bad", price_cache=PriceCache(), poll_interval=0.01)
         source._tickers = ["AAPL"]

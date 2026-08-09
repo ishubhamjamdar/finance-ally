@@ -130,6 +130,11 @@ MASSIVE_API_KEY=
 
 # Optional: Set to "true" for deterministic mock LLM responses (testing)
 LLM_MOCK=false
+
+# Optional: paths, defaulted for local development and overridden in the image
+DB_PATH=            # SQLite file. Default <repo>/db/finally.db; the container sets /app/db/finally.db
+STATIC_DIR=         # Built frontend. Default backend/static, then frontend/out
+LOG_LEVEL=INFO
 ```
 
 ### Behavior
@@ -138,6 +143,8 @@ LLM_MOCK=false
 - If `MASSIVE_API_KEY` is absent or empty → backend uses the built-in market simulator
 - If `LLM_MOCK=true` → backend returns deterministic mock LLM responses (for E2E tests)
 - The backend reads `.env` from the project root (mounted into the container or read via docker `--env-file`)
+- `DB_PATH`, `STATIC_DIR` and `LOG_LEVEL` are read at call time, not at import, and every one of
+  them has a working default — a `.env` with only `OPENROUTER_API_KEY` runs the whole app
 
 ---
 
@@ -541,7 +548,7 @@ row to ⛔, write a log entry describing how far it got and what blocked it, and
 | # | Checkpoint | Depends on | G1 Test | G2 Review | G3 Record | Coverage | Status |
 |---|---|---|---|---|---|---|---|
 | 1 | Market data hardening | — | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #4) |
-| 2 | Backend skeleton + database | 1 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 2 | Backend skeleton + database | 1 | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #5) |
 | 3 | Portfolio & watchlist API | 2 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 4 | LLM chat integration | 3 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 5 | Frontend scaffold + live prices | 2 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
@@ -930,3 +937,109 @@ item must be resolved or restated in a later entry — it does not expire by bei
   - `app/market/` is at 100% line coverage. That is a floor to hold, not a target reached: it says
     every line runs, not that every line is pinned. Two of the newest tests only became meaningful
     once mutation testing showed the obvious version passing against broken code
+
+#### Checkpoint 2 — Backend skeleton + database
+
+- **Closed:** 2026-08-09 · branch `checkpoint-2-backend-skeleton-db` · PR #5 · all three gates
+  passed
+- **Built:**
+  - `app/main.py` — `create_app()` factory (own `PriceCache` + `EventLog` per instance), lifespan
+    that loads tracked tickers from the database, starts the feed, wires failover, and stops on
+    shutdown; static mount tolerating an absent frontend build
+  - `app/db/schema.sql` — the six §7 tables plus three `(user_id, time)` indexes
+  - `app/db/database.py` — `connect()`, `transaction()`, race-safe lazy init, seeding,
+    `load_tracked_tickers()`
+  - `app/api/health.py` — `GET /api/health`, probing the database for real
+  - `app/paths.py` — **new**: one owner for `BACKEND_DIR` / `REPO_ROOT` / `is_source_checkout()`
+  - `app/market/` additions: `DEFAULT_TICKERS` (derived from `SEED_PRICES`), public
+    `create_simulator_source()`, `MassiveDataSource._teardown()`, and the `on_permanent_failure`
+    contract on the ABC
+- **Exit criteria:** all four met, verified by running them against a live server, twice — once at
+  Gate 1 and again after the review and simplify passes
+  - *`uvicorn app.main:app` starts, `GET /api/health` → 200* — 200, reporting
+    `SimulatorDataSource`, 10 tickers
+  - *Deleting `db/finally.db` and issuing any request recreates it, twice in a row* — both passes:
+    6 tables, profile at $10,000, 10 watchlist rows. Also covered at both layers in the suite
+  - *SSE emits price frames within two seconds and a heartbeat when idle* — 4 frames in 2 s; the
+    `: keep-alive` needs a genuinely idle cache, so it was observed with `SIM_UPDATE_INTERVAL=600`
+  - *Seeded watchlist == the tickers the source was started with* — database, stream and
+    `/api/health` all agree on the same ten
+- **Tests:** 228 → **295** (+67). Three consecutive full runs green. Coverage 100% → **100%** on
+  `app/`, every module at 100%, `app/market/`'s CP1 floor held
+- **Review:** `/code-review high` returned **6 findings, all 6 fixed.** Two were HIGH and
+  compounding — the second is why the first survived Gate 1:
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | 1 | Lazy init was not atomic. `executescript()` issues an implicit COMMIT when a transaction is pending, so `BEGIN IMMEDIATE` was committed before the schema ran and `rollback()` rolled back nothing. A failed seed left six empty tables — and since their presence *was* the "initialised" test, every later connection skipped init and the app ran forever with no cash balance | **Fixed**, two ways. The schema is split with `sqlite3.complete_statement` and executed inside the transaction; and `_is_initialized` now requires the seeded profile row, so a database in that state repairs itself |
+  | 2 | The test for #1 was vacuous: `monkeypatch.undo()` also reverted the autouse `DB_PATH` fixture, so its assertions ran against the developer's real, fully seeded database. Verified — running it alone recreated `db/finally.db` in a clean repo | **Fixed.** The `_seed` patch uses its own `MonkeyPatch.context()`, and the test asserts `DB_PATH` survived |
+  | 3 | The health probe discarded its result; `SELECT 1 … LIMIT 1` returns `None` on an empty table without error, so an unseeded database reported "ok" | **Fixed at the root** in #1, and the shallow duplicate then removed during `/simplify` — see below |
+  | 4 | `load_tracked_tickers` normalised *after* the `UNION`, so `aapl` and `AAPL` both survived and both became `AAPL`: one ticker priced twice and sent twice in every Massive request | **Fixed.** Deduplicated after normalising, and `UNION ALL` since SQL's dedupe was doing nothing useful |
+  | 5 | A failure inside the failover handler escaped into an `except` block in the dying source's task, surfacing only as "Task exception was never retrieved" while `/api/health` kept reporting the dead source as live | **Fixed.** Caught, logged, slot cleared; the callback is also assigned to the replacement |
+  | 6 | Shutdown read `app.state.market_source` once, so a failover completing mid-shutdown left a simulator ticking past shutdown; the failed source's `RESTClient` was never released | **Fixed**, later deepened by `/simplify` into a `shutting_down` flag that closes the window rather than draining it |
+
+  `/security-review` not run — optional for this checkpoint per the gate definition. Every fix was
+  mutation-verified: reverting any one of the seven changes fails the test written for it and
+  nothing else. Gate 1 was then re-run in full.
+
+  `/simplify` (4 agents) found the efficiency angle clean and the other three not:
+
+  - **The invariant moved to the layer that owns it.** "Never stop the source that just failed" was
+    a rule the *app* had to know, because the callback runs inside that source's own task.
+    `MassiveDataSource` now tears down before awaiting the callback, and the ABC states that
+    handlers may call `stop()`. The app does the obvious thing again
+  - **The shutdown/failover race is closed, not absorbed** — a `shutting_down` flag means no
+    failover can install a replacement once shutdown has begun
+  - **`app/paths.py`** — the database default and the static search path stopped counting
+    `parents[N]` independently, and `frontend/out` is only guessed at inside a source checkout
+  - **The health endpoint's unseeded-database branch was deleted.** It was review finding #3's
+    shallow form, living in a router, and unreachable except through a stub once #1 fixed the root
+  - Test duplication consolidated into `tests/conftest.py`: the ten-ticker literal, `add_position`,
+    the five-times-repeated failover stub, and the delete-the-database glob
+  - Efficiency measured rather than assumed: `connect()` costs ~500 µs, not the "microseconds" the
+    docstring claimed — most of it WAL sidecar setup, since no connection is held open. The claim
+    is corrected in `database.py` and `CLAUDE.md`, with the threshold that matters spelled out:
+    fine at human cadence, never on the 500 ms tick
+
+  Two things found while verifying those changes were worse than any of the findings:
+
+  1. **`tests/db` flaked with "database is locked", about one run in six.** Real, not test noise.
+     `PRAGMA journal_mode=WAL` takes a brief exclusive lock, SQLite returns `SQLITE_BUSY` for it
+     *without* consulting the busy handler, and it ran before `busy_timeout` was even set — so
+     several first requests arriving together (a browser opening the page) could 500. Fixed:
+     `busy_timeout` first, and a contended WAL switch tolerated, since whoever wins sets the
+     identical mode. **12/12 clean; the old ordering fails 2/12.** A deterministic test covers the
+     tolerance, because a 1-in-6 reproduction is not a gate
+  2. **A new test of mine was vacuous twice over.** It awaited `_poll_loop()` directly, so `_task`
+     was never set and `stop()` had nothing to cancel. Fixed, it *still* passed against the broken
+     source, because `stop()`'s own `except CancelledError` absorbs a self-cancel and the callback
+     completes either way — no assertion on its result can separate the two. It now asserts
+     `task.cancelling() == 0`: a cancellation requested and swallowed still leaves a trace
+- **Diverged from plan:** three deliberate divergences, all recorded in the spec above
+  - `MARKET_DATA_DESIGN.md` §13.1 shows `await load_tracked_tickers()` and a `hasattr` probe for
+    `_on_permanent_failure`. The database layer is **synchronous** — the lifespan calls it directly
+    at startup, where nothing else is running — and `on_permanent_failure` is a public ABC
+    attribute since CP1, so it is assigned plainly. §13.1 has been corrected
+  - Three environment variables the plan did not list — `DB_PATH`, `STATIC_DIR`, `LOG_LEVEL` — now
+    appear in §5. All three have working defaults; a `.env` holding only `OPENROUTER_API_KEY` runs
+    the whole app
+  - `schema.sql` adds three indexes on `(user_id, <time column>)` beyond the §7 columns, for the
+    trade blotter, the P&L series and chat replay
+- **Carried forward:**
+  - **`app/api/deps.py` is Checkpoint 3's first task.** `MARKET_DATA_DESIGN.md` §13.1 specifies
+    `Depends(get_price_cache)` / `Depends(get_market_source)`; CP2 has one handler and did not need
+    them, but CP3 adds six that do, each otherwise repeating "what if `market_source` is `None`?".
+    `get_market_source` should raise `HTTPException(503)` there, once. `/api/health` stays the
+    deliberate exception — reporting "no source" is its job
+  - Watchlist handlers must be `async def` with the SQLite call in `run_in_threadpool`: a `def`
+    handler cannot `await source.add_ticker()`, and mutating the watchlist without telling the
+    source leaves a new ticker permanently unpriced. Written up in `backend/CLAUDE.md`
+  - `transaction()` exists and is tested but has no production caller yet. CP3's trade path is its
+    first: a trade touches `positions`, `trades`, `users_profile` and `portfolio_snapshots` and
+    must not land partially
+  - The §7 background task writing a `portfolio_snapshots` row every 30 seconds is **not built** —
+    it is Checkpoint 3 scope, and the lifespan is where it goes
+  - `app.state.shutting_down` is read by the failover handler. Anything else that installs a source
+    must respect it, or it will leak a task past shutdown
+  - Coverage is 100% on `app/` and that is a floor, not an achievement. Three of this
+    checkpoint's tests passed against deliberately broken code before mutation testing exposed them

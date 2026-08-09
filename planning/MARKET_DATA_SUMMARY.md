@@ -117,6 +117,16 @@ all_prices = cache.get_all()        # dict[str, PriceUpdate]
 await source.add_ticker("TSLA")
 await source.remove_ticker("GOOGL")
 
+# Mid-session failover: a source that hits a failure retrying cannot fix calls
+# this, so the app can swap in a working one. Wired in app/main.py's lifespan
+# since Checkpoint 2. Calling stop() on the failed source from inside the
+# callback is safe — sources release their task before invoking it.
+source.on_permanent_failure = handler
+
 # Shutdown
 await source.stop()
 ```
+
+**Consumed by `app/main.py` since Checkpoint 2**, which owns the one `PriceCache` and `EventLog`,
+starts the source from `load_tracked_tickers()`, and mounts `create_stream_router` with
+`status_provider=lambda: current_market_status(app)`.

@@ -38,6 +38,12 @@ class MarketDataSource(ABC):
     #: Called when a source hits a failure that retrying cannot fix, to let the
     #: application swap in a working source mid-session. Assign after
     #: construction. A source that cannot fail permanently simply never calls it.
+    #:
+    #: Invoked from inside the source's own background task, so a source MUST
+    #: release that task before awaiting this — otherwise a handler calling
+    #: `stop()` on the source that just failed, the obvious thing to do,
+    #: cancels the coroutine doing the failover. Handlers are entitled to call
+    #: `stop()` here; keeping that true is the source's job, not theirs.
     on_permanent_failure: Callable[[Exception], Awaitable[None]] | None = None
 
     @abstractmethod
