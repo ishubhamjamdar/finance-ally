@@ -1517,50 +1517,96 @@ from app.db import load_tracked_tickers      # union(watchlist, position tickers
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- startup ---
-    price_cache = PriceCache()
-    event_log = EventLog()
-    app.state.price_cache = price_cache
-    app.state.event_log = event_log
-
-    tickers = await load_tracked_tickers()
-    source = await start_market_data(price_cache, tickers, event_log=event_log)
+    # Synchronous: the database layer is plain sqlite3, and this runs before
+    # anything is being served, so there is no event loop to stall. It is also
+    # what lazily creates and seeds the database on first boot.
+    tickers = load_tracked_tickers()
+    source = await start_market_data(
+        app.state.price_cache, tickers, event_log=app.state.event_log
+    )
+    source.on_permanent_failure = make_failover_handler(app)   # public since CP1
     app.state.market_source = source
 
-    async def on_permanent_failure(exc: Exception) -> None:
-        """Massive died mid-run — hot-swap to the simulator so the UI stays live."""
-        from app.market.simulator import SimulatorDataSource
+    try:
+        yield
+    finally:
+        # --- shutdown ---
+        # Set before the first await, so a failover completing right now sees
+        # it and retires its own replacement instead of leaving a task running
+        # that nothing will ever stop.
+        app.state.shutting_down = True
+        current, app.state.market_source = app.state.market_source, None
+        if current is not None:
+            await current.stop()
+```
 
-        logger.error("Falling back to simulator after Massive failure: %s", exc)
-        fallback = SimulatorDataSource(price_cache=price_cache, event_log=event_log)
-        await fallback.start(app.state.market_source.get_tickers())
-        app.state.market_source = fallback     # handlers read app.state per request
+The cache, the event log and the router are built in `create_app()` rather than in the lifespan, so
+the routes exist before startup and each test gets its own instances:
 
-    if hasattr(source, "_on_permanent_failure"):
-        source._on_permanent_failure = on_permanent_failure
+```python
+def create_app() -> FastAPI:
+    price_cache, event_log = PriceCache(), EventLog()
+    app = FastAPI(title="FinAlly", lifespan=lifespan)
+    app.state.price_cache = price_cache
+    app.state.event_log = event_log
+    app.state.market_source = None
+    app.state.shutting_down = False
 
+    app.include_router(health_router)
     app.include_router(
         create_stream_router(
             price_cache,
             event_log=event_log,
-            status_provider=lambda: getattr(app.state.market_source, "market_status", None),
+            # Read through app.state, never captured: failover replaces the
+            # source, and a captured reference reports the dead one forever.
+            status_provider=lambda: current_market_status(app),
         )
     )
+    mount_static(app)      # last: StaticFiles at "/" matches every path
+    return app
+```
 
-    yield
+The failover handler builds a simulator *specifically* — re-running source selection would read
+`MASSIVE_API_KEY` and hand back the source that just died:
 
-    # --- shutdown ---
-    await app.state.market_source.stop()
+```python
+async def on_permanent_failure(exc: Exception) -> None:
+    failed = app.state.market_source
+    tickers = failed.get_tickers() if failed is not None else []
+    try:
+        fallback = create_simulator_source(app.state.price_cache, event_log=app.state.event_log)
+        fallback.on_permanent_failure = on_permanent_failure   # protect the replacement too
+        await fallback.start(tickers)
+    except Exception:
+        # Invoked from an `except` block in the failed source's own task, so an
+        # escape here shows up only as "Task exception was never retrieved".
+        logger.exception("Failover failed; no market data source is running")
+        app.state.market_source = None
+        return
+
+    if app.state.shutting_down:
+        await fallback.stop()
+        return
+
+    app.state.market_source = fallback
+    if failed is not None:
+        await failed.stop()     # safe from in here — see §7 on on_permanent_failure
+```
+
+Handlers reach these through `Depends` providers in `app/api/deps.py`, which resolve the
+`market_source is None` case (before startup, or after a failover that could not start a
+replacement) exactly once rather than in each handler:
+
+```python
+def get_price_cache(request: Request) -> PriceCache:
+    return request.app.state.price_cache
 
 
-app = FastAPI(title="FinAlly", lifespan=lifespan)
-
-
-def get_price_cache() -> PriceCache:
-    return app.state.price_cache
-
-
-def get_market_source() -> MarketDataSource:
-    return app.state.market_source
+def get_market_source(request: Request) -> MarketDataSource:
+    source = request.app.state.market_source
+    if source is None:
+        raise HTTPException(503, "market data unavailable")
+    return source
 ```
 
 ### 13.2 Pricing a trade — never awaits I/O
@@ -1597,7 +1643,15 @@ total = cash + sum(
 
 Whoever mutates the DB watchlist also mutates the source, in that order, in the same handler.
 
+The handler is `async def`, and the database call goes through `run_in_threadpool`: `app.db` is
+synchronous, and a plain `def` handler — which would thread the query automatically — cannot
+`await source.add_ticker()`. Splitting the two across handlers is not an option; a watchlist row
+whose ticker was never added to the source is a row that never gets a price.
+
 ```python
+from fastapi.concurrency import run_in_threadpool
+
+
 @router.post("/watchlist")
 async def add_to_watchlist(
     payload: WatchlistAdd,
@@ -1605,7 +1659,7 @@ async def add_to_watchlist(
     price_cache: PriceCache = Depends(get_price_cache),
 ):
     ticker = normalize_ticker(payload.ticker)
-    await db.add_watchlist_entry(ticker)
+    await run_in_threadpool(db.add_watchlist_entry, ticker)
     await source.add_ticker(ticker)
     # Simulator: seeded synchronously, so a price is already available.
     # Massive: None until the next poll — the frontend renders "—".
@@ -1618,11 +1672,11 @@ async def remove_from_watchlist(
     source: MarketDataSource = Depends(get_market_source),
 ):
     ticker = normalize_ticker(ticker)
-    await db.delete_watchlist_entry(ticker)
+    await run_in_threadpool(db.delete_watchlist_entry, ticker)
 
     # Positions outlive the watchlist. Keep tracking a ticker we still hold, or
     # portfolio valuation silently loses it.
-    position = await db.get_position(ticker)
+    position = await run_in_threadpool(db.get_position, ticker)
     if position is None or position.quantity == 0:
         await source.remove_ticker(ticker)
 
