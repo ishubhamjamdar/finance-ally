@@ -130,6 +130,11 @@ MASSIVE_API_KEY=
 
 # Optional: Set to "true" for deterministic mock LLM responses (testing)
 LLM_MOCK=false
+
+# Optional: paths, defaulted for local development and overridden in the image
+DB_PATH=            # SQLite file. Default <repo>/db/finally.db; the container sets /app/db/finally.db
+STATIC_DIR=         # Built frontend. Default backend/static, then frontend/out
+LOG_LEVEL=INFO
 ```
 
 ### Behavior
@@ -138,6 +143,8 @@ LLM_MOCK=false
 - If `MASSIVE_API_KEY` is absent or empty → backend uses the built-in market simulator
 - If `LLM_MOCK=true` → backend returns deterministic mock LLM responses (for E2E tests)
 - The backend reads `.env` from the project root (mounted into the container or read via docker `--env-file`)
+- `DB_PATH`, `STATIC_DIR` and `LOG_LEVEL` are read at call time, not at import, and every one of
+  them has a working default — a `.env` with only `OPENROUTER_API_KEY` runs the whole app
 
 ---
 
@@ -541,7 +548,7 @@ row to ⛔, write a log entry describing how far it got and what blocked it, and
 | # | Checkpoint | Depends on | G1 Test | G2 Review | G3 Record | Coverage | Status |
 |---|---|---|---|---|---|---|---|
 | 1 | Market data hardening | — | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #4) |
-| 2 | Backend skeleton + database | 1 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 2 | Backend skeleton + database | 1 | ✅ | 🔨 | 🔨 | 100% | 🔨 In progress |
 | 3 | Portfolio & watchlist API | 2 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 4 | LLM chat integration | 3 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 5 | Frontend scaffold + live prices | 2 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |

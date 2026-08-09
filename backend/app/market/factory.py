@@ -38,15 +38,20 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _create_simulator(
+def create_simulator_source(
     price_cache: PriceCache,
-    event_log: EventLog | None,
+    event_log: EventLog | None = None,
 ) -> SimulatorDataSource:
-    """Build a simulator from the environment.
+    """Build a simulator from the environment. Returns it UNSTARTED.
 
     Shared by the primary path and the Massive fallback, so a user who tunes
     SIM_UPDATE_INTERVAL does not silently get stock defaults the moment their
     API key stops working.
+
+    Public because mid-run failover needs it: the lifespan's
+    `on_permanent_failure` handler must build a simulator *specifically*, not
+    re-run source selection, which would read MASSIVE_API_KEY and hand back the
+    source that just died.
     """
     return SimulatorDataSource(
         price_cache=price_cache,
@@ -82,7 +87,7 @@ def create_market_data_source(
         )
 
     logger.info("Market data source: GBM Simulator")
-    return _create_simulator(price_cache, event_log)
+    return create_simulator_source(price_cache, event_log)
 
 
 def _verify_priced(price_cache: PriceCache, tickers: list[str]) -> None:
@@ -136,6 +141,6 @@ async def start_market_data(
             raise
         logger.error("Massive unavailable (%s) — falling back to the simulator", exc)
         await source.stop()
-        fallback = _create_simulator(price_cache, event_log)
+        fallback = create_simulator_source(price_cache, event_log)
         await fallback.start(tickers)
         return fallback

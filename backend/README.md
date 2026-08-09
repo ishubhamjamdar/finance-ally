@@ -1,55 +1,64 @@
 # FinAlly Backend
 
-FastAPI backend for the FinAlly AI Trading Workstation.
+FastAPI backend for the FinAlly AI Trading Workstation. One process serves the
+REST API, the SSE price stream, and the exported frontend.
+
+## Running
+
+```bash
+uv sync --extra dev
+uv run uvicorn app.main:app --reload   # http://localhost:8000
+```
+
+The database is created and seeded on first use — there is no migration step.
 
 ## Structure
 
-- `app/` - Application code
-  - `market/` - Market data subsystem
-    - `models.py` - PriceUpdate dataclass
+- `app/`
+  - `main.py` - `create_app()`, lifespan (market feed start/stop, failover), static mount
+  - `api/` - REST routers
+    - `health.py` - `GET /api/health`
+  - `db/` - SQLite layer
+    - `schema.sql` - the six tables of PLAN.md §7
+    - `database.py` - connection helper, lazy initialisation, seeding
+  - `market/` - Market data subsystem (see `CLAUDE.md`)
+    - `models.py` - PriceUpdate / MarketEvent dataclasses
     - `cache.py` - Thread-safe price cache
+    - `events.py` - Bounded event log for simulator shocks
     - `interface.py` - MarketDataSource abstract interface
     - `simulator.py` - GBM-based market simulator
     - `massive_client.py` - Massive/Polygon.io API client
-    - `factory.py` - Data source factory
+    - `factory.py` - Source selection, startup verification, fallback
     - `stream.py` - SSE streaming endpoint
-    - `seed_prices.py` - Default ticker prices and parameters
+    - `seed_prices.py` - Default tickers, seed prices, GBM parameters
 
-- `tests/` - Unit and integration tests
-  - `market/` - Market data tests
+- `tests/` - Unit tests, mirroring the package layout
 
 ## Running Tests
 
 ```bash
-# Install dependencies
-uv sync --dev
-
-# Run all tests
-uv run pytest
-
-# Run with coverage
-uv run pytest --cov=app --cov-report=html
-
-# Run specific test file
-uv run pytest tests/market/test_simulator.py
-
-# Run with verbose output
-uv run pytest -v
+uv run --extra dev pytest                       # All tests
+uv run --extra dev pytest --cov=app             # With coverage
+uv run --extra dev pytest tests/db              # One directory
 ```
+
+Tests never touch the real database: `tests/conftest.py` points `DB_PATH` at a
+per-test temporary file and clears `MASSIVE_API_KEY`.
 
 ## Environment Variables
 
-- `MASSIVE_API_KEY` - Optional. If set, use real market data from Massive API. If not set, use the built-in simulator.
+| Var | Default | Meaning |
+|---|---|---|
+| `DB_PATH` | `<repo>/db/finally.db` | SQLite file. The container sets it to `/app/db/finally.db`, the volume mount |
+| `STATIC_DIR` | `backend/static`, then `frontend/out` | Built frontend. Absent is fine — the API still serves |
+| `LOG_LEVEL` | `INFO` | Root log level |
+| `MASSIVE_API_KEY` | *(empty)* | Non-empty selects real market data; otherwise the simulator |
+
+See `CLAUDE.md` for the market data subsystem's own variables.
 
 ## Development
 
 ```bash
-# Install dependencies
-uv sync --dev
-
-# Run linter
-uv run ruff check .
-
-# Format code
-uv run ruff format .
+uv run --extra dev ruff check app/ tests/
+uv run --extra dev ruff format app/ tests/
 ```

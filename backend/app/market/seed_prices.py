@@ -14,6 +14,11 @@ SEED_PRICES: dict[str, float] = {
     "NFLX": 600.00,
 }
 
+# The PLAN.md §7 default watchlist, seeded into the database on first run.
+# Derived from SEED_PRICES rather than repeated, so a ticker can never be
+# seeded into the watchlist without a starting price to simulate it from.
+DEFAULT_TICKERS: tuple[str, ...] = tuple(SEED_PRICES)
+
 # Per-ticker GBM parameters
 # sigma: annualized volatility (higher = more price movement)
 # mu: annualized drift / expected return

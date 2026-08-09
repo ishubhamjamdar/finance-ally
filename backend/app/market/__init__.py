@@ -6,12 +6,14 @@ module is the supported contract; everything else is free to move.
 
 from .cache import PriceCache
 from .events import EventLog
-from .factory import create_market_data_source, start_market_data
+from .factory import create_market_data_source, create_simulator_source, start_market_data
 from .interface import MarketDataSource, PermanentMarketDataError
 from .models import MarketEvent, PriceUpdate, normalize_ticker
+from .seed_prices import DEFAULT_TICKERS
 from .stream import create_stream_router
 
 __all__ = [
+    "DEFAULT_TICKERS",
     "PriceUpdate",
     "MarketEvent",
     "normalize_ticker",
@@ -20,6 +22,7 @@ __all__ = [
     "MarketDataSource",
     "PermanentMarketDataError",
     "create_market_data_source",
+    "create_simulator_source",
     "start_market_data",
     "create_stream_router",
 ]
