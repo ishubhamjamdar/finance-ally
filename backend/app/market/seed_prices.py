@@ -30,8 +30,12 @@ TICKER_PARAMS: dict[str, dict[str, float]] = {
     "NFLX": {"sigma": 0.35, "mu": 0.05},
 }
 
-# Default parameters for tickers not in the list above (dynamically added)
+# Applied to tickers added at runtime (e.g. the AI adds PYPL).
+# MUST be copied per ticker — dict(DEFAULT_PARAMS) — never shared by reference.
 DEFAULT_PARAMS: dict[str, float] = {"sigma": 0.25, "mu": 0.05}
+
+# Price range for an unknown ticker with no seed price.
+UNKNOWN_PRICE_RANGE: tuple[float, float] = (50.0, 300.0)
 
 # Correlation groups for the simulator's Cholesky decomposition
 # Tickers in the same group have higher intra-group correlation

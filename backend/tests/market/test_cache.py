@@ -101,3 +101,108 @@ class TestPriceCache:
         cache = PriceCache()
         update = cache.update("AAPL", 190.12345)
         assert update.price == 190.12
+
+    def test_zero_timestamp_is_preserved(self):
+        """0.0 is falsy — `timestamp or time.time()` would silently discard it."""
+        cache = PriceCache()
+        update = cache.update("AAPL", 190.50, timestamp=0.0)
+        assert update.timestamp == 0.0
+
+
+class TestNormalisation:
+    def test_writes_are_normalised(self):
+        cache = PriceCache()
+        cache.update(" aapl ", 190.00)
+        assert cache.get_price("AAPL") == 190.00
+
+    def test_reads_are_normalised(self):
+        cache = PriceCache()
+        cache.update("AAPL", 190.00)
+        assert cache.get_price(" aapl ") == 190.00
+        assert "aapl" in cache
+
+    def test_remove_is_normalised(self):
+        cache = PriceCache()
+        cache.update("AAPL", 190.00)
+        cache.remove(" aapl ")
+        assert cache.get("AAPL") is None
+
+    def test_case_variants_are_one_entry(self):
+        cache = PriceCache()
+        cache.update("aapl", 190.00)
+        cache.update("AAPL", 191.00)
+        assert len(cache) == 1
+        assert cache.get("AAPL").direction == "up"
+
+
+class TestPreviousClose:
+    def test_stored_when_supplied(self):
+        cache = PriceCache()
+        update = cache.update("AAPL", 195.00, previous_close=190.00)
+        assert update.previous_close == 190.00
+        assert update.day_change_percent == 2.6316
+
+    def test_is_sticky_across_updates(self):
+        """The simulator passes it every tick, but Massive may only have it on
+        some polls — a later update omitting it must not blank the column."""
+        cache = PriceCache()
+        cache.update("AAPL", 195.00, previous_close=190.00)
+        update = cache.update("AAPL", 196.00)
+        assert update.previous_close == 190.00
+
+    def test_can_be_replaced_on_a_new_session(self):
+        cache = PriceCache()
+        cache.update("AAPL", 195.00, previous_close=190.00)
+        update = cache.update("AAPL", 196.00, previous_close=195.00)
+        assert update.previous_close == 195.00
+
+    def test_absent_by_default(self):
+        cache = PriceCache()
+        assert cache.update("AAPL", 190.00).previous_close is None
+
+
+class TestConcurrency:
+    def test_concurrent_writers_and_readers(self):
+        """The lock is a threading.Lock precisely because MassiveDataSource
+        writes from an asyncio.to_thread worker on a real OS thread."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        cache = PriceCache()
+
+        def write(n):
+            for i in range(1000):
+                cache.update(f"T{n}", 100.0 + i * 0.01)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(write, range(8)))
+
+        assert len(cache) == 8
+        assert cache.version == 8000  # no lost updates
+
+    def test_reads_during_writes_are_consistent(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        cache = PriceCache()
+        cache.update("AAPL", 100.0)
+        errors: list[Exception] = []
+
+        def write():
+            for i in range(500):
+                cache.update("AAPL", 100.0 + i * 0.01)
+
+        def read():
+            try:
+                for _ in range(500):
+                    snapshot = cache.get_all()
+                    for ticker, update in snapshot.items():
+                        assert update.ticker == ticker
+                        assert update.price > 0
+            except Exception as exc:  # pragma: no cover - only on a real race
+                errors.append(exc)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(write), pool.submit(read), pool.submit(write), pool.submit(read)]
+            for future in futures:
+                future.result()
+
+        assert errors == []

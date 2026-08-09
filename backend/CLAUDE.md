@@ -12,15 +12,31 @@ uv sync --extra dev   # Install all dependencies including test/lint tools
 The market data subsystem lives in `app/market/`. Use these imports:
 
 ```python
-from app.market import PriceCache, PriceUpdate, MarketDataSource, create_market_data_source
+from app.market import (
+    EventLog, MarketDataSource, MarketEvent, PermanentMarketDataError,
+    PriceCache, PriceUpdate, create_stream_router, normalize_ticker,
+    start_market_data,
+)
 ```
+
+Import from `app.market` only — never from a submodule. `__init__.py` is the supported contract.
 
 ### Core Types
 
-- **`PriceUpdate`** — Immutable dataclass: `ticker`, `price`, `previous_price`, `timestamp`, plus properties `change`, `change_percent`, `direction` ("up"/"down"/"flat"), and `to_dict()` for JSON serialization.
+- **`PriceUpdate`** — Immutable dataclass: `ticker`, `price`, `previous_price`, `timestamp`,
+  `previous_close`. Two distinct notions of change, do not conflate them:
+  - `change` / `change_percent` / `direction` are **tick-over-tick** — they exist to flash a cell
+    green or red for 500 ms
+  - `day_change` / `day_change_percent` are **session-over-session** — the watchlist's "daily
+    change %" column. `None` when `previous_close` is unknown; render an em dash, do not invent a
+    baseline
+
+- **`normalize_ticker(t)`** — upper-case and strip. Apply at every entry point (REST handlers, LLM
+  tool calls). Massive tickers are case-sensitive; a lower-case DB row silently yields no data.
 
 - **`PriceCache`** — Thread-safe in-memory store. Key methods:
-  - `update(ticker, price, timestamp=None) -> PriceUpdate`
+  - `update(ticker, price, timestamp=None, previous_close=None) -> PriceUpdate`
+    (`previous_close` is sticky — pass it once and later updates carry it forward)
   - `get(ticker) -> PriceUpdate | None`
   - `get_price(ticker) -> float | None`
   - `get_all() -> dict[str, PriceUpdate]`
@@ -29,20 +45,53 @@ from app.market import PriceCache, PriceUpdate, MarketDataSource, create_market_
 
 - **`MarketDataSource`** — Abstract interface implemented by `SimulatorDataSource` and `MassiveDataSource`. Lifecycle: `start(tickers)` -> `add_ticker()` / `remove_ticker()` -> `stop()`.
 
-- **`create_market_data_source(cache)`** — Factory. Returns `MassiveDataSource` if `MASSIVE_API_KEY` is set, otherwise `SimulatorDataSource`.
+- **`EventLog`** — Bounded ring buffer of `MarketEvent`s (simulator shocks). Read by cursor:
+  `since(cursor) -> (next_cursor, events)`, so every SSE client sees every event. Pass `cursor=-1`
+  on connect to skip the backlog. **Defines `__len__`, so an empty log is falsy — always test it
+  with `is not None`, never truthiness.**
+
+- **`start_market_data(cache, tickers, event_log=None)`** — Use this, not the bare factory. Creates
+  and starts a source, and falls back to the simulator when Massive is unusable (bad key, or a
+  valid key on a plan without snapshot entitlement, which otherwise yields a permanently empty UI
+  with no error). `create_market_data_source(cache)` remains available when you need it unstarted.
 
 ### SSE Streaming
 
 ```python
-from app.market import create_stream_router
-
-router = create_stream_router(price_cache)  # Returns FastAPI APIRouter
+router = create_stream_router(
+    price_cache,
+    event_log=event_log,                    # optional: publishes `event: shock`
+    status_provider=lambda: source.market_status,  # optional: publishes `event: status`
+)
 # Endpoint: GET /api/stream/prices (text/event-stream)
 ```
 
+Frames: a default `data:` price snapshot (only when the cache version changed), named `shock` and
+`status` events, and `: keep-alive` comments every 15 s idle so proxies don't drop the connection.
+The router is built inside the factory, so calling it twice yields two independent routers.
+
 ### Seed Data
 
-Default tickers: AAPL, GOOGL, MSFT, AMZN, TSLA, NVDA, META, JPM, V, NFLX. Seed prices and per-ticker volatility/drift params are in `app/market/seed_prices.py`.
+Default tickers: AAPL, GOOGL, MSFT, AMZN, TSLA, NVDA, META, JPM, V, NFLX. Seed prices and
+per-ticker volatility/drift params are in `app/market/seed_prices.py`.
+
+## Environment variables
+
+| Var | Default | Meaning |
+|---|---|---|
+| `MASSIVE_API_KEY` | *(empty)* | Non-empty after `.strip()` selects Massive; else the simulator |
+| `MASSIVE_POLL_INTERVAL` | `15` | Seconds between polls (2-5 on Advanced+) |
+| `SIM_UPDATE_INTERVAL` | `0.5` | Simulator tick, seconds |
+| `SIM_EVENT_PROBABILITY` | `2e-5` | Shock chance per ticker per tick |
+
+`factory.py` is the only module that reads the environment.
+
+## Testing rules for this subsystem
+
+Never build Massive fixtures with `MagicMock` — it fabricates any attribute on access, which is how
+a client that could never populate the cache passed thirteen tests. Use
+`tests/market/conftest.make_snapshot()`, which parses a documented payload through
+`TickerSnapshot.from_dict`. New sources inherit `tests/market/test_source_contract.py` unchanged.
 
 ## Running Tests
 

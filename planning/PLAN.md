@@ -540,7 +540,7 @@ row to ⛔, write a log entry describing how far it got and what blocked it, and
 
 | # | Checkpoint | Depends on | G1 Test | G2 Review | G3 Record | Coverage | Status |
 |---|---|---|---|---|---|---|---|
-| 1 | Market data hardening | — | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 1 | Market data hardening | — | ✅ | ⬜ | ✅ | 99% | 🔨 Awaiting Gate 2 |
 | 2 | Backend skeleton + database | 1 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 3 | Portfolio & watchlist API | 2 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 4 | LLM chat integration | 3 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
@@ -814,4 +814,58 @@ item must be resolved or restated in a later entry — it does not expire by bei
 
 #### Entries
 
-*No checkpoints closed yet. The first entry lands with Checkpoint 1.*
+#### Checkpoint 1 — Market data hardening
+
+- **Closed:** Gate 1 and Gate 3 complete 2026-08-09 · branch `checkpoint-1-market-data-hardening` ·
+  **Gate 2 not yet run** — `/code-review` is user-triggered, so this checkpoint is not ✅ yet
+- **Built:** all 17 changes from `MARKET_DATA_DESIGN.md` §17, across `backend/app/market/`
+  - `models.py` — `normalize_ticker()`, `previous_close` + `day_change`/`day_change_percent` on
+    `PriceUpdate`, new `MarketEvent`
+  - `events.py` — **new**: `EventLog`, a bounded ring buffer with per-client cursors
+  - `cache.py` — normalisation at every entry point, sticky `previous_close`, `is None` timestamp
+    check, `version` read under the lock
+  - `interface.py` — `PermanentMarketDataError`
+  - `simulator.py` — injected RNGs, log-space shocks, `event_probability` 0.001 → 2e-5,
+    session-open baseline, `drain_events()`, Cholesky `LinAlgError` degradation
+  - `massive_client.py` — the `extract_price`/`extract_timestamp`/`extract_previous_close` ladder,
+    permanent-vs-transient classification, 5 s timeouts, `get_market_status()` polling
+  - `factory.py` — `start_market_data()` with fail-fast-then-fallback, `MASSIVE_POLL_INTERVAL` /
+    `SIM_UPDATE_INTERVAL` / `SIM_EVENT_PROBABILITY`
+  - `stream.py` — router built inside the factory, heartbeat comments, `event: shock` and
+    `event: status` frames
+- **Exit criteria:**
+  - *Massive fixture test fails if the ladder is reverted* — **verified by mutation.** Restoring
+    `snap.last_trade.timestamp / 1000.0` fails 16 tests; the previous `MagicMock` suite passed that
+    same mutation. Two further mutations run: removing the Cholesky multiply fails 2 correlation
+    tests; switching shocks back to `*= (1 ± m)` fails 2 shock tests
+  - *Contract tests pass for both sources* — `test_source_contract.py`, 7 tests × 2 sources
+  - *Invalid key yields a running simulator* — `test_falls_back_on_permanent_failure`, plus
+    `test_falls_back_when_authenticated_but_no_prices` for the Basic-plan case
+  - *Realised volatility within a factor of two of `TICKER_PARAMS`* — measured over a full
+    46,800-tick session per ticker, shocks disabled: every ticker lands at **1.00–1.07×** its
+    configured sigma (AAPL 0.230 vs 0.22, TSLA 0.501 vs 0.50, JPM 0.193 vs 0.18)
+  - *Suite green, coverage ≥ 85% on `app/market/`* — **210 passed, 99%**
+- **Tests:** 73 → 210 (+137). Three consecutive full runs green, no flakes. `ruff check` clean;
+  `ruff format` applied to the 6 files it flagged. Coverage 84% → **99%**; every module at 100%
+  except `massive_client` 99% and `stream` 97%
+- **Review:** **Gate 2 has not been run.** No `/code-review` or `/security-review` output exists for
+  this branch. Do not mark the checkpoint ✅ until both have run and their findings are dispositioned
+- **Diverged from plan:** one deliberate divergence. §16.4 specified SSE tests driven through
+  `httpx.ASGITransport`; that cannot work, because the SSE generator is infinite by design and
+  ASGITransport never delivers an `http.disconnect`, so `request.is_disconnected()` stays False and
+  closing the response hangs forever (verified — it blocks before the first frame). `test_stream.py`
+  instead drives `_generate_events` directly with a stub request that disconnects after N ticks, and
+  asserts the HTTP wiring off the router. Deterministic, no sleeps, and it reaches 97% on a module
+  that had none. §16.4 of the design doc has been corrected to match
+- **Carried forward:**
+  - Gate 2 review is outstanding and blocks this checkpoint
+  - `httpx` added to the backend dev dependencies; it is now unused after the §16.4 divergence and
+    can be dropped if no later checkpoint needs it
+  - `MassiveDataSource.on_permanent_failure` exists and is unit-tested, but nothing wires it yet —
+    Checkpoint 2's lifespan must connect it so mid-run failover reassigns the active source
+  - `EventLog` is threaded through simulator → factory → stream, but no consumer constructs one
+    yet; Checkpoint 2 must create it in the lifespan and pass it to both
+  - `market_data_demo.py` still detects notable moves with its own `abs(change_percent) > 1.0`
+    heuristic rather than consuming `EventLog`. It runs correctly; worth switching when convenient
+  - `massive_client.py` line 250 and `stream.py` lines 128-129 are the only uncovered lines — the
+    `get_market_status` success path inside `to_thread` and the `CancelledError` handler
