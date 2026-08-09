@@ -8,12 +8,30 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.db import connect
-from app.main import _current_market_status, _resolve_static_dir, create_app
+from app.main import (
+    SNAPSHOT_INTERVAL_SECONDS,
+    _current_market_status,
+    _resolve_static_dir,
+    _snapshot_loop,
+    create_app,
+)
 from app.market import MarketDataSource
 from app.market.simulator import SimulatorDataSource
+from app.portfolio import record_snapshot
 from tests.conftest import PLAN_DEFAULT_WATCHLIST
 
 DEFAULT_WATCHLIST = set(PLAN_DEFAULT_WATCHLIST)
+
+
+def snapshot_count() -> int:
+    with connect() as conn:
+        return conn.execute("SELECT COUNT(*) FROM portfolio_snapshots").fetchone()[0]
+
+
+def snapshot_values() -> list[float]:
+    with connect() as conn:
+        rows = conn.execute("SELECT total_value FROM portfolio_snapshots").fetchall()
+    return [row[0] for row in rows]
 
 
 @pytest.fixture
@@ -130,6 +148,75 @@ class TestLifespan:
         async with app.router.lifespan_context(app):
             pass
         assert temp_db.exists()
+
+
+class TestSnapshotTask:
+    """PLAN.md §7: a `portfolio_snapshots` row every 30 seconds.
+
+    The loop is driven directly with a tiny interval. Waiting on the real one
+    would make the suite thirty seconds slower per assertion and would test the
+    clock rather than the code.
+    """
+
+    def test_the_documented_interval_is_thirty_seconds(self):
+        assert SNAPSHOT_INTERVAL_SECONDS == 30.0
+
+    async def test_writes_a_point_immediately_and_then_every_interval(self, price_cache):
+        app = create_app()
+        app.state.price_cache = price_cache
+
+        task = asyncio.create_task(_snapshot_loop(app, interval=0.01))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert snapshot_count() >= 2, "the series is not accumulating"
+        assert snapshot_values() == [10000.0] * snapshot_count()
+
+    async def test_one_failure_does_not_end_the_series(self, price_cache, monkeypatch):
+        """A locked database or a transient I/O error must cost one point, not
+        every point for the remaining life of the process."""
+        calls = {"n": 0}
+        real = record_snapshot
+
+        def flaky(cache, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("database is locked")
+            return real(cache, *args, **kwargs)
+
+        monkeypatch.setattr("app.main.record_snapshot", flaky)
+
+        app = create_app()
+        app.state.price_cache = price_cache
+
+        task = asyncio.create_task(_snapshot_loop(app, interval=0.01))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert calls["n"] >= 2
+        assert snapshot_count() >= 1
+
+    async def test_the_lifespan_starts_it_and_shutdown_stops_it(self, monkeypatch):
+        monkeypatch.setattr("app.main.SNAPSHOT_INTERVAL_SECONDS", 0.01)
+
+        app = create_app()
+        async with app.router.lifespan_context(app):
+            task = app.state.snapshot_task
+            assert task is not None and not task.done()
+            await asyncio.sleep(0.05)
+            during = snapshot_count()
+            assert during >= 1
+
+        assert task.cancelled() or task.done()
+        assert app.state.snapshot_task is None
+
+        await asyncio.sleep(0.05)
+        assert snapshot_count() == during, "the snapshot task outlived shutdown"
+
+    def test_no_task_exists_before_startup(self):
+        assert create_app().state.snapshot_task is None
 
 
 class RevokedKeySource(MarketDataSource):

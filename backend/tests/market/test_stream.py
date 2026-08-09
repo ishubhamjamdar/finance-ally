@@ -23,38 +23,12 @@ from app.market import EventLog, PriceCache, create_stream_router
 from app.market.models import MarketEvent
 from app.market.stream import _generate_events
 
-
-class StubRequest:
-    """A Request stand-in that disconnects after `ticks` loop iterations.
-
-    `on_tick` fires before each check, which is how a test mutates the cache
-    part-way through the stream.
-    """
-
-    def __init__(self, ticks: int, on_tick=None) -> None:
-        self._ticks = ticks
-        self._calls = 0
-        self._on_tick = on_tick
-        self.client = None  # exercises the "unknown" client-ip branch
-
-    async def is_disconnected(self) -> bool:
-        if self._on_tick:
-            self._on_tick(self._calls)
-        self._calls += 1
-        return self._calls > self._ticks
-
-
-async def collect(cache: PriceCache, ticks: int = 3, on_tick=None, **kwargs) -> list[str]:
-    """Run the generator to completion and return the raw SSE frames."""
-    request = StubRequest(ticks, on_tick=on_tick)
-    return [frame async for frame in _generate_events(cache, request, interval=0, **kwargs)]
-
-
-def data_frames(frames: list[str]) -> list[dict]:
-    """Parse the payloads of default (unnamed) data frames."""
-    return [
-        json.loads(frame.split("data: ", 1)[1]) for frame in frames if frame.startswith("data: ")
-    ]
+# Defined in tests/conftest.py so the watchlist tests can drive a real SSE
+# frame too — "a ticker added at runtime appears in the stream" is a Checkpoint
+# 3 exit criterion, and it deserves the actual frame, not a proxy for it.
+from tests.conftest import StubStreamRequest as StubRequest
+from tests.conftest import collect_sse_frames as collect
+from tests.conftest import sse_data_frames as data_frames
 
 
 @pytest.mark.asyncio
