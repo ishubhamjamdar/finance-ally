@@ -15,11 +15,14 @@ from app.db import (
     add_watchlist_entry,
     apply_position,
     connect,
+    count_watchlist,
     delete_watchlist_entry,
     get_cash_balance,
     get_position,
+    insert_chat_message,
     insert_snapshot,
     insert_trade,
+    list_chat_messages,
     list_positions,
     list_snapshots,
     list_trades,
@@ -174,3 +177,111 @@ class TestWatchlist:
             add_watchlist_entry(conn, "PYPL", user_id="other")
             assert "PYPL" not in [e.ticker for e in list_watchlist(conn)]
             assert [e.ticker for e in list_watchlist(conn, user_id="other")] == ["PYPL"]
+
+
+class TestCountWatchlist:
+    def test_it_counts_the_seeded_rows(self):
+        with connect() as conn:
+            assert count_watchlist(conn) == 10
+
+    def test_it_tracks_additions_and_removals(self):
+        with connect() as conn:
+            add_watchlist_entry(conn, "PYPL")
+            assert count_watchlist(conn) == 11
+            delete_watchlist_entry(conn, "PYPL")
+            assert count_watchlist(conn) == 10
+
+    def test_it_scopes_by_user(self):
+        with connect() as conn:
+            add_watchlist_entry(conn, "PYPL", user_id="other")
+            assert count_watchlist(conn, user_id="other") == 1
+
+
+class TestChatMessages:
+    def test_a_message_round_trips(self):
+        with connect() as conn:
+            written = insert_chat_message(conn, "user", "hello")
+            (read,) = list_chat_messages(conn, limit=10)
+
+        assert (read.id, read.role, read.content) == (written.id, "user", "hello")
+        assert read.actions is None
+
+    def test_actions_are_stored_as_json_and_returned_decoded(self):
+        """The column is JSON by PLAN.md §7. Encoding in the repository is what
+        keeps the writer and the reader on one format — a caller passing a
+        pre-encoded string would leave the reader guessing."""
+        actions = [{"kind": "trade", "ok": True, "ticker": "AAPL"}]
+
+        with connect() as conn:
+            insert_chat_message(conn, "assistant", "Bought.", actions)
+            (read,) = list_chat_messages(conn, limit=10)
+            raw = conn.execute("SELECT actions FROM chat_messages").fetchone()[0]
+
+        assert read.actions == actions
+        assert isinstance(raw, str)
+
+    def test_an_empty_action_list_is_stored_as_null(self):
+        """`None` and `[]` mean the same thing — nothing was executed — so they
+        are stored the same way rather than as two states the reader must
+        distinguish."""
+        with connect() as conn:
+            insert_chat_message(conn, "assistant", "Just talking.", [])
+            assert conn.execute("SELECT actions FROM chat_messages").fetchone()[0] is None
+
+    def test_messages_come_back_oldest_first(self):
+        with connect() as conn:
+            for n in range(4):
+                insert_chat_message(conn, "user", f"message {n}")
+            assert [m.content for m in list_chat_messages(conn, limit=10)] == [
+                f"message {n}" for n in range(4)
+            ]
+
+    def test_the_limit_keeps_the_newest(self):
+        """Truncation from the wrong end would replay the start of a long
+        conversation and drop everything the user just said."""
+        with connect() as conn:
+            for n in range(5):
+                insert_chat_message(conn, "user", f"message {n}")
+            assert [m.content for m in list_chat_messages(conn, limit=2)] == [
+                "message 3",
+                "message 4",
+            ]
+
+    def test_a_question_and_its_answer_keep_their_order(self):
+        """Both rows are written inside one transaction and can share a
+        timestamp to the microsecond; without the rowid tiebreak they would
+        replay as the answer preceding the question."""
+        with transaction() as conn:
+            insert_chat_message(conn, "user", "question")
+            insert_chat_message(conn, "assistant", "answer")
+
+        with connect() as conn:
+            assert [m.role for m in list_chat_messages(conn, limit=10)] == ["user", "assistant"]
+
+    def test_it_scopes_by_user(self):
+        with connect() as conn:
+            insert_chat_message(conn, "user", "theirs", user_id="other")
+            assert list_chat_messages(conn, limit=10) == []
+            assert len(list_chat_messages(conn, limit=10, user_id="other")) == 1
+
+    def test_an_undecodable_actions_column_does_not_break_replay(self):
+        """A raised JSONDecodeError here would not cost one message: history is
+        read on every later chat request, so one bad row would make the endpoint
+        permanently unusable."""
+        with connect() as conn:
+            insert_chat_message(conn, "assistant", "Bought.", [{"ok": True}])
+            conn.execute("UPDATE chat_messages SET actions = ?", ("{not json",))
+            (read,) = list_chat_messages(conn, limit=10)
+
+        assert read.actions is None
+        assert read.content == "Bought."
+
+    def test_a_non_list_actions_column_is_ignored(self):
+        """The shape is a list by contract. An object would reach the frontend
+        as something it cannot iterate."""
+        with connect() as conn:
+            insert_chat_message(conn, "assistant", "Bought.", [{"ok": True}])
+            conn.execute("UPDATE chat_messages SET actions = ?", ('{"ok": true}',))
+            (read,) = list_chat_messages(conn, limit=10)
+
+        assert read.actions is None

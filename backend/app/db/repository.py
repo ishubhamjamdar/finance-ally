@@ -13,6 +13,8 @@ duplicating the rule here would give it two homes free to disagree.
 
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -20,6 +22,8 @@ from dataclasses import dataclass
 from app.market import normalize_ticker
 
 from .database import DEFAULT_USER_ID, utc_now
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +60,22 @@ class Snapshot:
 class WatchlistEntry:
     ticker: str
     added_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ChatMessage:
+    """One turn of the conversation.
+
+    `actions` is the decoded `actions` column — what the assistant executed on
+    that turn — and is `None` for user messages, which never carry any
+    (PLAN.md §7).
+    """
+
+    id: str
+    role: str  # "user" | "assistant"
+    content: str
+    actions: list[dict] | None
+    created_at: str
 
 
 # --- users_profile -------------------------------------------------------
@@ -273,6 +293,14 @@ def list_watchlist(
     return [WatchlistEntry(ticker=row["ticker"], added_at=row["added_at"]) for row in rows]
 
 
+def count_watchlist(conn: sqlite3.Connection, user_id: str = DEFAULT_USER_ID) -> int:
+    """How many tickers are watched. Cheaper than `len(list_watchlist(...))`,
+    and the size cap in `app.watchlist` checks it on every add."""
+    return conn.execute("SELECT COUNT(*) FROM watchlist WHERE user_id = ?", (user_id,)).fetchone()[
+        0
+    ]
+
+
 def add_watchlist_entry(
     conn: sqlite3.Connection, ticker: str, user_id: str = DEFAULT_USER_ID
 ) -> WatchlistEntry | None:
@@ -298,3 +326,93 @@ def delete_watchlist_entry(
         (user_id, normalize_ticker(ticker)),
     )
     return cursor.rowcount > 0
+
+
+# --- chat_messages -------------------------------------------------------
+
+
+def insert_chat_message(
+    conn: sqlite3.Connection,
+    role: str,
+    content: str,
+    actions: list[dict] | None = None,
+    user_id: str = DEFAULT_USER_ID,
+) -> ChatMessage:
+    """Append one turn to the conversation.
+
+    `actions` is stored as JSON because PLAN.md §7 defines the column that way.
+    Encoding here rather than at the call site means the write and the read
+    below share one format by construction; a caller that passed a pre-encoded
+    string would be choosing an encoding the reader has to guess at.
+    """
+    message = ChatMessage(
+        id=str(uuid.uuid4()),
+        role=role,
+        content=content,
+        actions=actions,
+        created_at=utc_now(),
+    )
+    conn.execute(
+        "INSERT INTO chat_messages (id, user_id, role, content, actions, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            message.id,
+            user_id,
+            message.role,
+            message.content,
+            json.dumps(actions) if actions else None,
+            message.created_at,
+        ),
+    )
+    return message
+
+
+def list_chat_messages(
+    conn: sqlite3.Connection, limit: int, user_id: str = DEFAULT_USER_ID
+) -> list[ChatMessage]:
+    """The most recent `limit` turns, returned oldest first.
+
+    Same shape as `list_snapshots` and for the same reason: a conversation is
+    replayed in order, but a truncated one must keep the *newest* turns, so the
+    LIMIT is applied to a descending scan — which the `(user_id, created_at)`
+    index serves directly — and the result reversed. `rowid` breaks ties,
+    because the user message and the assistant's reply to it are written inside
+    one transaction and can share a timestamp to the microsecond; ordered
+    arbitrarily they would replay as the answer preceding the question.
+    """
+    rows = conn.execute(
+        "SELECT id, role, content, actions, created_at FROM chat_messages"
+        " WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        (user_id, limit),
+    ).fetchall()
+    return [_chat_message(row) for row in reversed(rows)]
+
+
+def _chat_message(row: sqlite3.Row) -> ChatMessage:
+    return ChatMessage(
+        id=row["id"],
+        role=row["role"],
+        content=row["content"],
+        actions=_decode_actions(row["actions"], row["id"]),
+        created_at=row["created_at"],
+    )
+
+
+def _decode_actions(raw: str | None, message_id: str) -> list[dict] | None:
+    """Decode the `actions` column, tolerating a row that cannot be decoded.
+
+    The only free-form JSON in the schema, and the only column whose contents
+    this module cannot itself guarantee — a hand-edited database is enough. A
+    raised `JSONDecodeError` here would not cost one message: history replay
+    reads that row on *every* subsequent chat request, so one bad row would
+    make the endpoint permanently unusable. Dropping the actions costs an
+    inline confirmation the user already saw.
+    """
+    if raw is None:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Chat message %s has undecodable actions; ignoring them", message_id)
+        return None
+    return decoded if isinstance(decoded, list) else None

@@ -121,6 +121,24 @@ from app.watchlist import WatchlistError, add, remove, reconcile
 re-implement the rule. A trade the LLM asks for must be validated exactly like
 one the user typed.
 
+`app/chat.py` is the third module of that kind and the one that proves the
+point: it runs a whole conversational turn — context, prompt, model, parse,
+execute, persist — and **executes nothing itself**. Every trade goes through
+`execute_trade` and every watchlist change through `add`/`remove`. A model that
+has been talked into anything is still a client, and a client cannot be trusted
+to have validated its own request.
+
+```python
+from app.chat import handle_message, get_transcript   # no Request, no HTTPException
+```
+
+**The watchlist is capped at `MAX_WATCHLIST_SIZE` (50).** The check runs inside
+the insert's own `BEGIN IMMEDIATE`, after `INSERT OR IGNORE` has decided the
+duplicate question — which is what keeps "AAPL is already watched" reporting as
+a duplicate rather than as a full list. `remove()`'s compensating restore passes
+`enforce_cap=False`: putting back a row that was already there cannot be what
+pushed the list over.
+
 `app/portfolio.py`'s rounding policy — cash to cents via `_fill_value`,
 quantities and `avg_cost` never rounded, display rounding through `_money` and
 `_rate` — is documented at the top of that module. Do not re-decide it per call
@@ -155,6 +173,45 @@ user deleted.
 Adding a table means adding it to `schema.sql` **and** to `REQUIRED_TABLES` — a
 table absent from that tuple is not part of the "is it initialised?" test, so a
 database missing only that table looks healthy and fails at query time.
+
+## LLM API
+
+`app/llm/` is the contract with the model. Import from `app.llm` only, the same
+rule `app.market` and `app.db` keep.
+
+```python
+from app.llm import LLMUnavailableError, MalformedReplyError, build_messages, complete, parse_reply
+```
+
+Four modules, and the split matters:
+
+- **`schema.py`** — `AssistantReply` is the schema sent to the provider; nothing
+  parses with it. `parse_reply` validates **action by action**, so one malformed
+  trade costs that trade rather than the model's message and its nine good
+  actions. Leniency here is salvage, never trust: survivors are re-validated by
+  `app.portfolio` and `app.watchlist`
+- **`prompt.py`** — rules and account data go in as `system` messages;
+  everything a user or the model wrote goes in as `user`/`assistant`. That
+  separation is this layer's whole contribution to prompt-injection defence. An
+  assistant turn replays with *what actually executed* appended, because the
+  model writes its message before knowing which trades cleared
+- **`client.py`** — one blocking call. Callers on the event loop must push it to
+  a thread. `LLM_MOCK` is honoured *here*, so mock and live runs share one parse
+  and one execution path
+- **`mock.py`** — returns raw JSON, not objects, for the same reason
+
+**Two error types, deliberately not one.** `LLMUnavailableError` means the
+provider could not be reached — a 503, nothing persisted, resend the message.
+`MalformedReplyError` means it answered badly — a 200 whose message says so, and
+the turn *is* recorded. Collapsing them would make a missing API key look like a
+confused model.
+
+**Do not add a `pattern`, `minLength` or similar keyword to the wire schema.**
+Cerebras rejects them, and OpenRouter's `provider.order` is a preference rather
+than a pin, so the request is silently served by another host — every call
+succeeds, at none of the latency Cerebras was chosen for. `wire_schema()` strips
+the known offenders and a test guards the list; `_log_provider` warns when
+something else answered.
 
 ## Market Data API
 
@@ -239,6 +296,8 @@ per-ticker volatility/drift params are in `app/market/seed_prices.py`.
 | `DB_PATH` | `<repo>/db/finally.db` | SQLite file. Read on every call, not at import, so tests can redirect it. The container sets it to `/app/db/finally.db` |
 | `STATIC_DIR` | `backend/static`, then `frontend/out` | Built frontend. Absent is normal — the API serves on its own |
 | `LOG_LEVEL` | `INFO` | Root log level |
+| `OPENROUTER_API_KEY` | *(empty)* | Required for live chat. The only variable with no working default; without it `POST /api/chat` is a 503 that says so |
+| `LLM_MOCK` | `false` | `true`/`1`/`yes`/`on` selects the deterministic mock — no key, no network |
 | `MASSIVE_API_KEY` | *(empty)* | Non-empty after `.strip()` selects Massive; else the simulator |
 | `MASSIVE_POLL_INTERVAL` | `15` | Seconds between polls (2-5 on Advanced+) |
 | `SIM_UPDATE_INTERVAL` | `0.5` | Simulator tick, seconds. `dt` is derived from it, so `sigma` stays annualised volatility at any rate |
@@ -247,6 +306,16 @@ per-ticker volatility/drift params are in `app/market/seed_prices.py`.
 Within the market subsystem, `factory.py` is the only module that reads the
 environment. Blank or malformed numeric values fall back to the default with a
 warning rather than crashing startup.
+
+`app/config.py` loads `<repo>/.env` at `app.main` import, before
+`logging.basicConfig` and before anything reads a variable. **The environment
+always wins over the file** (`override=False`), so Docker's `--env-file`, a
+shell export and a test's `monkeypatch.setenv` all beat a checked-out `.env`.
+
+Because that load happens at *import*, `monkeypatch` cannot undo it —
+`tests/conftest.py` therefore clears every application variable for every test,
+from an exhaustive list. A new variable that is not added to `_APP_ENV_VARS` is
+one whose value the suite inherits from whoever is running it.
 
 ## Testing rules for this subsystem
 
@@ -261,6 +330,19 @@ a client that could never populate the cache passed thirteen tests. Use
 uv run --extra dev pytest -v              # All tests
 uv run --extra dev pytest --cov=app       # With coverage
 uv run --extra dev ruff check app/ tests/ # Lint
+```
+
+No test reaches the network: `OPENROUTER_API_KEY` and `LLM_MOCK` are both
+cleared, so `complete()` raises before it can open a socket. A test that wants
+the mock takes the `mock_llm` fixture; one that wants to script the model takes
+`stub_model`, which patches `app.chat.complete` so the *real* parser still runs.
+
+Gate 3's two harnesses live in `test/`:
+
+```bash
+test/smoke.sh                # every exit criterion against a real server
+LIVE_LLM=1 test/smoke.sh     # ...including one live OpenRouter call
+python3 test/mutate.py       # mutation testing, in a throwaway git worktree
 ```
 
 ## Demo

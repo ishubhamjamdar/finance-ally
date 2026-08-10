@@ -15,6 +15,7 @@ from app.api.schemas import WatchlistAddRequest
 from app.api.watchlist import create_watchlist_entry
 from app.db import connect, list_watchlist
 from app.main import create_app
+from app.watchlist import MAX_WATCHLIST_SIZE
 from tests.conftest import PLAN_DEFAULT_WATCHLIST, collect_sse_frames, sse_data_frames
 
 
@@ -98,6 +99,21 @@ class TestAddTicker:
 
         assert response.status_code == 503
         assert "PYPL" not in stored_tickers()
+
+
+class TestWatchlistSizeCap:
+    def test_an_add_past_the_cap_is_a_400_with_the_reason(self, client):
+        """400, not 422: the request is well formed and the account cannot
+        support it — PLAN.md §8's distinction, the same one an unaffordable
+        trade earns. Checkpoint 3 carried this gap forward to Checkpoint 4."""
+        for n in range(MAX_WATCHLIST_SIZE - len(PLAN_DEFAULT_WATCHLIST)):
+            assert client.post("/api/watchlist", json={"ticker": f"F{n:03d}"}).status_code == 201
+
+        response = client.post("/api/watchlist", json={"ticker": "PYPL"})
+
+        assert response.status_code == 400
+        assert "full" in response.json()["detail"]
+        assert str(MAX_WATCHLIST_SIZE) in response.json()["detail"]
 
 
 class TestRemoveTicker:

@@ -20,7 +20,8 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api import health_router, portfolio_router, watchlist_router
+from app.api import chat_router, health_router, portfolio_router, watchlist_router
+from app.config import load_env
 from app.db import load_tracked_tickers
 from app.market import (
     EventLog,
@@ -31,6 +32,11 @@ from app.market import (
 )
 from app.paths import BACKEND_DIR, REPO_ROOT, is_source_checkout
 from app.portfolio import record_snapshot
+
+# Before logging is configured, and before any module reads the environment:
+# `.env` supplies LOG_LEVEL and OPENROUTER_API_KEY, and a value loaded after
+# `basicConfig` has already run would be read too late to take effect.
+load_env()
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -74,6 +80,7 @@ def create_app() -> FastAPI:
     app.state.snapshot_task = None
     app.state.shutting_down = False
 
+    app.include_router(chat_router)
     app.include_router(health_router)
     app.include_router(portfolio_router)
     app.include_router(watchlist_router)

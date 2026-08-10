@@ -17,14 +17,21 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Path, status
 
 from app.api.deps import get_market_source, get_price_cache
-from app.api.schemas import TICKER_PATTERN, WatchlistAddRequest
+from app.api.schemas import WatchlistAddRequest
 from app.db import WatchlistEntry, connect, list_watchlist
-from app.market import MarketDataSource, PriceCache, PriceUpdate, normalize_ticker
+from app.market import (
+    TICKER_PATTERN,
+    MarketDataSource,
+    PriceCache,
+    PriceUpdate,
+    normalize_ticker,
+)
 from app.watchlist import (
     MarketSourceUnavailableError,
     TickerAlreadyWatchedError,
     TickerNotWatchedError,
     WatchlistError,
+    WatchlistFullError,
 )
 from app.watchlist import add as add_ticker
 from app.watchlist import remove as remove_ticker
@@ -39,6 +46,11 @@ _STATUS_FOR = {
     TickerAlreadyWatchedError: status.HTTP_409_CONFLICT,
     TickerNotWatchedError: status.HTTP_404_NOT_FOUND,
     MarketSourceUnavailableError: status.HTTP_503_SERVICE_UNAVAILABLE,
+    # 400, not 422: the request is well formed and the account cannot support
+    # it, which is the same distinction PLAN.md §8 draws for a trade the cash
+    # balance cannot cover. Listed explicitly rather than left to the default
+    # below, so the intended code is readable beside the others.
+    WatchlistFullError: status.HTTP_400_BAD_REQUEST,
 }
 
 

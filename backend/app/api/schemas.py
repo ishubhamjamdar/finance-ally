@@ -10,13 +10,14 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-#: Letters, digits, dot and hyphen, starting with a letter, at most 10 —
-#: covering ordinary symbols and the dotted class shares Massive uses
-#: ("BRK.B"). Anything else is rejected before it can be stored, so the
-#: watchlist cannot accumulate rows no data source will ever price.
-TICKER_PATTERN = r"^[A-Za-z][A-Za-z0-9.\-]{0,9}$"
+from app.market import TICKER_PATTERN
+
+# TICKER_PATTERN is defined in app.market, beside normalize_ticker: three
+# layers now validate symbols against it, and the rule belongs to the one that
+# knows what a symbol is. Rejecting anything else here is still what stops the
+# watchlist accumulating rows no data source will ever price.
 
 Ticker = Annotated[
     str,
@@ -42,3 +43,25 @@ class WatchlistAddRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     ticker: Ticker
+
+
+#: The longest chat message accepted. This is the one field in the API filled
+#: entirely with free text, and every character of it is forwarded to a paid
+#: provider inside a prompt that also carries the portfolio and twenty turns of
+#: history — so it is bounded at the edge rather than discovered at the context
+#: window. 2,000 characters is several paragraphs; no real question is longer.
+MAX_CHAT_MESSAGE_CHARS = 2000
+
+
+class ChatRequest(BaseModel):
+    """`POST /api/chat` — one turn of conversation (PLAN.md §8)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Stripped before the length checks, so a message of nothing but spaces is
+    #: a 422 rather than an empty prompt sent to the model at full price.
+    message: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_CHAT_MESSAGE_CHARS),
+        Field(description="What to say to the assistant."),
+    ]
