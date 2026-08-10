@@ -232,7 +232,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `price` REAL
 - `executed_at` TEXT (ISO timestamp)
 
-**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution.
+**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution — **except while a held ticker has no cached price.** A snapshot row carries `total_value` and nothing else, so unlike `GET /api/portfolio` it cannot say "this omits a position"; written anyway it would be a drawdown the account never suffered, permanently on the chart, that later "recovers" when the price returns. A gap in the series is the honest alternative. Ordinary runs are unaffected: a position can only be opened for a ticker that had a price.
 - `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (default: `"default"`)
 - `total_value` REAL
@@ -261,18 +261,30 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 | GET | `/api/stream/prices` | SSE stream of live price updates |
 
 ### Portfolio
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/portfolio` | Current positions, cash balance, total value, unrealized P&L |
-| POST | `/api/portfolio/trade` | Execute a trade: `{ticker, quantity, side}` |
-| GET | `/api/portfolio/history` | Portfolio value snapshots over time (for P&L chart) |
+| Method | Path | Description | Codes |
+|--------|------|-------------|-------|
+| GET | `/api/portfolio` | Current positions, cash balance, total value, unrealized P&L | 200 |
+| POST | `/api/portfolio/trade` | Execute a trade: `{ticker, quantity, side}` | 201 · 400 rejected · 422 malformed · 503 no feed |
+| GET | `/api/portfolio/history` | Portfolio value snapshots over time (for P&L chart), oldest first; `?limit=` 1–5000, default 500 | 200 · 422 |
 
 ### Watchlist
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/watchlist` | Current watchlist tickers with latest prices |
-| POST | `/api/watchlist` | Add a ticker: `{ticker}` |
-| DELETE | `/api/watchlist/{ticker}` | Remove a ticker |
+| Method | Path | Description | Codes |
+|--------|------|-------------|-------|
+| GET | `/api/watchlist` | Current watchlist tickers with latest prices, in add order | 200 |
+| POST | `/api/watchlist` | Add a ticker: `{ticker}` | 201 · 409 duplicate · 422 · 503 no feed |
+| DELETE | `/api/watchlist/{ticker}` | Remove a ticker. Does not sell, and keeps a held ticker subscribed | 200 · 404 · 422 · 503 no feed |
+
+**400 versus 422.** 422 means the request was malformed — a quantity that is not
+a positive finite number, a ticker that is not a symbol, an unexpected field.
+400 means it was well formed and the account could not support it: no price yet,
+insufficient cash, selling more than is held. The frontend renders them
+differently, and the Checkpoint 4 chat handler has to tell them apart to
+report back usefully.
+
+**A trade never accepts a price from the client.** The fill price is read from
+the server-side cache; the request schema has no `price` field and forbids
+unexpected ones, so a request naming its own price is rejected rather than
+silently ignored.
 
 ### Chat
 | Method | Path | Description |
@@ -549,7 +561,7 @@ row to ⛔, write a log entry describing how far it got and what blocked it, and
 |---|---|---|---|---|---|---|---|
 | 1 | Market data hardening | — | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #4) |
 | 2 | Backend skeleton + database | 1 | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #5) |
-| 3 | Portfolio & watchlist API | 2 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 3 | Portfolio & watchlist API | 2 | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #6) |
 | 4 | LLM chat integration | 3 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 5 | Frontend scaffold + live prices | 2 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 6 | Charts, portfolio visualisation, trade bar | 3, 5 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
@@ -1043,3 +1055,115 @@ item must be resolved or restated in a later entry — it does not expire by bei
     must respect it, or it will leak a task past shutdown
   - Coverage is 100% on `app/` and that is a floor, not an achievement. Three of this
     checkpoint's tests passed against deliberately broken code before mutation testing exposed them
+
+#### Checkpoint 3 — Portfolio & watchlist API
+
+- **Closed:** 2026-08-10 · branch `checkpoint-3-portfolio-watchlist-api` · PR #6 · all three gates
+  passed
+- **Built:**
+  - `app/api/deps.py` — `get_price_cache` / `get_market_source`, the latter 503-ing once so no
+    handler repeats the check. Closes CP2's first carried-forward item
+  - `app/db/repository.py` — **new**: row access for all six §7 tables as connection-taking
+    functions, so a trade composes four of them inside one `transaction()`. `Position`, `Trade`,
+    `Snapshot`, `WatchlistEntry` dataclasses. `apply_position()` owns "quantity zero means no row"
+  - `app/db/database.py` — `read_transaction()` (`BEGIN DEFERRED`) for multi-statement reads
+  - `app/portfolio.py` — **new**: the single implementation of valuation and trade execution.
+    `execute_trade`, `get_portfolio`, `get_history`, `record_snapshot`, `TradeError`, and the
+    `PortfolioView` / `PositionView` / `TradeResult` shapes. CP4's chat handler calls these
+  - `app/api/portfolio.py`, `app/api/watchlist.py`, `app/api/schemas.py` — the six §8 endpoints
+  - `app/main.py` — the 30-second `portfolio_snapshots` task, cancelled *and awaited* at shutdown
+- **Exit criteria:** all five met. The last four were verified against a live `uvicorn` over HTTP,
+  not only in the suite
+  - *Unit tests cover the seven listed money cases* — all seven, in `tests/test_portfolio.py`, and
+    each one **mutation-verified** (see Tests below)
+  - *A ticker added via `POST /api/watchlist` appears in the SSE stream without a restart* — added
+    PYPL and SQ against a running server; both appear in the next `data:` frame at a real price.
+    Also asserted in-process against the real simulator and the real SSE generator
+  - *Removing a held ticker does not delete the position* — `DELETE /api/watchlist/AAPL` while
+    holding 5 returned `still_tracked: true`; the position kept its live mark, and after a restart
+    `/api/health` reported 12 tracked tickers for an 11-ticker watchlist
+  - *A trade writes a snapshot immediately* — the live history showed four points exactly 30 s
+    apart from the background task, then a fifth at the trade's timestamp
+  - *Every endpoint returns the documented shape and correct status codes* — every path exercised
+    live: 200/201/400/404/409/422/503. §8 now records the codes and the 400-versus-422 rule
+- **Tests:** 295 → **429** (+134). Three consecutive full runs green, twice — once at Gate 1 and
+  again after the review fixes. Coverage **100%** on `app/`, holding CP1's and CP2's floor; `ruff
+  check` and `ruff format --check` clean. Runtime 4.2 s, still no network access
+
+  **32 mutations were run against the new code and all 32 were killed** — including one per money
+  rule (drop the cash check, mean instead of weighted average, re-average on a sell, drop the
+  oversell check, zero the tolerance, autocommit instead of `transaction()`) and one per review
+  fix. Two survived the first pass and both were real test gaps:
+  - The exact-balance buy test could not distinguish `>` from `>=`, because a `CASH_TOLERANCE` of
+    1e-9 made them equivalent at equality. Investigating it showed **the cash tolerance was dead
+    weight**: cash and cost are both `round(…, 2)`, so each is the nearest double to a whole number
+    of cents and the two compare exactly. It was deleted, and the asymmetry with
+    `QUANTITY_TOLERANCE` — which is load-bearing, because quantities are deliberately *not*
+    rounded — is now documented where the constant used to be
+  - "The trade and its snapshot read the same prices" passed against a version that re-read the
+    cache, because a static cache cannot tell one read from two. It now runs against a
+    `DriftingPriceCache` that moves on its second read
+- **Review:** `/code-review high` returned **7 findings, all 7 fixed.**
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | 1 | Gate 3 not performed — the diff touched no documentation, and `backend/CLAUDE.md` still read "**Checkpoint 3 should add `app/api/deps.py`**" | **Fixed.** This entry, the status row, §7, §8, and a rewritten `backend/CLAUDE.md` wiring section |
+  | 2 | `monkeypatch.setattr("app.main.SNAPSHOT_INTERVAL_SECONDS", 0.01)` did nothing — `interval: float = SNAPSHOT_INTERVAL_SECONDS` binds at def time — so the lifespan test ran at the real 30 s and its shutdown assertion could not fail | **Fixed** at the root: `interval` is `None`-defaulted and resolved in the body. The test now asserts several points rather than one, and a new test pins the resolution itself |
+  | 3 | `get_portfolio()` read cash and positions in autocommit, so a trade committing between the two statements yields pre-trade cash beside a post-trade position — a total that never existed | **Fixed.** `read_transaction()` (`BEGIN DEFERRED`) added and used. Tested by running a real trade from *inside* the cash read |
+  | 4 | The DELETE handler's held-check and `remove_ticker()` are not atomic, so a buy landing between them strands a position with no price source, permanently | **Fixed.** `_unsubscribe()` re-reads after the eviction and re-subscribes. The window does not fully close, but a buy landing after the eviction has no price to fill against and is rejected |
+  | 5 | Snapshots persist a total that silently omits unpriced positions — a permanent phantom drawdown that later "recovers" | **Fixed.** `_record_snapshot` skips and logs instead; a gap is honest, a fabricated drawdown is not. §7 corrected to match |
+  | 6 | `POST /api/portfolio/trade` took no `get_market_source` dependency, so after a failed failover it kept filling against frozen prices while the watchlist endpoints returned 503 | **Fixed.** It now depends on the source it does not use, and says why |
+  | 7 | Rollback asymmetry: POST undoes its row if the source refuses, DELETE did not | **Fixed.** Both directions now compensate |
+
+  `/security-review` was **run and required** for this checkpoint. **No HIGH or MEDIUM findings.**
+  What it checked and cleared: every new query is parameterised, with no interpolation of user
+  input; `TradeRequest` has no `price` field and sets `extra="forbid"`, so a client cannot name its
+  own fill price; `user_id` is threaded through every layer but is not reachable from any request,
+  so the no-auth single-user model exposes no cross-tenant path; the `{ticker}` path parameter is
+  pattern-bound and reaches only SQL parameters and dict keys, never a filesystem path; the ticker
+  forbids `/`, `:` and `%` and reaches Massive as a query argument rather than a URL path, so there
+  is no host or protocol control; and `BEGIN IMMEDIATE` takes the write lock before reading cash,
+  so two concurrent buys cannot both spend the same balance. Unbounded watchlist growth is real but
+  is resource exhaustion, excluded from that review's scope — it is carried forward below instead.
+- **Diverged from plan:** three, all now reflected in the spec above
+  - **§7's "immediately after each trade execution" is now qualified.** No snapshot is written
+    while a held ticker is unpriced — review finding #5. The exit criterion still holds for every
+    ordinary run, since a position can only be opened for a ticker that had a price
+  - **§8 gained a status-code column and the 400-versus-422 rule.** The plan named the endpoints
+    but not what they answer, and "correct status codes" is an exit criterion that needed something
+    to be correct against
+  - **`POST /api/portfolio/trade` requires a running market source**, which §8 did not say. Filling
+    against prices frozen by a dead feed is worse than refusing
+  - No new environment variables. `SNAPSHOT_INTERVAL_SECONDS` is a module constant, not a §5
+    variable: nothing outside a test wants a different value, and tests pass their own interval
+- **Resolved from Checkpoint 2's carried-forward list**, so none of it expires by being ignored:
+  - `app/api/deps.py` — built, with `get_market_source` raising 503 in one place; `/api/health`
+    still reads `app.state` directly
+  - Watchlist handlers are `async def` with the SQLite work in `run_in_threadpool`; the portfolio
+    handlers are plain `def`, because they never await the source. The rule in `backend/CLAUDE.md`
+    has been rewritten to say which colour applies where, rather than "all handlers"
+  - `transaction()` has its first production caller: the trade path, writing `users_profile`,
+    `positions`, `trades` and `portfolio_snapshots` atomically. `BEGIN IMMEDIATE` also turns out to
+    be what stops two concurrent buys spending the same balance
+  - The 30-second `portfolio_snapshots` task is built and lives in the lifespan
+  - `app.state.shutting_down` is untouched by this checkpoint — the snapshot task installs no
+    source. It is cancelled *and awaited* before the source is stopped, so it cannot be mid-write
+    when the interpreter tears down
+- **Carried forward:**
+  - **The watchlist has no size limit.** Nothing stops `POST /api/watchlist` being called a
+    thousand times, and every entry joins every Massive poll thereafter. Out of scope for the
+    security review by its own rules, and not a product rule the plan states — but Checkpoint 4
+    hands this endpoint to an LLM that can call it in a loop, so **CP4 should add a cap**
+  - **A ticker stays subscribed after its position closes.** Selling out of a ticker that is not on
+    the watchlist leaves it tracked for the life of the process. Deliberate — the chart going flat
+    the instant you sell would be worse — but it means the tracked set only ever grows within a
+    session
+  - `list_trades()` is written and tested but has no production caller. The blotter has no endpoint
+    yet; §10's positions table does not need one, so it is there for CP6 or CP7 to surface
+  - The `_unsubscribe` race (review #4) is narrowed, not eliminated. Closing it properly needs the
+    source subscription and the database row under one lock, which the async/sync split prevents
+  - `read_transaction()` has one caller. Any future multi-statement read must use it — autocommit
+    across two queries is exactly the bug #3 was
+  - Coverage is 100% on `app/` and remains a floor, not an achievement. Two of this checkpoint's
+    tests passed against deliberately broken code until mutation testing exposed them, which is
+    now the third checkpoint running where that has been true

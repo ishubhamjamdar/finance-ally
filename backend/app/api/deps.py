@@ -11,7 +11,9 @@ handler at a stub cache without starting a simulator.
 
 from __future__ import annotations
 
-from fastapi import HTTPException, Request, status
+from typing import Annotated
+
+from fastapi import Depends, HTTPException, Request, status
 
 from app.market import MarketDataSource, PriceCache
 
@@ -39,3 +41,26 @@ def get_market_source(request: Request) -> MarketDataSource:
             detail="Market data is not running.",
         )
     return source
+
+
+def require_live_market(
+    source: Annotated[MarketDataSource, Depends(get_market_source)],
+) -> None:
+    """Refuse the request unless a market data source is running.
+
+    The same 503 as `get_market_source`, for endpoints that need the *policy*
+    rather than the object. `POST /api/portfolio/trade` fills from the cache and
+    never touches the source, but must not fill at all once the feed has
+    stopped: after a failover that could not start a replacement, every price is
+    frozen at its last value and would stay fillable for the life of the
+    process, while the watchlist endpoints next door returned 503.
+
+    Declaring the policy by name beats injecting an object the handler ignores.
+    Checkpoint 4's chat endpoint executes trades too, and should use this.
+
+    Resolves `get_market_source` through `Depends`, not by calling it, so that
+    an `app.dependency_overrides` entry for it reaches this policy too — a
+    direct call would bypass the override and read `app.state` behind the
+    test's back.
+    """
+    del source

@@ -11,7 +11,14 @@ import math
 
 import pytest
 
-from app.db import DEFAULT_USER_ID, connect, get_position, list_positions, list_trades
+from app.db import (
+    DEFAULT_USER_ID,
+    connect,
+    get_cash_balance,
+    get_position,
+    list_positions,
+    list_trades,
+)
 from app.market import PriceCache
 from app.portfolio import (
     TradeError,
@@ -20,6 +27,7 @@ from app.portfolio import (
     get_portfolio,
     record_snapshot,
 )
+from tests.conftest import snapshot_count
 
 
 class DriftingPriceCache(PriceCache):
@@ -43,11 +51,6 @@ class DriftingPriceCache(PriceCache):
         return super().get_all()
 
 
-def snapshot_count() -> int:
-    with connect() as conn:
-        return conn.execute("SELECT COUNT(*) FROM portfolio_snapshots").fetchone()[0]
-
-
 def position(ticker: str):
     with connect() as conn:
         return get_position(conn, ticker)
@@ -58,8 +61,8 @@ class TestBuy:
         result = execute_trade(price_cache, "AAPL", "buy", 10)
 
         assert read_cash() == 8000.0
-        assert result.position.quantity == 10
-        assert result.position.avg_cost == 200.0
+        assert result.position().quantity == 10
+        assert result.position().avg_cost == 200.0
         assert result.trade.price == 200.0
         assert result.trade.side == "buy"
 
@@ -139,7 +142,7 @@ class TestSell:
         result = execute_trade(price_cache, "AAPL", "sell", 10)
 
         assert position("AAPL") is None
-        assert result.position is None
+        assert result.position() is None
         with connect() as conn:
             assert list_positions(conn) == []
 
@@ -265,7 +268,7 @@ class TestSnapshots:
         before it."""
         execute_trade(price_cache, "AAPL", "buy", 10)
 
-        history = get_history(price_cache)
+        history = get_history()
         assert [snapshot.total_value for snapshot in history] == [10000.0]
 
     def test_the_fill_and_the_snapshot_read_the_same_prices(self):
@@ -279,23 +282,91 @@ class TestSnapshots:
 
         execute_trade(cache, "AAPL", "buy", 10)  # $2,000 of the $10,000
 
-        assert [s.total_value for s in get_history(cache)] == [10000.0]
+        assert [s.total_value for s in get_history()] == [10000.0]
+
+    def test_no_point_is_recorded_while_a_position_is_unpriced(self, price_cache, add_position):
+        """A snapshot row is a bare total with nowhere to say "this omits a
+        position". Recorded anyway it is a drawdown the account never suffered,
+        permanently on the chart, that later "recovers" when the price returns.
+        A gap is the honest alternative."""
+        add_position("PYPL", quantity=5)
+
+        assert record_snapshot(price_cache) is None
+        assert snapshot_count() == 0
+
+    def test_a_trade_records_no_point_while_another_position_is_unpriced(
+        self, price_cache, add_position
+    ):
+        """The rule lives in one place, so the trade path inherits it."""
+        add_position("PYPL", quantity=5)
+
+        execute_trade(price_cache, "AAPL", "buy", 1)
+
+        assert snapshot_count() == 0
+
+    def test_the_series_resumes_once_the_price_returns(self, price_cache, add_position):
+        add_position("PYPL", quantity=5)
+        assert record_snapshot(price_cache) is None
+
+        price_cache.update("PYPL", 60.0)
+        snapshot = record_snapshot(price_cache)
+
+        assert snapshot is not None
+        assert snapshot.total_value == 10000.0 + 5 * 60.0
 
     def test_the_background_task_appends_a_point(self, price_cache):
         record_snapshot(price_cache)
         record_snapshot(price_cache)
-        assert [s.total_value for s in get_history(price_cache)] == [10000.0, 10000.0]
+        assert [s.total_value for s in get_history()] == [10000.0, 10000.0]
 
     def test_history_is_oldest_first_and_keeps_the_newest_when_truncated(self, price_cache):
         for _ in range(5):
             execute_trade(price_cache, "AAPL", "buy", 1)
             price_cache.update("AAPL", price_cache.get_price("AAPL") + 100)
 
-        recorded = [s.recorded_at for s in get_history(price_cache)]
+        recorded = [s.recorded_at for s in get_history()]
         assert recorded == sorted(recorded)
 
-        newest_two = get_history(price_cache, limit=2)
+        newest_two = get_history(limit=2)
         assert [s.recorded_at for s in newest_two] == recorded[-2:]
+
+
+class TestReadConsistency:
+    def test_cash_and_positions_come_from_one_snapshot(self, price_cache, monkeypatch):
+        """`_value` reads cash and then positions. In autocommit those are two
+        separate snapshots, so a trade committing between them is reported as
+        pre-trade cash *plus* a post-trade position — a total $2,000 too high,
+        served once and never reproducible.
+
+        The trade is forced into exactly that window by running it from inside
+        the cash read.
+        """
+        state = {"traded": False}
+        real_get_cash_balance = get_cash_balance
+
+        def trade_after_reading_cash(conn, user_id=DEFAULT_USER_ID):
+            cash = real_get_cash_balance(conn, user_id)
+            if not state["traded"]:
+                state["traded"] = True  # set first: execute_trade values too
+                execute_trade(price_cache, "AAPL", "buy", 10)
+            return cash
+
+        monkeypatch.setattr("app.portfolio.get_cash_balance", trade_after_reading_cash)
+
+        view = get_portfolio(price_cache)
+
+        assert state["traded"], "the racing trade never ran; the test proves nothing"
+        assert (view.cash_balance, view.positions) == (10000.0, [])
+        assert view.total_value == 10000.0
+
+    def test_the_trade_is_visible_to_the_next_read(self, price_cache):
+        """Positive control for the test above: the snapshot is per call, not a
+        cache that would hide the trade forever."""
+        execute_trade(price_cache, "AAPL", "buy", 10)
+
+        view = get_portfolio(price_cache)
+        assert view.cash_balance == 8000.0
+        assert [p.ticker for p in view.positions] == ["AAPL"]
 
 
 class TestValuation:

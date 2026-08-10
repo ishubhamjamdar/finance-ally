@@ -5,6 +5,8 @@ import uuid
 
 import pytest
 
+from app.market import MarketDataSource, PriceCache
+
 # PLAN.md §7 spells these out. Written here as a literal rather than imported
 # from app.market, so that a change to the market module's seed list cannot
 # silently redefine what the plan says the default watchlist is. One literal
@@ -87,6 +89,44 @@ def no_massive_key(monkeypatch):
     monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
 
 
+class RecordingSource(MarketDataSource):
+    """A market source that records what it was told, and prices on demand.
+
+    Models the simulator's behaviour, which is the harder case to get right:
+    `add_ticker` makes the ticker priceable immediately, so a test can check
+    that the handler returns a live quote with the 201.
+    """
+
+    def __init__(self, cache: PriceCache, tickers: list[str] | None = None) -> None:
+        self._cache = cache
+        self._tickers = list(tickers or [])
+        self.added: list[str] = []
+        self.removed: list[str] = []
+        #: Set to an exception to make `add_ticker` fail, for the rollback test.
+        self.add_error: Exception | None = None
+
+    async def start(self, tickers: list[str]) -> None:
+        self._tickers = list(tickers)
+
+    async def stop(self) -> None:
+        pass
+
+    async def add_ticker(self, ticker: str) -> None:
+        if self.add_error is not None:
+            raise self.add_error
+        self.added.append(ticker)
+        self._tickers.append(ticker)
+        self._cache.update(ticker, 50.0)
+
+    async def remove_ticker(self, ticker: str) -> None:
+        self.removed.append(ticker)
+        self._tickers = [t for t in self._tickers if t != ticker]
+        self._cache.remove(ticker)
+
+    def get_tickers(self) -> list[str]:
+        return list(self._tickers)
+
+
 class StubStreamRequest:
     """A `Request` stand-in that disconnects after `ticks` loop iterations.
 
@@ -121,6 +161,23 @@ def sse_data_frames(frames: list[str]) -> list[dict]:
     return [
         json.loads(frame.split("data: ", 1)[1]) for frame in frames if frame.startswith("data: ")
     ]
+
+
+def snapshot_count() -> int:
+    """How many P&L points have been recorded. Two modules assert on this; one
+    copy, so a `user_id` filter cannot be added to one and not the other."""
+    from app.db import connect
+
+    with connect() as conn:
+        return conn.execute("SELECT COUNT(*) FROM portfolio_snapshots").fetchone()[0]
+
+
+def snapshot_values() -> list[float]:
+    """Recorded totals, in insertion order."""
+    from app.db import connect
+
+    with connect() as conn:
+        return [row[0] for row in conn.execute("SELECT total_value FROM portfolio_snapshots")]
 
 
 @pytest.fixture

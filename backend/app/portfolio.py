@@ -40,6 +40,7 @@ from app.db import (
     insert_trade,
     list_positions,
     list_snapshots,
+    read_transaction,
     set_cash_balance,
     transaction,
 )
@@ -58,6 +59,15 @@ SIDES = (BUY, SELL)
 #: Absolute rather than relative: quantities here are bounded by $10,000 of
 #: capital, so the scale where a relative epsilon would matter cannot arise.
 QUANTITY_TOLERANCE = 1e-9
+
+#: P&L history points returned by default and at most. The single owner of both
+#: numbers: the API layer imports them for its query bounds, and a direct caller
+#: — Checkpoint 4 assembling chat context — gets the same default rather than a
+#: second one that could drift. 500 at one point per 30 s is over four hours of
+#: session, more than the chart can resolve; the ceiling stops a hand-typed
+#: `?limit=1000000` reading a whole table to draw a line 900 pixels wide.
+DEFAULT_HISTORY_LIMIT = 500
+MAX_HISTORY_LIMIT = 5000
 
 # There is no matching tolerance for cash, and it would be dead weight if there
 # were. Every cash figure and every cost is `round(…, 2)`, so each is the
@@ -97,12 +107,12 @@ class PositionView:
         return {
             "ticker": self.ticker,
             "quantity": self.quantity,
-            "avg_cost": round(self.avg_cost, 4),
-            "cost_basis": round(self.cost_basis, 2),
+            "avg_cost": _rate(self.avg_cost),
+            "cost_basis": _money(self.cost_basis),
             "current_price": self.current_price,
-            "market_value": _round_or_none(self.market_value, 2),
-            "unrealized_pnl": _round_or_none(self.unrealized_pnl, 2),
-            "unrealized_pnl_percent": _round_or_none(self.unrealized_pnl_percent, 4),
+            "market_value": _money(self.market_value),
+            "unrealized_pnl": _money(self.unrealized_pnl),
+            "unrealized_pnl_percent": _rate(self.unrealized_pnl_percent),
         }
 
 
@@ -124,13 +134,13 @@ class PortfolioView:
 
     def to_dict(self) -> dict:
         return {
-            "cash_balance": round(self.cash_balance, 2),
+            "cash_balance": _money(self.cash_balance),
             "positions": [position.to_dict() for position in self.positions],
-            "positions_value": round(self.positions_value, 2),
-            "total_value": round(self.total_value, 2),
-            "cost_basis": round(self.cost_basis, 2),
-            "unrealized_pnl": round(self.unrealized_pnl, 2),
-            "unrealized_pnl_percent": _round_or_none(self.unrealized_pnl_percent, 4),
+            "positions_value": _money(self.positions_value),
+            "total_value": _money(self.total_value),
+            "cost_basis": _money(self.cost_basis),
+            "unrealized_pnl": _money(self.unrealized_pnl),
+            "unrealized_pnl_percent": _rate(self.unrealized_pnl_percent),
             "unpriced_tickers": self.unpriced_tickers,
         }
 
@@ -142,10 +152,15 @@ class TradeResult:
     The portfolio travels with the fill so the UI needs one round trip, not two
     — and so it cannot render a position from one instant beside a cash balance
     from another.
+
+    There is deliberately no separate `position` field. The traded position is
+    already in `portfolio.positions`, in the one shape the rest of the API uses,
+    and absent from it when a sell closed the holding. A second, narrower copy
+    would give the frontend two places to read the same row and two rounding
+    rules to keep in step.
     """
 
     trade: Trade
-    position: Position | None  # None when the sell closed the holding
     portfolio: PortfolioView
 
     def to_dict(self) -> dict:
@@ -156,43 +171,42 @@ class TradeResult:
                 "side": self.trade.side,
                 "quantity": self.trade.quantity,
                 "price": self.trade.price,
-                "value": round(self.trade.price * self.trade.quantity, 2),
+                "value": _fill_value(self.trade.price, self.trade.quantity),
                 "executed_at": self.trade.executed_at,
             },
-            "position": (
-                {
-                    "ticker": self.position.ticker,
-                    "quantity": self.position.quantity,
-                    "avg_cost": round(self.position.avg_cost, 4),
-                }
-                if self.position is not None
-                else None
-            ),
             "portfolio": self.portfolio.to_dict(),
         }
+
+    def position(self) -> PositionView | None:
+        """The traded ticker's position after the fill, or None if it closed."""
+        return next((p for p in self.portfolio.positions if p.ticker == self.trade.ticker), None)
 
 
 # --- reads ---------------------------------------------------------------
 
 
 def get_portfolio(price_cache: PriceCache, user_id: str = DEFAULT_USER_ID) -> PortfolioView:
-    """Value the account against the current cache."""
+    """Value the account against the current cache.
+
+    Read inside a snapshot transaction, because `_value` issues two queries and
+    a trade can commit between them. In autocommit that yields pre-trade cash
+    beside a post-trade position — a total ten thousand dollars out, reported
+    once and never repeated, which is the hardest kind of bug to be told about.
+    """
     prices = price_cache.get_all()
-    with connect() as conn:
+    with read_transaction() as conn:
         return _value(conn, prices, user_id)
 
 
 def get_history(
-    price_cache: PriceCache, limit: int = 500, user_id: str = DEFAULT_USER_ID
+    limit: int = DEFAULT_HISTORY_LIMIT, user_id: str = DEFAULT_USER_ID
 ) -> list[Snapshot]:
     """Portfolio value over time, oldest first — the P&L chart's series.
 
-    `price_cache` is unused and deliberately part of the signature: the P&L
-    chart plots recorded history, not a curve recomputed from today's prices,
-    and a future caller reaching for the cache here would be about to backfill
-    the past with the present.
+    Takes no `PriceCache`, and must not: the chart plots what was recorded, not
+    a curve recomputed from today's prices. Backfilling the past with the
+    present would redraw history every time the market moved.
     """
-    del price_cache
     with connect() as conn:
         return list_snapshots(conn, limit=limit, user_id=user_id)
 
@@ -200,11 +214,15 @@ def get_history(
 # --- writes --------------------------------------------------------------
 
 
-def record_snapshot(price_cache: PriceCache, user_id: str = DEFAULT_USER_ID) -> Snapshot:
-    """Append one point to the P&L series. Used by the 30-second background task."""
+def record_snapshot(price_cache: PriceCache, user_id: str = DEFAULT_USER_ID) -> Snapshot | None:
+    """Append one point to the P&L series, or `None` if it would be a lie.
+
+    Used by the 30-second background task. See `_record_snapshot` for when a
+    point is skipped.
+    """
     prices = price_cache.get_all()
     with transaction() as conn:
-        return _record_snapshot(conn, prices, user_id)
+        return _record_snapshot(conn, _value(conn, prices, user_id), user_id)
 
 
 def execute_trade(
@@ -245,18 +263,17 @@ def execute_trade(
         set_cash_balance(conn, new_cash, user_id)
         apply_position(conn, ticker, new_quantity, new_avg_cost, user_id)
         trade = insert_trade(conn, ticker, side, quantity, price, user_id)
-        _record_snapshot(conn, prices, user_id)
 
-        # Read back rather than construct: this is the row the rest of the app
+        # Read back rather than construct: this is what the rest of the app
         # will see, including the `quantity == 0` delete apply_position may
         # have just performed.
-        position = get_position(conn, ticker, user_id)
         portfolio = _value(conn, prices, user_id)
+        _record_snapshot(conn, portfolio, user_id)
 
     logger.info(
         "Trade filled: %s %s %g @ %.2f — cash %.2f", side, ticker, quantity, price, new_cash
     )
-    return TradeResult(trade=trade, position=position, portfolio=portfolio)
+    return TradeResult(trade=trade, portfolio=portfolio)
 
 
 # --- internals -----------------------------------------------------------
@@ -300,7 +317,7 @@ def _apply_buy(
     cash: float, held: Position | None, price: float, quantity: float, ticker: str
 ) -> tuple[float, float, float]:
     """New (cash, quantity, avg_cost) after a buy."""
-    cost = round(price * quantity, 2)
+    cost = _fill_value(price, quantity)
     # `>`, not `>=`: a buy for exactly the cash on hand must fill, or the
     # account becomes unspendable at the one moment the user wants to spend it.
     if cost > cash:
@@ -330,7 +347,7 @@ def _apply_sell(
     if quantity > held.quantity + QUANTITY_TOLERANCE:
         raise TradeError(f"Cannot sell {quantity:g} {ticker}: only {held.quantity:g} held.")
 
-    proceeds = round(price * quantity, 2)
+    proceeds = _fill_value(price, quantity)
     remaining = held.quantity - quantity
     if abs(remaining) <= QUANTITY_TOLERANCE:
         remaining = 0.0  # closes the position; apply_position deletes the row
@@ -342,10 +359,27 @@ def _apply_sell(
 
 
 def _record_snapshot(
-    conn: sqlite3.Connection, prices: dict[str, PriceUpdate], user_id: str
-) -> Snapshot:
-    """Write one snapshot row using an already-open connection."""
-    return insert_snapshot(conn, _value(conn, prices, user_id).total_value, user_id)
+    conn: sqlite3.Connection, view: PortfolioView, user_id: str
+) -> Snapshot | None:
+    """Write one snapshot row, unless the total would be understated.
+
+    A `portfolio_snapshots` row carries `total_value` and nothing else, so
+    unlike `GET /api/portfolio` it has nowhere to say "this omits two positions
+    the cache could not price". Recorded anyway, such a point is a drawdown the
+    account never suffered, permanently on the P&L chart, which then "recovers"
+    when the price comes back.
+
+    A gap in the series is the honest alternative, so the point is skipped and
+    the reason logged. Fully-priced portfolios — every ordinary run — are
+    unaffected, since a position can only exist for a ticker that had a price.
+    """
+    if view.unpriced_tickers:
+        logger.warning(
+            "Skipping the portfolio snapshot: no price for %s",
+            ", ".join(view.unpriced_tickers),
+        )
+        return None
+    return insert_snapshot(conn, view.total_value, user_id)
 
 
 def _value(conn: sqlite3.Connection, prices: dict[str, PriceUpdate], user_id: str) -> PortfolioView:
@@ -416,5 +450,23 @@ def _value(conn: sqlite3.Connection, prices: dict[str, PriceUpdate], user_id: st
     )
 
 
-def _round_or_none(value: float | None, digits: int) -> float | None:
-    return None if value is None else round(value, digits)
+def _fill_value(price: float, quantity: float) -> float:
+    """What a fill is worth, to the cent.
+
+    The one definition. It is the amount that leaves or enters the cash balance,
+    the amount a buy's cost basis is built from, and the `value` shown on the
+    receipt — three things that must agree, and would not if each rounded the
+    product itself.
+    """
+    return round(price * quantity, 2)
+
+
+def _money(value: float | None) -> float | None:
+    """A currency amount, rounded for display. `None` stays `None`."""
+    return None if value is None else round(value, 2)
+
+
+def _rate(value: float | None) -> float | None:
+    """A ratio — a percentage or an average cost. Four places, because two would
+    visibly mis-state the average cost of a fractional holding."""
+    return None if value is None else round(value, 4)

@@ -123,7 +123,7 @@ def apply_position(
     """
     ticker = normalize_ticker(ticker)
     if quantity == 0:
-        delete_position(conn, ticker, user_id)
+        _delete_position(conn, ticker, user_id)
         return
 
     conn.execute(
@@ -139,7 +139,9 @@ def apply_position(
     )
 
 
-def delete_position(conn: sqlite3.Connection, ticker: str, user_id: str = DEFAULT_USER_ID) -> None:
+def _delete_position(conn: sqlite3.Connection, ticker: str, user_id: str = DEFAULT_USER_ID) -> None:
+    """Private on purpose: `apply_position(..., quantity=0)` is the way to close
+    a holding, so "quantity zero means no row" has exactly one enforcer."""
     conn.execute(
         "DELETE FROM positions WHERE user_id = ? AND ticker = ?",
         (user_id, normalize_ticker(ticker)),
@@ -193,7 +195,13 @@ def insert_trade(
 def list_trades(
     conn: sqlite3.Connection, limit: int = 100, user_id: str = DEFAULT_USER_ID
 ) -> list[Trade]:
-    """Most recent trades first."""
+    """Most recent trades first.
+
+    No production caller yet — the blotter has no endpoint in PLAN.md §8. Kept
+    because the `trades` table is otherwise write-only, and Checkpoint 6's
+    positions panel or Checkpoint 7's chat context is where it surfaces. Delete
+    it at Checkpoint 10 if neither claimed it.
+    """
     rows = conn.execute(
         "SELECT id, ticker, side, quantity, price, executed_at FROM trades"
         " WHERE user_id = ? ORDER BY executed_at DESC, rowid DESC LIMIT ?",
@@ -228,7 +236,7 @@ def insert_snapshot(
 
 
 def list_snapshots(
-    conn: sqlite3.Connection, limit: int = 500, user_id: str = DEFAULT_USER_ID
+    conn: sqlite3.Connection, limit: int, user_id: str = DEFAULT_USER_ID
 ) -> list[Snapshot]:
     """The most recent `limit` snapshots, returned oldest first.
 

@@ -52,7 +52,18 @@ class TestTrade:
         assert body["trade"]["side"] == "buy"
         assert body["trade"]["price"] == 200.0
         assert body["trade"]["value"] == 400.0
-        assert body["position"] == {"ticker": "AAPL", "quantity": 2.0, "avg_cost": 200.0}
+        assert body["portfolio"]["positions"] == [
+            {
+                "ticker": "AAPL",
+                "quantity": 2.0,
+                "avg_cost": 200.0,
+                "cost_basis": 400.0,
+                "current_price": 200.0,
+                "market_value": 400.0,
+                "unrealized_pnl": 0.0,
+                "unrealized_pnl_percent": 0.0,
+            }
+        ]
         assert body["portfolio"]["cash_balance"] == 9600.0
 
     def test_sell_that_closes_the_position_reports_no_position(self, client):
@@ -61,7 +72,6 @@ class TestTrade:
             "/api/portfolio/trade", json={"ticker": "AAPL", "side": "sell", "quantity": 2}
         ).json()
 
-        assert body["position"] is None
         assert body["portfolio"]["positions"] == []
 
     def test_accepts_a_lower_case_ticker(self, client):
@@ -118,6 +128,24 @@ class TestTrade:
         ignored is indistinguishable from being honoured."""
         assert client.post("/api/portfolio/trade", json=payload).status_code == 422
         assert read_cash() == 10000.0
+
+    def test_is_a_503_when_no_market_feed_is_running(self, sourceless_client, read_cash):
+        """After a failover that could not start a replacement, every price in
+        the cache is frozen at its last value. Filling against those is worse
+        than refusing — the watchlist endpoints are already returning 503, so
+        the account would be trading on a feed the app knows is dead."""
+        response = sourceless_client.post(
+            "/api/portfolio/trade", json={"ticker": "AAPL", "side": "buy", "quantity": 1}
+        )
+
+        assert response.status_code == 503
+        assert read_cash() == 10000.0
+
+    def test_reading_the_portfolio_still_works_without_a_feed(self, sourceless_client):
+        """Refusing to trade is not refusing to look. The last known marks are
+        still the best answer available, and a blank screen would be worse."""
+        assert sourceless_client.get("/api/portfolio").status_code == 200
+        assert sourceless_client.get("/api/portfolio/history").status_code == 200
 
 
 class TestHistory:

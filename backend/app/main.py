@@ -48,8 +48,8 @@ _STATIC_CANDIDATES = (BACKEND_DIR / "static",) + (
 
 #: How often the P&L series gains a point (PLAN.md §7). Deliberately not an
 #: environment variable: nothing outside a test wants a different value, and
-#: tests drive `_snapshot_loop` directly with their own interval rather than
-#: waiting on the real one.
+#: tests either pass `_snapshot_loop` their own interval or patch this constant,
+#: which the lifespan reads at call time.
 SNAPSHOT_INTERVAL_SECONDS = 30.0
 
 
@@ -109,7 +109,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     source.on_permanent_failure = _make_failover_handler(app)
     app.state.market_source = source
 
-    snapshot_task = asyncio.create_task(_snapshot_loop(app), name="portfolio-snapshots")
+    snapshot_task = asyncio.create_task(
+        _snapshot_loop(app, SNAPSHOT_INTERVAL_SECONDS), name="portfolio-snapshots"
+    )
     app.state.snapshot_task = snapshot_task
 
     try:
@@ -133,7 +135,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await current.stop()
 
 
-async def _snapshot_loop(app: FastAPI, interval: float = SNAPSHOT_INTERVAL_SECONDS) -> None:
+async def _snapshot_loop(app: FastAPI, interval: float) -> None:
     """Append a `portfolio_snapshots` row every `interval` seconds (PLAN.md §7).
 
     The first point is written straight away rather than one interval later, so
@@ -148,6 +150,12 @@ async def _snapshot_loop(app: FastAPI, interval: float = SNAPSHOT_INTERVAL_SECON
     One failure costs one point, not the series: the loop logs and carries on.
     Only cancellation ends it, and `CancelledError` is a `BaseException`, so it
     passes through the handler below untouched.
+
+    `interval` is required rather than defaulted from the module constant: a
+    default argument binds at def time, so patching `SNAPSHOT_INTERVAL_SECONDS`
+    would not reach it, and a test that patched it would silently run at the
+    real 30 seconds and assert nothing in its 50 ms window. The lifespan names
+    the constant instead, which reads it at call time.
     """
     while True:
         try:

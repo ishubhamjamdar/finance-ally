@@ -135,6 +135,44 @@ class TestRemoveTicker:
         assert [p["ticker"] for p in portfolio["positions"]] == ["AAPL"]
         assert portfolio["positions"][0]["current_price"] == 200.0
 
+    def test_resubscribes_when_the_ticker_is_bought_mid_removal(self, client, source, add_position):
+        """The held check and the unsubscribe cannot share a transaction — one
+        is SQLite, the other an await — so a buy can land between them. Left
+        alone, that position has no price source: null mark, excluded from the
+        total, for the life of the process.
+
+        The buy is forced into exactly that window by creating the position
+        from inside `remove_ticker`.
+        """
+        original = source.remove_ticker
+
+        async def buy_while_unsubscribing(ticker):
+            await original(ticker)
+            add_position(ticker, quantity=3)
+
+        source.remove_ticker = buy_while_unsubscribing
+
+        body = client.delete("/api/watchlist/AAPL").json()
+
+        assert body["still_tracked"] is True
+        assert "AAPL" in source.get_tickers()
+        assert client.get("/api/portfolio").json()["unpriced_tickers"] == []
+
+    def test_restores_the_row_when_the_source_refuses_to_unsubscribe(self, client, source):
+        """Symmetric with the add path. The row is already committed gone, so
+        leaving it that way would have the watchlist and the source disagree
+        with no way back."""
+
+        async def refuse(ticker):
+            raise RuntimeError("source is wedged")
+
+        source.remove_ticker = refuse
+
+        response = client.delete("/api/watchlist/AAPL")
+
+        assert response.status_code == 503
+        assert "AAPL" in stored_tickers()
+
     @pytest.mark.parametrize("ticker", ["A" * 11, "1AAPL", "AAPL*"])
     def test_rejects_a_ticker_that_is_not_a_symbol(self, client, ticker):
         assert client.delete(f"/api/watchlist/{ticker}").status_code == 422

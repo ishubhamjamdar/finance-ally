@@ -18,20 +18,9 @@ from app.main import (
 from app.market import MarketDataSource
 from app.market.simulator import SimulatorDataSource
 from app.portfolio import record_snapshot
-from tests.conftest import PLAN_DEFAULT_WATCHLIST
+from tests.conftest import PLAN_DEFAULT_WATCHLIST, snapshot_count, snapshot_values
 
 DEFAULT_WATCHLIST = set(PLAN_DEFAULT_WATCHLIST)
-
-
-def snapshot_count() -> int:
-    with connect() as conn:
-        return conn.execute("SELECT COUNT(*) FROM portfolio_snapshots").fetchone()[0]
-
-
-def snapshot_values() -> list[float]:
-    with connect() as conn:
-        rows = conn.execute("SELECT total_value FROM portfolio_snapshots").fetchall()
-    return [row[0] for row in rows]
 
 
 @pytest.fixture
@@ -161,7 +150,21 @@ class TestSnapshotTask:
     def test_the_documented_interval_is_thirty_seconds(self):
         assert SNAPSHOT_INTERVAL_SECONDS == 30.0
 
-    async def test_writes_a_point_immediately_and_then_every_interval(self, price_cache):
+    async def test_the_first_point_is_written_before_the_first_sleep(self, price_cache):
+        """A freshly started app draws a P&L chart with a line on it, not
+        thirty seconds of blank axes. The interval is long enough that only an
+        immediate first write can produce a point at all."""
+        app = create_app()
+        app.state.price_cache = price_cache
+
+        task = asyncio.create_task(_snapshot_loop(app, interval=3600))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert snapshot_count() == 1
+
+    async def test_keeps_appending_every_interval(self, price_cache):
         app = create_app()
         app.state.price_cache = price_cache
 
@@ -206,14 +209,22 @@ class TestSnapshotTask:
             task = app.state.snapshot_task
             assert task is not None and not task.done()
             await asyncio.sleep(0.05)
-            during = snapshot_count()
-            assert during >= 1
+            # Several, not one: at 10 ms a single point would mean the loop
+            # wrote its first snapshot and then stopped, which is also what a
+            # loop that never got the patched interval looks like.
+            assert snapshot_count() >= 2
 
         assert task.cancelled() or task.done()
         assert app.state.snapshot_task is None
 
+        # Counted after shutdown, never before it. Read inside the block, the
+        # figure is stale the moment the loop ticks again, and the comparison
+        # below fails whenever the machine is slow enough to fit one more write
+        # in — which is how a timing-dependent test passes locally and fails in
+        # CI. (Found exactly that way: green bare, red under coverage.)
+        after_shutdown = snapshot_count()
         await asyncio.sleep(0.05)
-        assert snapshot_count() == during, "the snapshot task outlived shutdown"
+        assert snapshot_count() == after_shutdown, "the snapshot task outlived shutdown"
 
     def test_no_task_exists_before_startup(self):
         assert create_app().state.snapshot_task is None

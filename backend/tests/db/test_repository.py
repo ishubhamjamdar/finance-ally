@@ -15,7 +15,6 @@ from app.db import (
     add_watchlist_entry,
     apply_position,
     connect,
-    delete_position,
     delete_watchlist_entry,
     get_cash_balance,
     get_position,
@@ -72,7 +71,7 @@ class TestPositions:
             assert get_position(conn, "AAPL").ticker == "AAPL"
             assert get_position(conn, " aapl ") is not None
 
-            delete_position(conn, "aapl")
+            apply_position(conn, "aapl", 0, 100.0)
             assert get_position(conn, "AAPL") is None
 
     def test_lists_in_ticker_order(self):
@@ -117,7 +116,7 @@ class TestSnapshots:
         with connect() as conn:
             for value in (1.0, 2.0, 3.0):
                 insert_snapshot(conn, value)
-            assert [s.total_value for s in list_snapshots(conn)] == [1.0, 2.0, 3.0]
+            assert [s.total_value for s in list_snapshots(conn, limit=100)] == [1.0, 2.0, 3.0]
 
     def test_a_limit_keeps_the_newest_points(self):
         """Truncating from the old end: a chart missing its left edge is
@@ -140,7 +139,7 @@ class TestSnapshots:
                 )
 
         with connect() as conn:
-            assert [s.total_value for s in list_snapshots(conn)] == [1.0, 2.0, 3.0]
+            assert [s.total_value for s in list_snapshots(conn, limit=100)] == [1.0, 2.0, 3.0]
             assert [s.total_value for s in list_snapshots(conn, limit=2)] == [2.0, 3.0]
 
 
