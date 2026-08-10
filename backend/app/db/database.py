@@ -142,6 +142,31 @@ def transaction() -> Iterator[sqlite3.Connection]:
         conn.commit()
 
 
+@contextmanager
+def read_transaction() -> Iterator[sqlite3.Connection]:
+    """A connection holding one consistent read snapshot.
+
+    `connect()` is autocommit, so each statement reads the database as it is at
+    that instant. That is fine for a single query and wrong for several: valuing
+    the portfolio reads cash and then positions, and a trade committing between
+    the two yields pre-trade cash beside a post-trade position — a total that
+    never existed, reported to the user as fact.
+
+    BEGIN DEFERRED fixes the snapshot at the first read and holds it to the end.
+    Under WAL it takes no write lock, so unlike `transaction()` it does not
+    block, or get blocked by, the very trade it is racing.
+    """
+    with connect() as conn:
+        conn.execute("BEGIN DEFERRED")
+        try:
+            yield conn
+        finally:
+            # Read-only by contract, so there is nothing to commit. Rollback
+            # also releases the snapshot in the error case without pretending
+            # the caller's partial work was intended.
+            conn.rollback()
+
+
 def ensure_initialized(conn: sqlite3.Connection) -> None:
     """Create and seed the schema if the database is not usable yet.
 

@@ -23,57 +23,29 @@ from app.market import EventLog, PriceCache, create_stream_router
 from app.market.models import MarketEvent
 from app.market.stream import _generate_events
 
-
-class StubRequest:
-    """A Request stand-in that disconnects after `ticks` loop iterations.
-
-    `on_tick` fires before each check, which is how a test mutates the cache
-    part-way through the stream.
-    """
-
-    def __init__(self, ticks: int, on_tick=None) -> None:
-        self._ticks = ticks
-        self._calls = 0
-        self._on_tick = on_tick
-        self.client = None  # exercises the "unknown" client-ip branch
-
-    async def is_disconnected(self) -> bool:
-        if self._on_tick:
-            self._on_tick(self._calls)
-        self._calls += 1
-        return self._calls > self._ticks
-
-
-async def collect(cache: PriceCache, ticks: int = 3, on_tick=None, **kwargs) -> list[str]:
-    """Run the generator to completion and return the raw SSE frames."""
-    request = StubRequest(ticks, on_tick=on_tick)
-    return [frame async for frame in _generate_events(cache, request, interval=0, **kwargs)]
-
-
-def data_frames(frames: list[str]) -> list[dict]:
-    """Parse the payloads of default (unnamed) data frames."""
-    return [
-        json.loads(frame.split("data: ", 1)[1]) for frame in frames if frame.startswith("data: ")
-    ]
+# Defined in tests/conftest.py so the watchlist tests can drive a real SSE
+# frame too — "a ticker added at runtime appears in the stream" is a Checkpoint
+# 3 exit criterion, and it deserves the actual frame, not a proxy for it.
+from tests.conftest import StubStreamRequest, collect_sse_frames, sse_data_frames
 
 
 @pytest.mark.asyncio
 class TestFrames:
     async def test_opens_with_retry_directive(self):
         """Without it the browser's EventSource uses its own default backoff."""
-        frames = await collect(PriceCache(), ticks=1)
+        frames = await collect_sse_frames(PriceCache(), ticks=1)
         assert frames[0] == "retry: 1000\n\n"
 
     async def test_emits_price_snapshot(self):
         cache = PriceCache()
         cache.update("AAPL", 190.0)
 
-        payloads = data_frames(await collect(cache, ticks=2))
+        payloads = sse_data_frames(await collect_sse_frames(cache, ticks=2))
         assert payloads[0]["AAPL"]["price"] == 190.0
         assert payloads[0]["AAPL"]["direction"] == "flat"
 
     async def test_empty_cache_emits_no_snapshot(self):
-        assert data_frames(await collect(PriceCache(), ticks=3)) == []
+        assert sse_data_frames(await collect_sse_frames(PriceCache(), ticks=3)) == []
 
     async def test_unchanged_cache_sends_nothing_new(self):
         """The version counter is what keeps a 15 s Massive poll from producing
@@ -81,7 +53,7 @@ class TestFrames:
         cache = PriceCache()
         cache.update("AAPL", 190.0)
 
-        assert len(data_frames(await collect(cache, ticks=10))) == 1
+        assert len(sse_data_frames(await collect_sse_frames(cache, ticks=10))) == 1
 
     async def test_price_change_produces_a_new_frame(self):
         cache = PriceCache()
@@ -91,7 +63,7 @@ class TestFrames:
             if call == 2:
                 cache.update("AAPL", 191.0)
 
-        payloads = data_frames(await collect(cache, ticks=5, on_tick=bump))
+        payloads = sse_data_frames(await collect_sse_frames(cache, ticks=5, on_tick=bump))
         assert len(payloads) == 2
         assert payloads[0]["AAPL"]["price"] == 190.0
         assert payloads[1]["AAPL"]["price"] == 191.0
@@ -101,7 +73,7 @@ class TestFrames:
         cache = PriceCache()
         cache.update("AAPL", 195.0, previous_close=190.0)
 
-        payload = data_frames(await collect(cache, ticks=2))[0]
+        payload = sse_data_frames(await collect_sse_frames(cache, ticks=2))[0]
         assert payload["AAPL"]["previous_close"] == 190.0
         assert payload["AAPL"]["day_change_percent"] == 2.6316
 
@@ -116,7 +88,7 @@ class TestNamedEvents:
             if call == 1:
                 log.append(MarketEvent("TSLA", -3.4, 241.5))
 
-        frames = await collect(cache, ticks=4, on_tick=shock, event_log=log)
+        frames = await collect_sse_frames(cache, ticks=4, on_tick=shock, event_log=log)
         shocks = [f for f in frames if f.startswith("event: shock")]
         assert len(shocks) == 1
 
@@ -129,7 +101,7 @@ class TestNamedEvents:
         log = EventLog()
         log.append(MarketEvent("AAPL", 2.0, 190.0))
 
-        frames = await collect(PriceCache(), ticks=3, event_log=log)
+        frames = await collect_sse_frames(PriceCache(), ticks=3, event_log=log)
         assert [f for f in frames if f.startswith("event: shock")] == []
 
     async def test_each_shock_is_sent_once(self):
@@ -139,7 +111,7 @@ class TestNamedEvents:
             if call == 1:
                 log.append(MarketEvent("TSLA", -3.4, 241.5))
 
-        frames = await collect(PriceCache(), ticks=8, on_tick=shock, event_log=log)
+        frames = await collect_sse_frames(PriceCache(), ticks=8, on_tick=shock, event_log=log)
         assert len([f for f in frames if f.startswith("event: shock")]) == 1
 
     async def test_status_emitted_once_until_it_changes(self):
@@ -149,7 +121,7 @@ class TestNamedEvents:
             if call == 3:
                 status["value"] = "open"
 
-        frames = await collect(
+        frames = await collect_sse_frames(
             PriceCache(), ticks=6, on_tick=flip, status_provider=lambda: status["value"]
         )
         statuses = [
@@ -159,7 +131,7 @@ class TestNamedEvents:
 
     async def test_no_status_event_without_a_provider(self):
         """The simulator has no market hours, so the frontend gets no status."""
-        frames = await collect(PriceCache(), ticks=3)
+        frames = await collect_sse_frames(PriceCache(), ticks=3)
         assert [f for f in frames if f.startswith("event: status")] == []
 
     async def test_a_failing_status_provider_does_not_abort_the_stream(self):
@@ -174,9 +146,9 @@ class TestNamedEvents:
         def boom():
             raise AttributeError("'SimulatorDataSource' object has no attribute 'market_status'")
 
-        frames = await collect(cache, ticks=4, status_provider=boom)
+        frames = await collect_sse_frames(cache, ticks=4, status_provider=boom)
 
-        assert data_frames(frames)[0]["AAPL"]["price"] == 190.0  # prices still flow
+        assert sse_data_frames(frames)[0]["AAPL"]["price"] == 190.0  # prices still flow
         assert [f for f in frames if f.startswith("event: status")] == []
 
 
@@ -184,7 +156,7 @@ class TestNamedEvents:
 class TestHeartbeat:
     async def test_heartbeat_when_idle(self):
         """Idle connections through a proxy get dropped without one."""
-        frames = await collect(PriceCache(), ticks=3, heartbeat=0.0)
+        frames = await collect_sse_frames(PriceCache(), ticks=3, heartbeat=0.0)
         assert [f for f in frames if f.startswith(": ")] == [": keep-alive\n\n"] * 3
 
     async def test_no_heartbeat_while_data_is_flowing(self):
@@ -193,11 +165,11 @@ class TestHeartbeat:
         def churn(call: int) -> None:
             cache.update("AAPL", 190.0 + call)
 
-        frames = await collect(cache, ticks=4, on_tick=churn, heartbeat=0.0)
+        frames = await collect_sse_frames(cache, ticks=4, on_tick=churn, heartbeat=0.0)
         assert [f for f in frames if f.startswith(": ")] == []
 
     async def test_heartbeat_suppressed_until_the_interval_elapses(self):
-        frames = await collect(PriceCache(), ticks=3, heartbeat=3600.0)
+        frames = await collect_sse_frames(PriceCache(), ticks=3, heartbeat=3600.0)
         assert [f for f in frames if f.startswith(": ")] == []
 
 
@@ -211,7 +183,7 @@ class TestCancellation:
         """
         cache = PriceCache()
         cache.update("AAPL", 190.0)
-        agen = _generate_events(cache, StubRequest(ticks=10), interval=0)
+        agen = _generate_events(cache, StubStreamRequest(ticks=10), interval=0)
 
         # Advance past the preamble to a yield inside the streaming loop —
         # cancellation lands wherever the generator is suspended, and only the
@@ -227,7 +199,7 @@ class TestCancellation:
     async def test_cancellation_is_logged(self, caplog):
         cache = PriceCache()
         cache.update("AAPL", 190.0)
-        agen = _generate_events(cache, StubRequest(ticks=10), interval=0)
+        agen = _generate_events(cache, StubStreamRequest(ticks=10), interval=0)
         await agen.asend(None)
         await agen.asend(None)
 
@@ -258,7 +230,7 @@ class TestRouterWiring:
     @pytest.mark.asyncio
     async def test_response_declares_sse_content_type_and_headers(self):
         route = create_stream_router(PriceCache()).routes[0]
-        response = await route.endpoint(StubRequest(0))
+        response = await route.endpoint(StubStreamRequest(0))
 
         assert response.media_type == "text/event-stream"
         assert response.headers["cache-control"] == "no-cache"

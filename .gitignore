@@ -214,3 +214,6 @@ db/*.db-wal
 db/*.db-shm
 backend/static/
 frontend/out/
+
+# mutation testing scratch worktree (test/mutate.py)
+.mutation-worktree/

@@ -232,7 +232,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `price` REAL
 - `executed_at` TEXT (ISO timestamp)
 
-**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution.
+**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution — **except while a held ticker has no cached price.** A snapshot row carries `total_value` and nothing else, so unlike `GET /api/portfolio` it cannot say "this omits a position"; written anyway it would be a drawdown the account never suffered, permanently on the chart, that later "recovers" when the price returns. A gap in the series is the honest alternative. Ordinary runs are unaffected: a position can only be opened for a ticker that had a price.
 - `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (default: `"default"`)
 - `total_value` REAL
@@ -261,18 +261,30 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 | GET | `/api/stream/prices` | SSE stream of live price updates |
 
 ### Portfolio
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/portfolio` | Current positions, cash balance, total value, unrealized P&L |
-| POST | `/api/portfolio/trade` | Execute a trade: `{ticker, quantity, side}` |
-| GET | `/api/portfolio/history` | Portfolio value snapshots over time (for P&L chart) |
+| Method | Path | Description | Codes |
+|--------|------|-------------|-------|
+| GET | `/api/portfolio` | Current positions, cash balance, total value, unrealized P&L | 200 |
+| POST | `/api/portfolio/trade` | Execute a trade: `{ticker, quantity, side}` | 201 · 400 rejected · 422 malformed · 503 no feed |
+| GET | `/api/portfolio/history` | Portfolio value snapshots over time (for P&L chart), oldest first; `?limit=` 1–5000, default 500 | 200 · 422 |
 
 ### Watchlist
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/watchlist` | Current watchlist tickers with latest prices |
-| POST | `/api/watchlist` | Add a ticker: `{ticker}` |
-| DELETE | `/api/watchlist/{ticker}` | Remove a ticker |
+| Method | Path | Description | Codes |
+|--------|------|-------------|-------|
+| GET | `/api/watchlist` | Current watchlist tickers with latest prices, in add order | 200 |
+| POST | `/api/watchlist` | Add a ticker: `{ticker}` | 201 · 409 duplicate · 422 · 503 no feed |
+| DELETE | `/api/watchlist/{ticker}` | Remove a ticker. Does not sell, and keeps a held ticker subscribed | 200 · 404 · 422 · 503 no feed |
+
+**400 versus 422.** 422 means the request was malformed — a quantity that is not
+a positive finite number, a ticker that is not a symbol, an unexpected field.
+400 means it was well formed and the account could not support it: no price yet,
+insufficient cash, selling more than is held. The frontend renders them
+differently, and the Checkpoint 4 chat handler has to tell them apart to
+report back usefully.
+
+**A trade never accepts a price from the client.** The fill price is read from
+the server-side cache; the request schema has no `price` field and forbids
+unexpected ones, so a request naming its own price is rejected rather than
+silently ignored.
 
 ### Chat
 | Method | Path | Description |
@@ -472,40 +484,73 @@ state. Agents pick up the lowest-numbered incomplete checkpoint.
 
 ### Definition of Done (applies to every checkpoint)
 
-Every checkpoint passes through three gates, **in order**. No gate may be skipped, and no checkpoint
-is marked ✅ until all three have passed. Work does not begin on checkpoint N+1 while N sits at an
+Every checkpoint passes through four gates, **in order**. No gate may be skipped, and no checkpoint
+is marked ✅ until all four have passed. Work does not begin on checkpoint N+1 while N sits at an
 unpassed gate.
 
-#### Gate 1 — Test
+**The order is the point, and it was learned the expensive way.** Checkpoints 1–3 ran review
+*after* full hardening, so every review finding and every simplification invalidated the mutation
+set, the fixtures and the live verification, and all of it was redone. Checkpoint 3 ran its
+mutation suite three times and its live smoke twice for that reason alone. Review is now cheap and
+early; the brittle, expensive verification runs **once**, against code nobody is going to change
+again.
 
-1. Every exit criterion listed for the checkpoint passes, verified by actually running the command —
-   not by reading the code and concluding it should work
-2. Unit tests covering the new code exist and pass (`uv run --extra dev pytest` for backend,
+#### Gate 1 — Build
+
+Fast, iterated freely. Nothing here is expensive, so run it as often as you like.
+
+1. Unit tests covering the new code exist and pass (`uv run --extra dev pytest` for backend,
    `npm test` for frontend)
-3. The **full** suite is green, not just the new tests — nothing from an earlier checkpoint regressed
-4. Linting is clean (`ruff check app/ tests/`; `npm run lint` and `tsc --noEmit` for frontend)
-5. Coverage has not dropped below the previous checkpoint's figure; record the new figure in the
-   status table
+2. The **full** suite is green, not just the new tests — nothing from an earlier checkpoint regressed
+3. Linting is clean (`ruff check app/ tests/`; `npm run lint` and `tsc --noEmit` for frontend)
+4. **Commit.** Green is a checkpoint you can return to; see the hard rules below
 
-Tests must be capable of failing for the right reason. A test that passes against a deliberately
-broken implementation is not coverage — see Checkpoint 1, where thirteen `MagicMock`-based tests
-passed against a client that could never populate the cache.
+Do **not** run mutation testing, the live smoke, or the three-consecutive-runs check here. They
+belong at Gate 3, after the code has stopped moving.
 
 #### Gate 2 — Review
 
-Only once Gate 1 is green, and before merge:
+Straight after Gate 1, while changes are still cheap to make.
 
-1. Run `/code-review high` over the branch diff. Every **CONFIRMED** correctness finding is fixed;
-   every **PLAUSIBLE** one is either fixed or answered in writing on the PR — silently ignoring one
-   is not an outcome
+1. Run `/code-review high` over the branch diff — **one agent.** Every **CONFIRMED** correctness
+   finding is fixed; every **PLAUSIBLE** one is either fixed or answered in writing on the PR —
+   silently ignoring one is not an outcome
 2. Run `/security-review` on any checkpoint handling untrusted input, money movement, or secrets.
-   Required for Checkpoints 3, 4, and 8; optional elsewhere
-3. Apply fixes, then **re-run Gate 1 in full**. Review fixes are code changes and break things like
-   any other
-4. Open a PR to `main`. `.github/workflows/claude-code-review.yml` reviews it automatically on open
-   and on every push. Unresolved review comments block merge
-5. Run `/simplify` on the diff before requesting merge, so the accumulated code stays legible to the
-   agents working on later checkpoints
+   Required for Checkpoints 4 and 8; optional elsewhere
+3. **Structure pass.** Ask one question: *can the next checkpoint call this without going through
+   HTTP?* Spawn a single agent for it only when the checkpoint adds new modules or a new layer;
+   otherwise do it inline. This is the pass that earns its keep — it is what found that Checkpoint
+   3's watchlist rules lived only inside FastAPI handlers, leaving Checkpoint 4 nothing to call
+4. Re-run **Gate 1** (seconds), not the whole hardening suite
+5. Commit the fixes
+
+`/simplify`'s four-agent fan-out is **retired.** Run at Checkpoint 3 it cost roughly 350k subagent
+tokens and returned the same finding three times over — the duplicated history limit, the
+duplicated "is held" predicate and the phantom `price_cache` argument each came back from multiple
+angles. One structure agent plus an inline read of the diff found everything that mattered at a
+fraction of the cost.
+
+#### Gate 3 — Verify
+
+Runs **once**, on code that is not going to change again. If a Gate 3 failure forces a code change,
+return to Gate 2 rather than patching forward.
+
+1. Every exit criterion listed for the checkpoint passes, verified by **actually running it** — not
+   by reading the code and concluding it should work. Keep the commands in a re-runnable smoke
+   script under `test/`, not hand-assembled at the terminal, so the second run costs nothing
+2. Full suite green three consecutive times, plus once under coverage — the coverage run is slower
+   and has already exposed one timing-dependent test that passed bare
+3. Coverage has not dropped below the previous checkpoint's figure; record it in the status table
+4. **Mutation testing, scoped to the invariants this checkpoint owns** — the money rules, the
+   atomicity, the domain-specific ones. Ten to fifteen well-chosen mutations, not forty: mutating
+   request schemas and route wiring mostly re-proves what ordinary tests already assert
+5. Commit
+
+Tests must be capable of failing for the right reason. A test that passes against a deliberately
+broken implementation is not coverage — see Checkpoint 1, where thirteen `MagicMock`-based tests
+passed against a client that could never populate the cache, and Checkpoints 2 and 3, where
+mutation testing exposed vacuous tests every single time. This is why the step survives being
+scoped down; it must not be skipped.
 
 What each checkpoint's review should weight most heavily:
 
@@ -522,7 +567,7 @@ What each checkpoint's review should weight most heavily:
 | 9 | Flaky-test sources — fixed sleeps, unpinned versions, order dependence |
 | 10 | Stale claims in docs; dead code and abandoned scaffolding |
 
-#### Gate 3 — Record
+#### Gate 4 — Record
 
 **This document is the project's record. It is updated as part of every checkpoint, never
 retroactively in a batch at the end.**
@@ -535,33 +580,53 @@ retroactively in a batch at the end.**
    any relevant `planning/` doc, so the spec describes the built system. An undocumented divergence
    is how `MARKET_DATA_SUMMARY.md` came to describe a subsystem with a blocking bug as "Complete,
    tested, reviewed"
-4. Branch name `checkpoint-N-<slug>`; merge to `main` only after Gates 1 and 2 have both passed
+4. Branch name `checkpoint-N-<slug>`; open the PR to `main` **with `--repo` and `--base` given
+   explicitly** — this repo is a fork, and a bare `gh pr create` targets the upstream parent.
+   `.github/workflows/claude-code-review.yml` reviews on open and on every push; unresolved
+   comments block merge
 
 Items 1–3 land in the same commit as the code, not a follow-up commit. A green checkpoint with a
-stale `PLAN.md` has not passed Gate 3.
+stale `PLAN.md` has not passed Gate 4.
 
 If an exit criterion or a gate cannot be met, do not mark the checkpoint done and move on. Set the
 row to ⛔, write a log entry describing how far it got and what blocked it, and raise it.
 
+#### Hard rules — each one is a mistake already made
+
+- **Never run `git checkout --`, `git restore` or `git reset --hard` against a dirty tree.** In
+  Checkpoint 3 that command was used to clear a stray file and silently discarded every uncommitted
+  review fix in `app/` — eight files, rewritten from scratch to recover. Commit first, always; the
+  Gate 1 and Gate 2 commits exist so there is something to fall back to
+- **Run mutation testing in a `git worktree`, never the working tree.** The harness restores files
+  in a `finally`, which a `SIGKILL` skips — that is how a mutant was left behind and provoked the
+  destructive command above. A throwaway worktree makes the whole class of accident impossible
+- **Give every mutation subprocess a timeout.** Removing `snapshot_task.cancel()` does not fail the
+  suite, it hangs it; a timeout is a detection, not an error
+- **Use absolute paths in shell commands.** The working directory resets between calls, and
+  `cd backend` from an unknown cwd failed repeatedly in Checkpoint 3
+- **Prefer inline work to spawning agents.** A cold agent re-derives context that is already loaded.
+  Spawn for genuinely independent judgement — the code review, the structure pass — not for work
+  that can be done directly
+
 ### Status
 
-| # | Checkpoint | Depends on | G1 Test | G2 Review | G3 Record | Coverage | Status |
-|---|---|---|---|---|---|---|---|
-| 1 | Market data hardening | — | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #4) |
-| 2 | Backend skeleton + database | 1 | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #5) |
-| 3 | Portfolio & watchlist API | 2 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
-| 4 | LLM chat integration | 3 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
-| 5 | Frontend scaffold + live prices | 2 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
-| 6 | Charts, portfolio visualisation, trade bar | 3, 5 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
-| 7 | Chat panel | 4, 6 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
-| 8 | Docker packaging + start/stop scripts | 7 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
-| 9 | End-to-end test suite | 8 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
-| 10 | Polish, docs, and release readiness | 9 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| # | Checkpoint | Depends on | G1 Build | G2 Review | G3 Verify | G4 Record | Coverage | Status |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Market data hardening | — | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #4) |
+| 2 | Backend skeleton + database | 1 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #5) |
+| 3 | Portfolio & watchlist API | 2 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #6) |
+| 4 | LLM chat integration | 3 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 5 | Frontend scaffold + live prices | 2 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 6 | Charts, portfolio visualisation, trade bar | 3, 5 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 7 | Chat panel | 4, 6 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 8 | Docker packaging + start/stop scripts | 7 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 9 | End-to-end test suite | 8 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 10 | Polish, docs, and release readiness | 9 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 
 Legend: ⬜ not started · 🔨 in progress · ✅ complete · ⛔ blocked
 
-A checkpoint's Status may only read ✅ when G1, G2, and G3 all read ✅. Coverage records the backend
-figure at Gate 1, and must not fall from one checkpoint to the next.
+A checkpoint's Status may only read ✅ when G1, G2, G3 and G4 all read ✅. Coverage records the backend
+figure at Gate 3, and must not fall from one checkpoint to the next.
 
 Checkpoints 5 and 2 unblock in parallel — frontend work can begin against the SSE endpoint as soon
 as the backend skeleton serves it, without waiting for the portfolio API.
@@ -795,7 +860,7 @@ covering every scenario listed in §12, running with `LLM_MOCK=true`.
 
 ### Checkpoint log
 
-Append-only. One entry per checkpoint, written at Gate 3, in the same commit as the code. Newest
+Append-only. One entry per checkpoint, written at Gate 4, in the same commit as the code. Newest
 last. An agent picking up this project should be able to read the log and know the true state of the
 build without running anything.
 
@@ -1043,3 +1108,174 @@ item must be resolved or restated in a later entry — it does not expire by bei
     must respect it, or it will leak a task past shutdown
   - Coverage is 100% on `app/` and that is a floor, not an achievement. Three of this
     checkpoint's tests passed against deliberately broken code before mutation testing exposed them
+
+#### Checkpoint 3 — Portfolio & watchlist API
+
+- **Closed:** 2026-08-10 · branch `checkpoint-3-portfolio-watchlist-api` · PR #6 · all three gates
+  passed
+- **Built:**
+  - `app/api/deps.py` — `get_price_cache` / `get_market_source`, the latter 503-ing once so no
+    handler repeats the check. Closes CP2's first carried-forward item
+  - `app/db/repository.py` — **new**: row access for all six §7 tables as connection-taking
+    functions, so a trade composes four of them inside one `transaction()`. `Position`, `Trade`,
+    `Snapshot`, `WatchlistEntry` dataclasses. `apply_position()` owns "quantity zero means no row"
+  - `app/db/database.py` — `read_transaction()` (`BEGIN DEFERRED`) for multi-statement reads
+  - `app/portfolio.py` — **new**: the single implementation of valuation and trade execution.
+    `execute_trade`, `get_portfolio`, `get_history`, `record_snapshot`, `TradeError`, and the
+    `PortfolioView` / `PositionView` / `TradeResult` shapes. CP4's chat handler calls these
+  - `app/watchlist.py` — **new**: the same treatment for the watchlist. `add`, `remove`,
+    `reconcile`, and a `WatchlistError` hierarchy. `reconcile()` is the sole enforcer of
+    "tracked = watchlist ∪ positions"
+  - `app/api/portfolio.py`, `app/api/watchlist.py`, `app/api/schemas.py` — the six §8 endpoints,
+    now thin: they translate HTTP to those two modules and hold no rules of their own
+  - `app/main.py` — the 30-second `portfolio_snapshots` task, cancelled *and awaited* at shutdown
+- **Exit criteria:** all five met. The last four were verified against a live `uvicorn` over HTTP,
+  not only in the suite
+  - *Unit tests cover the seven listed money cases* — all seven, in `tests/test_portfolio.py`, and
+    each one **mutation-verified** (see Tests below)
+  - *A ticker added via `POST /api/watchlist` appears in the SSE stream without a restart* — added
+    PYPL and SQ against a running server; both appear in the next `data:` frame at a real price.
+    Also asserted in-process against the real simulator and the real SSE generator
+  - *Removing a held ticker does not delete the position* — `DELETE /api/watchlist/AAPL` while
+    holding 5 returned `still_tracked: true`; the position kept its live mark, and after a restart
+    `/api/health` reported 12 tracked tickers for an 11-ticker watchlist
+  - *A trade writes a snapshot immediately* — the live history showed four points exactly 30 s
+    apart from the background task, then a fifth at the trade's timestamp
+  - *Every endpoint returns the documented shape and correct status codes* — every path exercised
+    live: 200/201/400/404/409/422/503. §8 now records the codes and the 400-versus-422 rule
+- **Tests:** 295 → **443** (+148). Three consecutive full runs green, three times over — at Gate 1,
+  after the review fixes, and after the simplify refactor. Coverage **100%** on `app/`, holding
+  CP1's and CP2's floor; `ruff check` and `ruff format --check` clean. Runtime 4.2 s, still no
+  network access
+
+  **36 mutations were run against the final code and all 36 were killed** — one per money rule
+  (drop the cash check, mean instead of weighted average, re-average on a sell, drop the oversell
+  check, zero the tolerance, round to the dollar, autocommit instead of `transaction()`), one per
+  review fix, and one per watchlist rule including all three failure modes `reconcile()` exists to
+  prevent. Two survived the first pass and both were real test gaps:
+  - The exact-balance buy test could not distinguish `>` from `>=`, because a `CASH_TOLERANCE` of
+    1e-9 made them equivalent at equality. Investigating it showed **the cash tolerance was dead
+    weight**: cash and cost are both `round(…, 2)`, so each is the nearest double to a whole number
+    of cents and the two compare exactly. It was deleted, and the asymmetry with
+    `QUANTITY_TOLERANCE` — which is load-bearing, because quantities are deliberately *not*
+    rounded — is now documented where the constant used to be
+  - "The trade and its snapshot read the same prices" passed against a version that re-read the
+    cache, because a static cache cannot tell one read from two. It now runs against a
+    `DriftingPriceCache` that moves on its second read
+
+  Two further things the mutation run surfaced. Removing `snapshot_task.cancel()` does not fail the
+  suite — it **hangs** it, because shutdown then awaits a task that never ends; the harness treats
+  a timeout as detection, since the unmutated code returns in seconds. And a shutdown assertion
+  read its baseline count *inside* the lifespan, so the loop could tick once more before shutdown
+  and the comparison would fail on a slow enough machine: green bare, red under coverage. Both the
+  ordering and the reason are now in the test.
+- **Review:** `/code-review high` returned **7 findings, all 7 fixed.**
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | 1 | Gate 3 not performed — the diff touched no documentation, and `backend/CLAUDE.md` still read "**Checkpoint 3 should add `app/api/deps.py`**" | **Fixed.** This entry, the status row, §7, §8, and a rewritten `backend/CLAUDE.md` wiring section |
+  | 2 | `monkeypatch.setattr("app.main.SNAPSHOT_INTERVAL_SECONDS", 0.01)` did nothing — `interval: float = SNAPSHOT_INTERVAL_SECONDS` binds at def time — so the lifespan test ran at the real 30 s and its shutdown assertion could not fail | **Fixed** at the root: `interval` is `None`-defaulted and resolved in the body. The test now asserts several points rather than one, and a new test pins the resolution itself |
+  | 3 | `get_portfolio()` read cash and positions in autocommit, so a trade committing between the two statements yields pre-trade cash beside a post-trade position — a total that never existed | **Fixed.** `read_transaction()` (`BEGIN DEFERRED`) added and used. Tested by running a real trade from *inside* the cash read |
+  | 4 | The DELETE handler's held-check and `remove_ticker()` are not atomic, so a buy landing between them strands a position with no price source, permanently | **Fixed.** `_unsubscribe()` re-reads after the eviction and re-subscribes. The window does not fully close, but a buy landing after the eviction has no price to fill against and is rejected |
+  | 5 | Snapshots persist a total that silently omits unpriced positions — a permanent phantom drawdown that later "recovers" | **Fixed.** `_record_snapshot` skips and logs instead; a gap is honest, a fabricated drawdown is not. §7 corrected to match |
+  | 6 | `POST /api/portfolio/trade` took no `get_market_source` dependency, so after a failed failover it kept filling against frozen prices while the watchlist endpoints returned 503 | **Fixed.** It now depends on the source it does not use, and says why |
+  | 7 | Rollback asymmetry: POST undoes its row if the source refuses, DELETE did not | **Fixed.** Both directions now compensate |
+
+  `/simplify` (reuse, simplification, altitude; the efficiency agent died on a session limit and
+  that angle was reviewed directly instead) found one structural problem and a list of smaller ones:
+
+  - **The watchlist had no callable path.** Its rules lived entirely inside FastAPI handlers that
+    signal by raising `HTTPException`, so CP4 — which must execute the LLM's `watchlist_changes`
+    "through the *same* validation path as Checkpoint 3" — had nothing to call. It would have had
+    to re-implement them, or catch a `409` that FastAPI would then apply to `POST /api/chat`,
+    aborting the whole reply instead of saying "AAPL was already watched". `app/watchlist.py` now
+    holds them, and the handlers are a 12-line error-code map
+  - **`reconcile()` replaced three pieces of incremental bookkeeping.** The tracked-set rule was
+    already written down once in `load_tracked_tickers()`, but after startup nothing recomputed it —
+    each mutation maintained it by hand, which is why the delete path had grown an unsubscribe, a
+    re-query and a re-subscribe. One idempotent diff against the source's set deleted all of that,
+    and closes the same race by re-reading after its removals
+  - One owner each for things that had grown three: the history limit (api, domain, repository),
+    `round(price * quantity, 2)` (buy, sell, and the receipt — which is *why* they must agree), and
+    the money/rate display precisions
+  - `TradeResult.position` was a second, narrower copy of a row already in `portfolio.positions`,
+    with its own rounding rule to keep in step. Dropped; `result.position()` derives it
+  - `get_history(price_cache)` deleted its own argument, which forced the endpoint to inject a
+    dependency it only forwarded into a `del`. The docstring carries the warning by itself
+  - `delete_position` was exported while `apply_position`'s docstring explained that callers must
+    never call it. Now `_delete_position`
+  - Test hygiene: `RecordingSource`, `snapshot_count`, `snapshot_values` and the SSE helpers moved
+    to `tests/conftest.py`; `test_stream.py`'s three aliased imports became one name each; and a
+    test filed under `TestGetMarketSource` that only exercised `get_price_cache` was rewritten, so
+    the per-request read that actually matters for failover is now covered
+
+  Skipped, with reasons: Pydantic response models for the five endpoints (they would create a
+  second definition of every shape beside the dataclass `to_dict`, which is the drift this codebase
+  keeps eliminating — worth revisiting at CP5 when the frontend wants typed responses); a staleness
+  bound on quotes instead of `require_live_market` (it needs a threshold derived from the poll
+  interval, 0.5 s on the simulator against 15 s on Massive, and guessing it would silently block
+  valid trades — recorded below instead); and `list_trades`, which stays with a docstring saying it
+  is CP6/CP7 scaffolding rather than becoming dead code nobody can date.
+
+  `/security-review` was **run and required** for this checkpoint. **No HIGH or MEDIUM findings.**
+  What it checked and cleared: every new query is parameterised, with no interpolation of user
+  input; `TradeRequest` has no `price` field and sets `extra="forbid"`, so a client cannot name its
+  own fill price; `user_id` is threaded through every layer but is not reachable from any request,
+  so the no-auth single-user model exposes no cross-tenant path; the `{ticker}` path parameter is
+  pattern-bound and reaches only SQL parameters and dict keys, never a filesystem path; the ticker
+  forbids `/`, `:` and `%` and reaches Massive as a query argument rather than a URL path, so there
+  is no host or protocol control; and `BEGIN IMMEDIATE` takes the write lock before reading cash,
+  so two concurrent buys cannot both spend the same balance. Unbounded watchlist growth is real but
+  is resource exhaustion, excluded from that review's scope — it is carried forward below instead.
+- **Diverged from plan:** three, all now reflected in the spec above
+  - **§7's "immediately after each trade execution" is now qualified.** No snapshot is written
+    while a held ticker is unpriced — review finding #5. The exit criterion still holds for every
+    ordinary run, since a position can only be opened for a ticker that had a price
+  - **§8 gained a status-code column and the 400-versus-422 rule.** The plan named the endpoints
+    but not what they answer, and "correct status codes" is an exit criterion that needed something
+    to be correct against
+  - **`POST /api/portfolio/trade` requires a running market source**, which §8 did not say. Filling
+    against prices frozen by a dead feed is worse than refusing
+  - No new environment variables. `SNAPSHOT_INTERVAL_SECONDS` is a module constant, not a §5
+    variable: nothing outside a test wants a different value, and tests pass their own interval
+- **Resolved from Checkpoint 2's carried-forward list**, so none of it expires by being ignored:
+  - `app/api/deps.py` — built, with `get_market_source` raising 503 in one place; `/api/health`
+    still reads `app.state` directly
+  - Watchlist handlers are `async def` with the SQLite work in `run_in_threadpool`; the portfolio
+    handlers are plain `def`, because they never await the source. The rule in `backend/CLAUDE.md`
+    has been rewritten to say which colour applies where, rather than "all handlers"
+  - `transaction()` has its first production caller: the trade path, writing `users_profile`,
+    `positions`, `trades` and `portfolio_snapshots` atomically. `BEGIN IMMEDIATE` also turns out to
+    be what stops two concurrent buys spending the same balance
+  - The 30-second `portfolio_snapshots` task is built and lives in the lifespan
+  - `app.state.shutting_down` is untouched by this checkpoint — the snapshot task installs no
+    source. It is cancelled *and awaited* before the source is stopped, so it cannot be mid-write
+    when the interpreter tears down
+- **Carried forward:**
+  - **The watchlist has no size limit.** Nothing stops `POST /api/watchlist` being called a
+    thousand times, and every entry joins every Massive poll thereafter. Out of scope for the
+    security review by its own rules, and not a product rule the plan states — but Checkpoint 4
+    hands this endpoint to an LLM that can call it in a loop, so **CP4 should add a cap**
+  - **A ticker stays subscribed after its position closes.** Selling out of a ticker that is not on
+    the watchlist leaves it tracked for the life of the process. Deliberate — the chart going flat
+    the instant you sell would be worse — but it means the tracked set only ever grows within a
+    session
+  - `list_trades()` is written and tested but has no production caller. The blotter has no endpoint
+    yet; §10's positions table does not need one, so it is there for CP6 or CP7 to surface
+  - The `_unsubscribe` race (review #4) is narrowed, not eliminated. Closing it properly needs the
+    source subscription and the database row under one lock, which the async/sync split prevents
+  - `read_transaction()` has one caller. Any future multi-statement read must use it — autocommit
+    across two queries is exactly the bug #3 was
+  - **A source that is alive but stalled is still undetected.** `require_live_market` catches the
+    feed being *gone*; it cannot catch a poller that is wedged while its object still exists, and
+    trades would fill against frozen prices. The fix is a staleness bound on `PriceUpdate.timestamp`
+    inside `_require_price`, which protects every caller including CP4's. It was not guessed at
+    here because the threshold has to come from the poll interval — 0.5 s on the simulator against
+    15 s or more on Massive — and too tight a bound silently blocks valid trades
+  - `watchlist.reconcile()` costs two `load_tracked_tickers()` reads per mutation, about 1 ms of
+    connection setup. Deliberate: the second read is what turns a buy-during-removal into an add,
+    and skipping it when no removals happened would trade the simplicity of an unconditional
+    invariant for 500 µs on a user's click
+  - Coverage is 100% on `app/` and remains a floor, not an achievement. Two of this checkpoint's
+    tests passed against deliberately broken code until mutation testing exposed them, which is
+    now the third checkpoint running where that has been true

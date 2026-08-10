@@ -19,34 +19,57 @@ re-read them per request, because failover replaces `market_source` mid-session.
 `market_source` is also `None` before startup, after shutdown, and after a
 failover that could not start a replacement.
 
-**Checkpoint 3 should add `app/api/deps.py`** with the two providers
-`MARKET_DATA_DESIGN.md` §13.1 specifies — `get_price_cache(request)` and
-`get_market_source(request)`, the latter raising `HTTPException(503)` on the
-`None` case — rather than each of its six handlers repeating that check. They
-also make `app.dependency_overrides` available for pointing trade tests at a
-stub cache. `/api/health` is the deliberate exception: reporting "no source" is
-its job, so it reads `app.state` directly.
+Handlers reach both through `app/api/deps.py` rather than `app.state`:
 
-### Handler colour: `async def`, with blocking work offloaded
+```python
+from app.api.deps import get_market_source, get_price_cache
 
-Database calls block and `source.add_ticker()` is a coroutine, so a watchlist
-handler needs both. Write handlers `async def` and push the SQLite work to a
-thread:
+price_cache: Annotated[PriceCache, Depends(get_price_cache)]
+source: Annotated[MarketDataSource, Depends(get_market_source)]
+```
+
+`get_market_source` raises `HTTPException(503)` when no source is running, once,
+so no handler repeats the check — and injecting them makes
+`app.dependency_overrides` available, which is how the API tests point handlers
+at a fixed cache instead of starting a simulator. `/api/health` is the
+deliberate exception: reporting "no source" is its job, so it reads `app.state`
+directly.
+
+**Depend on `get_market_source` even where the source is unused.** `POST
+/api/portfolio/trade` fills from the cache and never touches the source, but
+takes the dependency anyway: without it, a failover that could not start a
+replacement leaves every price frozen and the endpoint filling against them
+indefinitely, while the watchlist endpoints next door return 503.
+
+The lifespan also runs a background task writing a `portfolio_snapshots` row
+every `SNAPSHOT_INTERVAL_SECONDS` (30). It writes its first point immediately,
+so a fresh app has a P&L chart with a line on it, and it is cancelled *and
+awaited* at shutdown.
+
+### Handler colour: `async def` only when the source is awaited
+
+A `def` handler runs in a worker thread automatically, which is what the
+blocking SQLite calls want. Use it for anything that only touches the database
+and the cache — the three portfolio endpoints and `GET /api/watchlist`.
+
+The two watchlist mutations are the exception: they must write the row *and*
+`await source.add_ticker()`, which a `def` handler cannot do. Those are
+`async def` with the database work pushed to a thread:
 
 ```python
 from fastapi.concurrency import run_in_threadpool
 
-@router.post("/watchlist")
-async def add_to_watchlist(payload: WatchlistAdd, request: Request):
+@router.post("")
+async def create_watchlist_entry(payload: WatchlistAddRequest, source=Depends(get_market_source)):
     ticker = normalize_ticker(payload.ticker)
-    await run_in_threadpool(db.add_watchlist_entry, ticker)
-    await request.app.state.market_source.add_ticker(ticker)
+    entry = await run_in_threadpool(_insert_watchlist_row, ticker)
+    await source.add_ticker(ticker)
 ```
 
-A plain `def` handler would run in a worker thread automatically but cannot
-`await` the source, and mutating the watchlist without telling the source is
-what leaves a newly added ticker permanently unpriced
-(MARKET_DATA_DESIGN.md §13.4). Database write first, source second, one handler.
+Never split those two across handlers: a watchlist row whose ticker the source
+never heard of is a row that never gets a price (MARKET_DATA_DESIGN.md §13.4).
+Database write first, source second, one handler — and undo the row if the
+source refuses, which `app/api/watchlist.py` does in both directions.
 
 Static files are mounted at `/` **after** every router. `StaticFiles` at the
 root matches every path, so mounting it earlier would swallow `/api/*`.
@@ -54,20 +77,60 @@ root matches every path, so mounting it earlier would swallow `/api/*`.
 ## Database API
 
 ```python
-from app.db import connect, transaction, load_tracked_tickers, utc_now
+from app.db import connect, transaction, read_transaction, load_tracked_tickers, utc_now
 ```
 
 Import from `app.db` only, the same contract `app.market` keeps.
 
 - **`connect()`** — context manager yielding an initialised `sqlite3.Connection`
-  with `row_factory = sqlite3.Row`. Autocommit: each statement commits alone
+  with `row_factory = sqlite3.Row`. Autocommit: each statement commits alone.
+  Correct for a *single* query and wrong for several
 - **`transaction()`** — `connect()` wrapped in `BEGIN IMMEDIATE`. Use it for
   anything that must land atomically — a trade touches `positions`, `trades`,
-  `users_profile` and `portfolio_snapshots` and must not land partially
+  `users_profile` and `portfolio_snapshots` and must not land partially. Taking
+  the write lock up front is also what stops two concurrent buys both reading
+  the same cash balance
+- **`read_transaction()`** — `BEGIN DEFERRED`: one consistent snapshot across
+  several reads, without taking a write lock. Valuing the portfolio reads cash
+  and then positions, and in autocommit a trade committing between the two
+  yields pre-trade cash beside a post-trade position. **Any multi-statement
+  read goes through this**
 - **`load_tracked_tickers()`** — `union(watchlist, positions)`. Positions are in
   the union deliberately: a ticker removed from the watchlist while still held
   must keep being priced or the portfolio total silently loses it
 - **`utc_now()`** — the ISO-8601 string every `*_at` column stores
+
+### Repository and domain layers
+
+`app/db/repository.py` holds row-level access for the six tables. Every function
+takes an open connection as its first argument, which is what lets a trade
+compose four of them inside one `transaction()`. Nothing there validates.
+
+`app/portfolio.py` and `app/watchlist.py` are the **only** implementations of
+what a trade does, what the account is worth, and what the watchlist means.
+They take no `Request` and raise no `HTTPException`, so Checkpoint 4's chat
+handler calls them exactly as the routers do:
+
+```python
+from app.portfolio import TradeError, execute_trade
+from app.watchlist import WatchlistError, add, remove, reconcile
+```
+
+`execute_trade` raises `TradeError`; the watchlist functions raise
+`WatchlistError` subclasses. Catch those and report the message — never
+re-implement the rule. A trade the LLM asks for must be validated exactly like
+one the user typed.
+
+`app/portfolio.py`'s rounding policy — cash to cents via `_fill_value`,
+quantities and `avg_cost` never rounded, display rounding through `_money` and
+`_rate` — is documented at the top of that module. Do not re-decide it per call
+site.
+
+**The tracked set is `watchlist ∪ positions(quantity != 0)`, and
+`watchlist.reconcile(source)` is its only enforcer.** Call it after any change
+that could alter either side rather than adding or removing tickers by hand; it
+is idempotent, and it re-reads after its removals so a buy landing mid-flight
+cannot strand a holding with no price source.
 
 One connection per operation, opened and closed inside the helper — about
 500 µs each, most of it WAL sidecar setup, since no connection is held open.

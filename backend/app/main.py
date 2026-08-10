@@ -8,6 +8,7 @@ price stream, and the exported frontend as static files at the root.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -15,10 +16,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api import health_router
+from app.api import health_router, portfolio_router, watchlist_router
 from app.db import load_tracked_tickers
 from app.market import (
     EventLog,
@@ -28,6 +30,7 @@ from app.market import (
     start_market_data,
 )
 from app.paths import BACKEND_DIR, REPO_ROOT, is_source_checkout
+from app.portfolio import record_snapshot
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -42,6 +45,12 @@ logger = logging.getLogger(__name__)
 _STATIC_CANDIDATES = (BACKEND_DIR / "static",) + (
     (REPO_ROOT / "frontend" / "out",) if is_source_checkout() else ()
 )
+
+#: How often the P&L series gains a point (PLAN.md §7). Deliberately not an
+#: environment variable: nothing outside a test wants a different value, and
+#: tests either pass `_snapshot_loop` their own interval or patch this constant,
+#: which the lifespan reads at call time.
+SNAPSHOT_INTERVAL_SECONDS = 30.0
 
 
 def create_app() -> FastAPI:
@@ -62,9 +71,12 @@ def create_app() -> FastAPI:
     app.state.price_cache = price_cache
     app.state.event_log = event_log
     app.state.market_source = None
+    app.state.snapshot_task = None
     app.state.shutting_down = False
 
     app.include_router(health_router)
+    app.include_router(portfolio_router)
+    app.include_router(watchlist_router)
     app.include_router(
         create_stream_router(
             price_cache,
@@ -97,6 +109,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     source.on_permanent_failure = _make_failover_handler(app)
     app.state.market_source = source
 
+    snapshot_task = asyncio.create_task(
+        _snapshot_loop(app, SNAPSHOT_INTERVAL_SECONDS), name="portfolio-snapshots"
+    )
+    app.state.snapshot_task = snapshot_task
+
     try:
         yield
     finally:
@@ -104,10 +121,48 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # replacement, so shutdown has one source to stop and cannot leave a
         # freshly started simulator ticking behind it.
         app.state.shutting_down = True
+
+        snapshot_task.cancel()
+        # Awaited, not just cancelled: the task may be mid-write inside
+        # run_in_threadpool, and returning from the lifespan before it unwinds
+        # would let the interpreter tear down under an open transaction.
+        await asyncio.gather(snapshot_task, return_exceptions=True)
+        app.state.snapshot_task = None
+
         current = app.state.market_source
         app.state.market_source = None
         if current is not None:
             await current.stop()
+
+
+async def _snapshot_loop(app: FastAPI, interval: float) -> None:
+    """Append a `portfolio_snapshots` row every `interval` seconds (PLAN.md §7).
+
+    The first point is written straight away rather than one interval later, so
+    a freshly started app draws a P&L chart with a line on it instead of thirty
+    seconds of blank axes. Trades write their own point as part of the trade
+    transaction, so the series has resolution where it matters regardless of
+    where the tick happens to fall.
+
+    The write is blocking SQLite, so it goes to a thread — this task shares an
+    event loop with the simulator tick and every open SSE stream.
+
+    One failure costs one point, not the series: the loop logs and carries on.
+    Only cancellation ends it, and `CancelledError` is a `BaseException`, so it
+    passes through the handler below untouched.
+
+    `interval` is required rather than defaulted from the module constant: a
+    default argument binds at def time, so patching `SNAPSHOT_INTERVAL_SECONDS`
+    would not reach it, and a test that patched it would silently run at the
+    real 30 seconds and assert nothing in its 50 ms window. The lifespan names
+    the constant instead, which reads it at call time.
+    """
+    while True:
+        try:
+            await run_in_threadpool(record_snapshot, app.state.price_cache)
+        except Exception:
+            logger.exception("Portfolio snapshot failed; the series will resume next tick")
+        await asyncio.sleep(interval)
 
 
 def _current_market_status(app: FastAPI) -> str | None:
