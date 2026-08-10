@@ -271,8 +271,13 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 | Method | Path | Description | Codes |
 |--------|------|-------------|-------|
 | GET | `/api/watchlist` | Current watchlist tickers with latest prices, in add order | 200 |
-| POST | `/api/watchlist` | Add a ticker: `{ticker}` | 201 · 409 duplicate · 422 · 503 no feed |
+| POST | `/api/watchlist` | Add a ticker: `{ticker}` | 201 · 400 list full · 409 duplicate · 422 · 503 no feed |
 | DELETE | `/api/watchlist/{ticker}` | Remove a ticker. Does not sell, and keeps a held ticker subscribed | 200 · 404 · 422 · 503 no feed |
+
+**The watchlist holds at most 50 tickers.** Every entry joins every Massive
+poll for the life of the process, and Checkpoint 4 hands this endpoint to an
+LLM that can call it in a loop. A duplicate is still reported as a duplicate
+when the list is full, because re-adding a watched ticker adds nothing to poll.
 
 **400 versus 422.** 422 means the request was malformed — a quantity that is not
 a positive finite number, a ticker that is not a symbol, an unexpected field.
@@ -287,9 +292,23 @@ unexpected ones, so a request naming its own price is rejected rather than
 silently ignored.
 
 ### Chat
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/chat` | Send a message, receive complete JSON response (message + executed actions) |
+| Method | Path | Description | Codes |
+|--------|------|-------------|-------|
+| POST | `/api/chat` | Send a message: `{message}`. Returns the reply, the actions it executed, and the resulting portfolio | 200 · 422 malformed · 503 no feed or no provider |
+| GET | `/api/chat/history` | Stored transcript, oldest first; `?limit=` 1–500, default 50 | 200 · 422 |
+
+**A bad *answer* is not an error.** A model that returns unparseable output
+produces a 200 whose `message` says the turn went wrong, and an action the
+model asked for that fails validation comes back inside `actions` with
+`ok: false` and the reason. Only two things are 503: no market data source, and
+a provider that could not be reached at all. The distinction is the difference
+between "try that again" and "try saying it differently".
+
+**`POST /api/chat` requires a running market source**, exactly as
+`POST /api/portfolio/trade` does and for the same reason: the turn can execute
+trades, and with a dead feed every price is frozen at its last value. A chat
+that kept filling against them would be a way around the refusal the trade bar
+gives.
 
 ### System
 | Method | Path | Description |
@@ -336,6 +355,29 @@ The LLM is instructed to respond with JSON matching this schema:
 - `message` (required): The conversational text shown to the user
 - `trades` (optional): Array of trades to auto-execute. Each trade goes through the same validation as manual trades (sufficient cash for buys, sufficient shares for sells)
 - `watchlist_changes` (optional): Array of watchlist modifications
+
+At most **10 trades and 10 watchlist changes** are honoured per reply. The model
+is told both limits in the system prompt, and anything beyond them is reported
+back to the user rather than silently dropped — the chat path executes without
+a confirmation dialog, so nothing else stands between a looping model and the
+ledger.
+
+**Cerebras rejects `pattern` in a structured-output schema**, answering
+`Invalid fields for schema with types ['string']`. OpenRouter's
+`provider.order` is a *preference*, not a pin, so it silently served those
+requests from another host instead: every call succeeded and nothing looked
+wrong, but no run was on the provider this section requires. The schema sent
+over the wire therefore has that keyword stripped, while the Pydantic model
+keeps it and still validates every action — the provider was never the
+authority on what a ticker is. Fallbacks stay enabled so a Cerebras outage
+costs latency rather than the assistant, and the backend logs a warning
+whenever something other than Cerebras served a request.
+
+**The reply is parsed action by action, not as one document.** A single
+malformed trade must not discard the model's message and its nine good actions
+along with it; each bad item becomes a reported rejection instead. This is
+salvage, never trust — every surviving action is validated again by
+`app.portfolio` and `app.watchlist`.
 
 ### Auto-Execution
 
@@ -615,7 +657,7 @@ row to ⛔, write a log entry describing how far it got and what blocked it, and
 | 1 | Market data hardening | — | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #4) |
 | 2 | Backend skeleton + database | 1 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #5) |
 | 3 | Portfolio & watchlist API | 2 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #6) |
-| 4 | LLM chat integration | 3 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 4 | LLM chat integration | 3 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #7) |
 | 5 | Frontend scaffold + live prices | 2 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 6 | Charts, portfolio visualisation, trade bar | 3, 5 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 7 | Chat panel | 4, 6 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
@@ -1279,3 +1321,159 @@ item must be resolved or restated in a later entry — it does not expire by bei
   - Coverage is 100% on `app/` and remains a floor, not an achievement. Two of this checkpoint's
     tests passed against deliberately broken code until mutation testing exposed them, which is
     now the third checkpoint running where that has been true
+
+#### Checkpoint 4 — LLM chat integration
+
+- **Closed:** 2026-08-10 · branch `checkpoint-4-llm-chat` · PR #7 · all four gates passed. First
+  checkpoint run under the reworked gate order, and it paid for itself: review landed before the
+  expensive verification, so the ten review fixes cost one mutation run rather than three
+- **Built:**
+  - `app/llm/` — **new package**, the contract with the model
+    - `schema.py` — `AssistantReply` (the wire schema), `LLMTrade` / `LLMWatchlistChange`, and
+      `parse_reply`, which validates **action by action** rather than as one document. Also
+      `wire_schema()`, which strips the keywords Cerebras rejects
+    - `prompt.py` — `SYSTEM_PROMPT` per §9, `render_context`, `build_messages`. Rules and account
+      data are `system` messages; anything a user or the model wrote is `user`/`assistant`
+    - `client.py` — LiteLLM → OpenRouter → Cerebras, `LLMUnavailableError`, `is_mock_enabled`,
+      and `_log_provider`
+    - `mock.py` — the deterministic `LLM_MOCK=true` stand-in, returning **raw JSON** so mock runs
+      exercise the real parser
+  - `app/chat.py` — **new**: `handle_message`, `get_transcript`, `ChatReply`, `ActionResult`. The
+    turn's orchestration and persistence. It executes nothing itself
+  - `app/api/chat.py`, `ChatRequest` — `POST /api/chat` and `GET /api/chat/history`
+  - `app/config.py` — **new**: `load_env()`, delivering §5's promise that the backend reads `.env`
+  - `app/db/repository.py` — `ChatMessage`, `insert_chat_message`, `list_chat_messages`,
+    `count_watchlist`
+  - `app/watchlist.py` — `MAX_WATCHLIST_SIZE` (50) and `WatchlistFullError`, resolving Checkpoint
+    3's first carried-forward item
+  - `app/market/models.py` — `TICKER_PATTERN` moved here from `app/api/schemas.py`
+- **Exit criteria:** all five met, the last four verified over HTTP against a live `uvicorn` via
+  `test/smoke.sh`, and the fifth against OpenRouter for real
+  - *A `LLM_MOCK=true` request returns a schema-valid response and a mocked trade moves cash and
+    positions* — `POST /api/chat {"message":"buy 2 MSFT"}` returned `ok: true` and the balance fell;
+    asserted in the smoke script and in `TestMockMode`, which runs the production `complete()`
+  - *A malformed or non-JSON response is graceful, never a 500* — every shape in the parametrised
+    set (`""`, `not json`, `[1,2,3]`, no `message`, `message: null`) returns 200 with
+    `MALFORMED_REPLY_MESSAGE`
+  - *A trade that fails validation returns its error rather than vanishing* — `buy 100000 AAPL`
+    over HTTP: 200, `ok: false`, "Insufficient cash…", cash unmoved
+  - *Messages and actions persist and are replayed as history* — both turns written in one
+    transaction, `actions` JSON on the assistant row, and the next call's prompt carries them back
+  - *One live call succeeds, confirming model id, provider routing and structured-output handling*
+    — **this is the criterion that found the checkpoint's worst defect.** See below
+- **Tests:** 443 → **692** (+249). Coverage **100%** on `app/`, holding the floor from Checkpoints
+  1–3. `ruff check` and `ruff format --check` clean. Runtime 8.1 s, still no network access in the
+  suite
+
+  **37 mutations run, all 37 killed** — the 19 inherited from Checkpoint 3 plus 18 written for the
+  invariants this checkpoint owns: the model naming its own fill price, an infinite order size, the
+  per-reply cap, a refused action being swallowed, the action ordering, ticker normalisation, the
+  turn being persisted when the provider never answered, the context block arriving as a `user`
+  message, `LLM_MOCK` falling through to a live call, the provider's error text reaching the user,
+  and both halves of the watchlist cap.
+
+  One survived the first pass and was a genuinely vacuous test, the **third checkpoint running**
+  where that has been true. "The compensating restore is not refused by the cap" filled the
+  watchlist, made the source refuse, and asserted the row came back — but `remove()` deletes before
+  it restores, so the restore only ever returned the list *to* the cap and never past it. The check
+  it was written to guard was never reached. It now has something else take the freed slot first,
+  which is the window the review actually described.
+- **Review:** `/code-review high` returned **11 findings — 10 fixed, 1 was Gate 4 work.**
+
+  | # | Finding | Disposition |
+  |---|---|---|
+  | 1 | Watchlist changes ran before trades, so a `remove` in the same reply evicted the price a `buy` of that ticker needed and the trade was refused. The comment justified the order with "removing a ticker does not untrack a holding", which only covers a ticker already held | **Fixed.** Adds, then trades, then removes — subscribing creates a price and unsubscribing destroys one, so trades sit between them |
+  | 2 | Un-normalised tickers reached `ActionResult` and `chat_messages.actions`. The add branch reported `entry.ticker` and the remove branch the raw string, so one request could report two spellings of one symbol — the field CP7 matches rows by | **Fixed.** Normalised once per action, in both loops |
+  | 3 | The mock read "buy 3 shares" as a trade in `SHARES` | **Fixed.** The stop-list now applies to trades as well as watchlist verbs |
+  | 4 | "watch for a dip" added `FOR` to the watchlist — and the simulator invents a price for any symbol, so the junk row really did stream | **Fixed** by the same change; the stop-list gained the prepositions |
+  | 5 | History replay dropped `actions`, so a refused buy left "I've bought 10 AAPL" in the transcript and the model read its own claim back as fact | **Fixed.** An assistant turn replays with what actually executed appended |
+  | 6 | `remove()`'s compensating restore could itself raise `WatchlistFullError` if a concurrent add refilled the list, replacing the real error and leaving the row deleted | **Fixed.** The restore bypasses the cap: putting back a row that was already there cannot be what pushed the list over |
+  | 7 | `_load_context` reads the portfolio outside its `read_transaction`, so the comment claiming one snapshot overclaimed | **Comment corrected**, behaviour left. Folding it in would mean exporting `app.portfolio`'s private valuation so a block of advisory prose could be atomic; the cost is two rendered prices differing by one tick, and nothing is computed from the pair |
+  | 8 | `_finish` persists after the trades commit, so a failed write returned a 500 for a request that had already moved cash — where the client's obvious retry buys twice | **Fixed.** Logged and swallowed; the reply is returned regardless |
+  | 9 | Comment/code mismatch: the over-cap branch appended one rejection per item, not one for the remainder | **Fixed** in favour of the comment — one line, so twenty identical sentences cannot bury the turn's other failures |
+  | 10 | `load_env()` runs at import and `monkeypatch` cannot undo an import-time mutation, so a developer's `.env` tuning variables leaked into the suite | **Fixed.** `tests/conftest.py` clears every application variable, listed exhaustively |
+  | 11 | `PLAN.md` and `backend/CLAUDE.md` untouched by the code commit | **This entry and the docs below.** Gate 4 under the reworked process is a separate gate, but the reviewer is right that Checkpoint 3 raised the identical finding |
+
+  `/security-review` was **run and required** for this checkpoint. **No HIGH or MEDIUM findings.**
+  What it checked and cleared: the model cannot name its own fill price (`LLMTrade` has no `price`
+  field and forbids extras, so a request carrying one is a rejected action); `user_id` is not
+  reachable from any request, since `ChatRequest` and both action models forbid extras; every new
+  query is parameterised, including the `limit`; `TICKER_PATTERN` still forbids `/`, `:` and `%`,
+  so a model-supplied ticker reaches SQL parameters and dict keys but never a path or a host; the
+  provider's error text — which quotes the failing request back — is confined to the server log and
+  never reaches the response or `chat_messages`, asserted by planting a key-shaped string in the
+  exception; and `json.loads` is the only deserialisation. Prompt injection via user text and
+  resource exhaustion are excluded by that review's own rules; the substantive mitigation for the
+  former is that the model moves money only by returning an action that is then re-validated, and
+  the caps added here cover the latter.
+
+  The structure pass was done **inline**, not by a spawned agent: the review above had just covered
+  the same diff at length, and a cold agent would have re-derived it for the third time. Its one
+  finding is already in the build list — `app/llm/schema.py` imported `TICKER_PATTERN` from
+  `app.api.schemas`, an upward dependency from the LLM contract to the transport layer that happened
+  to define it first. It moved to `app/market/models.py`, beside `normalize_ticker`. With that done
+  nothing outside `app/api/` imports `app.api`, and `app.chat.handle_message` / `get_transcript`
+  take no `Request` and raise no `HTTPException`, so Checkpoint 7 can drive the whole turn without
+  HTTP.
+- **Diverged from plan:** four, all now reflected in the spec above
+  - **`GET /api/chat/history` is new**, and §8 did not list it. Checkpoint 7's "history survives a
+    page reload" needs it, the data was already being written, and the alternative was
+    `get_transcript()` sitting as undated scaffolding — the thing `list_trades` is already doing
+  - **`POST /api/chat` requires a running market source**, which §8 did not say, for the reason
+    `POST /api/portfolio/trade` does
+  - **The wire schema is not `AssistantReply` verbatim** — the `pattern` keyword is stripped,
+    because Cerebras rejects it. §9 now records this
+  - **The watchlist is capped at 50.** Not in the plan at all; it is Checkpoint 3's carried-forward
+    item, and §8 now states it
+  - No new environment variables. `LLM_MOCK` and `OPENROUTER_API_KEY` were already in §5 — what
+    changed is that `.env` is now actually read
+- **The live call was worth the whole checkpoint.** Everything passed — 683 tests, the smoke script,
+  a real trade filled end to end — while every request was being served by **CoreWeave**, not
+  Cerebras. `provider.order` is a preference, not a pin, and Cerebras had been refusing the request
+  outright with `Invalid fields for schema with types ['string']: {'pattern'}`: `Field(pattern=...)`
+  puts `pattern` into the generated JSON schema, and Cerebras' structured-output implementation does
+  not accept it. Nothing failed, so nothing was visible. It surfaced only because the live check
+  printed which provider had answered.
+
+  Fixed by deriving the wire schema with that keyword removed. After the fix: `provider='Cerebras'`,
+  **0.43 s** for a full turn, against several seconds before — and the model, given the same
+  context block, started reporting the cash balance correctly instead of claiming it could not see
+  one. Per the gate rules this Gate 3 failure returned to Gate 2 rather than being patched forward.
+  `test_the_wire_schema_avoids_what_cerebras_rejects` and `_log_provider` exist so the next such
+  drift is loud.
+- **Resolved from Checkpoint 3's carried-forward list:**
+  - **The watchlist size cap is built** — `MAX_WATCHLIST_SIZE = 50`, enforced inside the insert's
+    transaction so a duplicate on a full list still reports as a duplicate
+  - `list_trades()` still has no production caller. Restated below rather than resolved
+  - The `_unsubscribe` race, `read_transaction()`'s single caller and the stalled-source gap are
+    unchanged by this checkpoint and are restated below
+- **Carried forward:**
+  - **One unreproducible test failure.** A single full-suite run failed once — `1 failed, 691
+    passed` — and could not be reproduced in **63 subsequent runs**: bare, under coverage, under
+    tenfold CPU load, and repeating the exact smoke-then-suite sequence that produced it. Its
+    identity is lost because the run was piped through `tail -1`. Every fixed-sleep test in the
+    suite is inherited from Checkpoints 1–3 (`test_main.py`, `test_simulator_source.py`,
+    `test_massive.py`); Checkpoint 4 added no timing-dependent test. **Checkpoint 9 owns
+    flaky-test sources by its review focus and must resolve this**; until then, capture full pytest
+    output when verifying, because that is the only reason this one cannot be named
+  - **A stalled-but-alive market source is still undetected**, unchanged from Checkpoint 3 and now
+    reachable through one more path: `require_live_market` and `get_market_source` catch a feed that
+    is *gone*, not a poller wedged while its object lives, and the chat would fill against frozen
+    prices exactly as the trade endpoint would. The fix remains a staleness bound on
+    `PriceUpdate.timestamp` inside `_require_price`, and the threshold still has to come from the
+    poll interval — 0.5 s on the simulator against 15 s on Massive
+  - **A ticker stays subscribed after its position closes**, unchanged. The chat can now reach this
+    too, so a long conversation only ever grows the tracked set within a session
+  - **The mock's stop-list is a heuristic, not a parser.** "buy 3 widgets" will still trade
+    `WIDGETS`. It is bounded to `LLM_MOCK=true`, so it costs Checkpoint 9 a carefully worded fixture
+    rather than anything in production
+  - `list_trades()` is still written, tested and uncalled. Checkpoint 6 or 7 surfaces it, or
+    Checkpoint 10 deletes it — it is now one checkpoint older than the note that said so
+  - The `_unsubscribe` race narrowed at Checkpoint 3 is unchanged, and `read_transaction()` now has
+    two callers rather than one
+  - **`app/llm/prompt.py` renders the model's context as prose, and nothing tests what the model
+    *does* with it.** The system prompt is asserted to contain its rules; whether the model obeys
+    them is only ever established by a live call, and there is exactly one of those
+  - Coverage is 100% on `app/` and is still a floor, not an achievement. One of this checkpoint's
+    tests passed against deliberately broken code until mutation testing exposed it — four
+    checkpoints, four times
