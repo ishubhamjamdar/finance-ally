@@ -17,6 +17,7 @@ from .client import (
     MAX_OUTPUT_TOKENS,
     MODEL,
     REQUEST_TIMEOUT_SECONDS,
+    RESPONSE_FORMAT,
     LLMUnavailableError,
     complete,
     is_mock_enabled,
@@ -32,6 +33,7 @@ from .schema import (
     ParsedReply,
     RejectedAction,
     parse_reply,
+    wire_schema,
 )
 
 __all__ = [
@@ -41,6 +43,7 @@ __all__ = [
     "MAX_WATCHLIST_CHANGES_PER_REPLY",
     "MODEL",
     "REQUEST_TIMEOUT_SECONDS",
+    "RESPONSE_FORMAT",
     "SYSTEM_PROMPT",
     "AssistantReply",
     "LLMTrade",
@@ -54,4 +57,5 @@ __all__ = [
     "is_mock_enabled",
     "parse_reply",
     "render_context",
+    "wire_schema",
 ]

@@ -108,6 +108,46 @@ class AssistantReply(BaseModel):
     )
 
 
+#: JSON Schema keywords Cerebras' structured-output implementation rejects.
+#:
+#: Found by running it, which is the only way it could have been found. With
+#: `pattern` present, Cerebras answers
+#:
+#:     Invalid fields for schema with types ['string']: {'pattern'}
+#:
+#: and OpenRouter — whose `provider.order` is a *preference*, not a pin, unless
+#: `allow_fallbacks` is false — quietly served the request from CoreWeave
+#: instead. Every call still succeeded, so nothing looked wrong; the run was
+#: simply not on the provider PLAN.md §9 requires, at none of the speed that
+#: choice was made for. `test_the_wire_schema_avoids_what_cerebras_rejects`
+#: fails if this drifts again, because the next silent fallback would be just
+#: as invisible.
+#:
+#: Dropping the keyword costs nothing. It constrains the *model's* output, and
+#: the model is not the authority: `LLMTrade` still carries `pattern` and still
+#: validates every action, so a ticker the regex rejects is a rejected action
+#: whether the provider enforced it or not.
+_UNSUPPORTED_SCHEMA_KEYWORDS = frozenset({"pattern"})
+
+
+def wire_schema() -> dict:
+    """`AssistantReply`'s schema in the form the provider will accept.
+
+    Derived from the model rather than written out a second time, so the schema
+    the model is given cannot drift from the one the parser enforces.
+    """
+    return _without(AssistantReply.model_json_schema(), _UNSUPPORTED_SCHEMA_KEYWORDS)
+
+
+def _without(node: object, keywords: frozenset[str]) -> object:
+    """Recursively drop `keywords` from a JSON Schema document."""
+    if isinstance(node, dict):
+        return {k: _without(v, keywords) for k, v in node.items() if k not in keywords}
+    if isinstance(node, list):
+        return [_without(v, keywords) for v in node]
+    return node
+
+
 @dataclass(frozen=True, slots=True)
 class RejectedAction:
     """An action that never reached the domain layer, and why.

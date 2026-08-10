@@ -17,8 +17,8 @@ from app.llm.client import (
     MAX_OUTPUT_TOKENS,
     REASONING_EFFORT,
     REQUEST_TIMEOUT_SECONDS,
+    RESPONSE_FORMAT,
 )
-from app.llm.schema import AssistantReply
 
 MESSAGES = [{"role": "user", "content": "hello"}]
 
@@ -118,7 +118,7 @@ class TestConfiguration:
         (kwargs,) = recorded_call
         assert kwargs["model"] == MODEL == "openrouter/openai/gpt-oss-120b"
         assert kwargs["extra_body"] == EXTRA_BODY == {"provider": {"order": ["cerebras"]}}
-        assert kwargs["response_format"] is AssistantReply
+        assert kwargs["response_format"] is RESPONSE_FORMAT
         assert kwargs["reasoning_effort"] == REASONING_EFFORT
         assert kwargs["messages"] == MESSAGES
 
@@ -204,3 +204,38 @@ class TestFailure:
         )
 
         assert complete(MESSAGES) == "  {not json}  "
+
+
+class TestProviderRouting:
+    """PLAN.md §9 requires Cerebras. `provider.order` alone does not enforce it,
+    so the one thing this layer can do is say when it did not happen."""
+
+    def test_a_fallback_provider_is_logged(self, recorded_call, monkeypatch, caplog):
+        served = StubResponse(json.dumps({"message": "ok"}))
+        served.provider = "CoreWeave"
+        monkeypatch.setattr("app.llm.client.completion", lambda **kwargs: served)
+
+        with caplog.at_level("WARNING"):
+            complete(MESSAGES)
+
+        assert "CoreWeave" in caplog.text
+        assert "not Cerebras" in caplog.text
+
+    def test_cerebras_is_not_worth_a_warning(self, recorded_call, monkeypatch, caplog):
+        served = StubResponse(json.dumps({"message": "ok"}))
+        served.provider = "Cerebras"
+        monkeypatch.setattr("app.llm.client.completion", lambda **kwargs: served)
+
+        with caplog.at_level("WARNING"):
+            complete(MESSAGES)
+
+        assert "not Cerebras" not in caplog.text
+
+    def test_a_response_without_a_provider_field_is_not_a_warning(self, recorded_call):
+        """LiteLLM does not promise the attribute; its absence is not a fault."""
+        complete(MESSAGES)  # the fixture's response has no `provider`
+
+    def test_the_request_still_asks_for_cerebras_first(self, recorded_call):
+        complete(MESSAGES)
+
+        assert recorded_call[0]["extra_body"]["provider"]["order"] == ["cerebras"]

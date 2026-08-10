@@ -19,7 +19,9 @@ from app.llm import (
     AssistantReply,
     MalformedReplyError,
     parse_reply,
+    wire_schema,
 )
+from app.llm.schema import _UNSUPPORTED_SCHEMA_KEYWORDS
 
 
 def reply(**payload) -> str:
@@ -300,3 +302,57 @@ class TestWireSchema:
         assert parsed.trades[0].quantity == 1.5
         assert parsed.watchlist_changes[0].ticker == "PYPL"
         assert parsed.rejected == []
+
+
+class TestWireSchemaCompatibility:
+    """The schema is sent to Cerebras, which refuses some JSON Schema keywords.
+
+    OpenRouter's `provider.order` is a preference, not a pin, so a refusal does
+    not fail — it silently reroutes to another host. Every call still succeeds,
+    which is why this was invisible until a live run reported
+    `provider='CoreWeave'`. These tests are the standing guard, because the next
+    such drift would be just as quiet.
+    """
+
+    def keywords(self, node) -> set:
+        if isinstance(node, dict):
+            return set(node) | {k for v in node.values() for k in self.keywords(v)}
+        if isinstance(node, list):
+            return {k for v in node for k in self.keywords(v)}
+        return set()
+
+    def test_the_wire_schema_avoids_what_cerebras_rejects(self):
+        """With `pattern` present Cerebras answers "Invalid fields for schema
+        with types ['string']" and the request lands on a fallback provider at
+        none of the speed PLAN.md §9 chose Cerebras for."""
+        assert self.keywords(wire_schema()) & _UNSUPPORTED_SCHEMA_KEYWORDS == set()
+
+    def test_the_model_still_declares_the_pattern(self):
+        """Only the *wire* copy drops it. The provider was never the authority
+        on what a ticker is — `LLMTrade` is, and it still rejects one."""
+        assert "pattern" in self.keywords(AssistantReply.model_json_schema())
+
+    def test_dropping_the_keyword_does_not_weaken_validation(self):
+        """The point of the whole arrangement: a ticker the regex rejects is
+        still a rejected action, whether or not the provider enforced it."""
+        parsed = parse_reply(
+            reply(message="?", trades=[{"ticker": "NOT A TICKER", "side": "buy", "quantity": 1}])
+        )
+
+        assert parsed.trades == []
+        assert parsed.rejected
+
+    def test_the_wire_schema_keeps_the_parts_the_provider_needs(self):
+        schema = wire_schema()
+
+        assert set(schema["required"]) == {"message", "trades", "watchlist_changes"}
+        assert schema["additionalProperties"] is False
+        # $defs/$ref survive: Cerebras accepts them, and inlining by hand would
+        # be a second definition of the action shapes.
+        assert "$defs" in schema
+
+    def test_it_is_derived_from_the_model_not_written_out_again(self):
+        """A hand-maintained copy would drift from what the parser enforces."""
+        assert wire_schema()["properties"].keys() == (
+            AssistantReply.model_json_schema()["properties"].keys()
+        )

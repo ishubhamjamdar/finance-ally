@@ -18,15 +18,31 @@ import os
 from litellm import completion
 
 from app.llm.mock import mock_completion
-from app.llm.schema import AssistantReply
+from app.llm.schema import wire_schema
 
 logger = logging.getLogger(__name__)
 
 #: PLAN.md §9 fixes all three: the model, the provider routing, and structured
-#: outputs. `order: [cerebras]` is what pins inference to Cerebras rather than
-#: whichever OpenRouter host is cheapest this minute.
+#: outputs.
+#:
+#: `order: [cerebras]` is a *preference*, not a pin — OpenRouter falls back to
+#: another host whenever Cerebras refuses a request, and only
+#: `allow_fallbacks: false` would stop it. Fallbacks are left on deliberately:
+#: a Cerebras outage should degrade the assistant's latency, not remove it.
+#: What must not happen is falling back for a reason we control, which is
+#: exactly what `RESPONSE_FORMAT` below fixes and `_log_provider` reports.
 MODEL = "openrouter/openai/gpt-oss-120b"
 EXTRA_BODY = {"provider": {"order": ["cerebras"]}}
+
+#: The structured-output request, built from `AssistantReply` with the keywords
+#: Cerebras rejects removed — see `app.llm.schema.wire_schema`. Passed as a
+#: dict rather than the Pydantic class because LiteLLM derives the class's
+#: schema verbatim, `pattern` included, which is what silently pushed every
+#: request onto a fallback provider.
+RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {"name": "assistant_reply", "strict": True, "schema": wire_schema()},
+}
 
 #: Cerebras answers in low single-digit seconds, which is why §9 chose a single
 #: complete response over token streaming. The timeout is generous against that
@@ -88,7 +104,7 @@ def complete(messages: list[dict[str, str]]) -> str:
         response = completion(
             model=MODEL,
             messages=messages,
-            response_format=AssistantReply,
+            response_format=RESPONSE_FORMAT,
             reasoning_effort=REASONING_EFFORT,
             extra_body=EXTRA_BODY,
             timeout=REQUEST_TIMEOUT_SECONDS,
@@ -105,7 +121,26 @@ def complete(messages: list[dict[str, str]]) -> str:
             f"Could not reach the AI assistant ({type(exc).__name__}). Please try again."
         ) from exc
 
+    _log_provider(response)
     return _content(response)
+
+
+def _log_provider(response: object) -> None:
+    """Record which provider actually served the request.
+
+    `provider.order` is a preference, not a pin: OpenRouter falls back silently
+    when the named provider refuses a request, and a refusal for a schema the
+    model never sees is invisible from the outside — every call succeeds, just
+    not where §9 says it should. One log line makes the next such drift
+    something an operator can notice.
+    """
+    served_by = getattr(response, "provider", None)
+    if served_by and served_by.lower() != "cerebras":
+        logger.warning(
+            "LLM request served by %s, not Cerebras — check the request schema "
+            "against that provider's structured-output support",
+            served_by,
+        )
 
 
 def _content(response: object) -> str:

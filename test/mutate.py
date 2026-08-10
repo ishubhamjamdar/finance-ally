@@ -46,6 +46,8 @@ VENV_PYTHON = REPO / "backend" / ".venv" / "bin" / "python"
 
 PORTFOLIO = "tests/test_portfolio.py tests/api/test_portfolio_api.py"
 WATCHLIST = "tests/test_watchlist.py tests/api/test_watchlist_api.py"
+CHAT = "tests/test_chat.py tests/api/test_chat_api.py"
+LLM = "tests/llm tests/test_chat.py tests/api/test_chat_api.py"
 
 #: (name, file relative to backend/, snippet to replace, replacement, tests)
 MUTATIONS: list[tuple[str, str, str, str, str]] = [
@@ -105,6 +107,73 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
      "    for ticker in sorted(wanted - set(source.get_tickers())):", WATCHLIST),
     ("lifespan: never cancel the snapshot task", "app/main.py",
      "        snapshot_task.cancel()", "        pass", "tests/test_main.py"),
+
+    # --- Checkpoint 4: the model is a client, not an authority ----------
+    # The invariant this checkpoint owns is that nothing the model returns
+    # reaches the ledger unvalidated, and that nothing it does is hidden.
+    ("parse: accept an action the schema rejects", "app/llm/schema.py",
+     "            valid.append(model.model_validate(item))",
+     "            valid.append(model.model_construct(**item))", LLM),
+    ("parse: let a model name its own fill price", "app/llm/schema.py",
+     '    model_config = ConfigDict(extra="forbid")\n\n'
+     "    ticker: Annotated[str, Field(pattern=TICKER_PATTERN)]\n"
+     '    side: Literal["buy", "sell"]',
+     '    model_config = ConfigDict(extra="allow")\n\n'
+     "    ticker: Annotated[str, Field(pattern=TICKER_PATTERN)]\n"
+     '    side: Literal["buy", "sell"]', LLM),
+    ("parse: admit an infinite order size", "app/llm/schema.py",
+     "    quantity: Annotated[float, Field(gt=0, allow_inf_nan=False)]",
+     "    quantity: Annotated[float, Field(gt=0)]", LLM),
+    ("parse: drop the per-reply action cap", "app/llm/schema.py",
+     "        if len(valid) >= cap:", "        if False:", LLM),
+    ("parse: treat a reply with no message as usable", "app/llm/schema.py",
+     "    if not isinstance(message, str) or not message.strip():",
+     "    if False:", LLM),
+    ("chat: swallow a refused trade instead of reporting it", "app/chat.py",
+     "            logger.info(\"Chat trade refused (%s): %s\", summary, exc)",
+     "            logger.info(\"Chat trade refused (%s): %s\", summary, exc)\n            continue",
+     CHAT),
+    ("chat: swallow a refused watchlist change", "app/chat.py",
+     "            logger.info(\"Chat watchlist change refused (%s): %s\", summary, exc)",
+     "            logger.info(\"Chat watchlist change refused (%s): %s\", summary, exc)\n            continue",
+     CHAT),
+    ("chat: raise on a malformed reply instead of answering", "app/chat.py",
+     "        logger.warning(\"Discarding an unusable model reply: %s\", exc)",
+     "        raise", CHAT),
+    ("chat: run removes before trades, killing the price a trade needs", "app/chat.py",
+     "    actions = await _apply_watchlist_changes(source, adds, user_id)\n"
+     "    actions += await _apply_trades(price_cache, parsed.trades, user_id)\n"
+     "    actions += await _apply_watchlist_changes(source, removes, user_id)",
+     "    actions = await _apply_watchlist_changes(source, adds + removes, user_id)\n"
+     "    actions += await _apply_trades(price_cache, parsed.trades, user_id)", CHAT),
+    ("chat: report the model's raw ticker rather than the normalised one", "app/chat.py",
+     "        ticker = normalize_ticker(trade.ticker)", "        ticker = trade.ticker", CHAT),
+    ("chat: persist the turn before the actions are known", "app/chat.py",
+     "        insert_chat_message(conn, \"user\", user_text, None, user_id)",
+     "        insert_chat_message(conn, \"user\", user_text, None, user_id)\n        actions = []",
+     CHAT),
+    ("chat: persist a failed turn the provider never answered", "app/chat.py",
+     "    raw = await run_in_threadpool(complete, messages)",
+     "    try:\n        raw = await run_in_threadpool(complete, messages)\n"
+     "    except Exception:\n        await _finish(text, 'failed', [], price_cache, user_id)\n        raise",
+     CHAT),
+    ("prompt: replay an assistant turn without what executed", "app/llm/prompt.py",
+     "    if message.role != \"assistant\" or not message.actions:",
+     "    if True:", LLM),
+    ("prompt: put the portfolio context in a user message", "app/llm/prompt.py",
+     '        {"role": "system", "content": render_context(portfolio, watchlist)},',
+     '        {"role": "user", "content": render_context(portfolio, watchlist)},', LLM),
+    ("client: fall back to a live call when LLM_MOCK is set", "app/llm/client.py",
+     "    if is_mock_enabled():\n        return mock_completion(messages)", "    pass", LLM),
+    ("client: forward the provider's error text to the user", "app/llm/client.py",
+     '            f"Could not reach the AI assistant ({type(exc).__name__}). Please try again."',
+     '            f"Could not reach the AI assistant ({exc}). Please try again."', LLM),
+    ("watchlist: drop the size cap", "app/watchlist.py",
+     "        if enforce_cap and count_watchlist(conn, user_id) > MAX_WATCHLIST_SIZE:",
+     "        if False:", WATCHLIST),
+    ("watchlist: enforce the cap on a compensating restore", "app/watchlist.py",
+     "        await run_in_threadpool(_insert_row, ticker, user_id, enforce_cap=False)",
+     "        await run_in_threadpool(_insert_row, ticker, user_id)", WATCHLIST),
 ]
 
 
