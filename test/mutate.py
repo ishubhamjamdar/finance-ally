@@ -40,6 +40,10 @@ WORKTREE = REPO / ".mutation-worktree"
 #: finishes, and the unmutated suite returns in seconds.
 TIMEOUT_SECONDS = 120
 
+#: The project venv, not `sys.executable`. This script runs under whatever
+#: python invoked it — the system one, via the shebang — which has no pytest.
+VENV_PYTHON = REPO / "backend" / ".venv" / "bin" / "python"
+
 PORTFOLIO = "tests/test_portfolio.py tests/api/test_portfolio_api.py"
 WATCHLIST = "tests/test_watchlist.py tests/api/test_watchlist_api.py"
 
@@ -115,11 +119,11 @@ def build_worktree() -> pathlib.Path:
     return WORKTREE / "backend"
 
 
-def suite_passes(backend: pathlib.Path, tests: str) -> bool:
+def suite_passes(backend: pathlib.Path, tests: str, python: pathlib.Path) -> bool:
     """True if the suite passed — i.e. the mutation went unnoticed."""
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", "-x", "-q", "--no-header",
+            [str(python), "-m", "pytest", "-x", "-q", "--no-header",
              "-p", "no:cacheprovider", *tests.split()],
             cwd=backend, capture_output=True, text=True, timeout=TIMEOUT_SECONDS,
         )
@@ -144,13 +148,13 @@ def main() -> int:
         return 1
 
     backend = build_worktree()
-    # The worktree needs the venv; reuse the main one rather than syncing again.
-    venv = REPO / "backend" / ".venv"
-    if venv.exists() and not (backend / ".venv").exists():
-        (backend / ".venv").symlink_to(venv)
+    python = VENV_PYTHON if VENV_PYTHON.exists() else pathlib.Path(sys.executable)
+    if not VENV_PYTHON.exists():
+        print("No backend/.venv — run `uv sync --extra dev` in backend/ first.")
+        return 1
 
     print(f"Baseline: the unmutated suite must pass in {backend}")
-    if not suite_passes(backend, "tests/"):
+    if not suite_passes(backend, "tests/", python):
         print("  FAILED — the suite is red before any mutation. Fix that first.")
         return 1
     print("  ok\n")
@@ -165,7 +169,7 @@ def main() -> int:
             continue
         path.write_text(original.replace(old, new))
         try:
-            unnoticed = suite_passes(backend, tests)
+            unnoticed = suite_passes(backend, tests, python)
         finally:
             path.write_text(original)
         print(f"{'SURVIVED ' if unnoticed else 'killed   '} {name}", flush=True)
