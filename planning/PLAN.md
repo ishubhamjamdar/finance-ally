@@ -484,40 +484,73 @@ state. Agents pick up the lowest-numbered incomplete checkpoint.
 
 ### Definition of Done (applies to every checkpoint)
 
-Every checkpoint passes through three gates, **in order**. No gate may be skipped, and no checkpoint
-is marked ✅ until all three have passed. Work does not begin on checkpoint N+1 while N sits at an
+Every checkpoint passes through four gates, **in order**. No gate may be skipped, and no checkpoint
+is marked ✅ until all four have passed. Work does not begin on checkpoint N+1 while N sits at an
 unpassed gate.
 
-#### Gate 1 — Test
+**The order is the point, and it was learned the expensive way.** Checkpoints 1–3 ran review
+*after* full hardening, so every review finding and every simplification invalidated the mutation
+set, the fixtures and the live verification, and all of it was redone. Checkpoint 3 ran its
+mutation suite three times and its live smoke twice for that reason alone. Review is now cheap and
+early; the brittle, expensive verification runs **once**, against code nobody is going to change
+again.
 
-1. Every exit criterion listed for the checkpoint passes, verified by actually running the command —
-   not by reading the code and concluding it should work
-2. Unit tests covering the new code exist and pass (`uv run --extra dev pytest` for backend,
+#### Gate 1 — Build
+
+Fast, iterated freely. Nothing here is expensive, so run it as often as you like.
+
+1. Unit tests covering the new code exist and pass (`uv run --extra dev pytest` for backend,
    `npm test` for frontend)
-3. The **full** suite is green, not just the new tests — nothing from an earlier checkpoint regressed
-4. Linting is clean (`ruff check app/ tests/`; `npm run lint` and `tsc --noEmit` for frontend)
-5. Coverage has not dropped below the previous checkpoint's figure; record the new figure in the
-   status table
+2. The **full** suite is green, not just the new tests — nothing from an earlier checkpoint regressed
+3. Linting is clean (`ruff check app/ tests/`; `npm run lint` and `tsc --noEmit` for frontend)
+4. **Commit.** Green is a checkpoint you can return to; see the hard rules below
 
-Tests must be capable of failing for the right reason. A test that passes against a deliberately
-broken implementation is not coverage — see Checkpoint 1, where thirteen `MagicMock`-based tests
-passed against a client that could never populate the cache.
+Do **not** run mutation testing, the live smoke, or the three-consecutive-runs check here. They
+belong at Gate 3, after the code has stopped moving.
 
 #### Gate 2 — Review
 
-Only once Gate 1 is green, and before merge:
+Straight after Gate 1, while changes are still cheap to make.
 
-1. Run `/code-review high` over the branch diff. Every **CONFIRMED** correctness finding is fixed;
-   every **PLAUSIBLE** one is either fixed or answered in writing on the PR — silently ignoring one
-   is not an outcome
+1. Run `/code-review high` over the branch diff — **one agent.** Every **CONFIRMED** correctness
+   finding is fixed; every **PLAUSIBLE** one is either fixed or answered in writing on the PR —
+   silently ignoring one is not an outcome
 2. Run `/security-review` on any checkpoint handling untrusted input, money movement, or secrets.
-   Required for Checkpoints 3, 4, and 8; optional elsewhere
-3. Apply fixes, then **re-run Gate 1 in full**. Review fixes are code changes and break things like
-   any other
-4. Open a PR to `main`. `.github/workflows/claude-code-review.yml` reviews it automatically on open
-   and on every push. Unresolved review comments block merge
-5. Run `/simplify` on the diff before requesting merge, so the accumulated code stays legible to the
-   agents working on later checkpoints
+   Required for Checkpoints 4 and 8; optional elsewhere
+3. **Structure pass.** Ask one question: *can the next checkpoint call this without going through
+   HTTP?* Spawn a single agent for it only when the checkpoint adds new modules or a new layer;
+   otherwise do it inline. This is the pass that earns its keep — it is what found that Checkpoint
+   3's watchlist rules lived only inside FastAPI handlers, leaving Checkpoint 4 nothing to call
+4. Re-run **Gate 1** (seconds), not the whole hardening suite
+5. Commit the fixes
+
+`/simplify`'s four-agent fan-out is **retired.** Run at Checkpoint 3 it cost roughly 350k subagent
+tokens and returned the same finding three times over — the duplicated history limit, the
+duplicated "is held" predicate and the phantom `price_cache` argument each came back from multiple
+angles. One structure agent plus an inline read of the diff found everything that mattered at a
+fraction of the cost.
+
+#### Gate 3 — Verify
+
+Runs **once**, on code that is not going to change again. If a Gate 3 failure forces a code change,
+return to Gate 2 rather than patching forward.
+
+1. Every exit criterion listed for the checkpoint passes, verified by **actually running it** — not
+   by reading the code and concluding it should work. Keep the commands in a re-runnable smoke
+   script under `test/`, not hand-assembled at the terminal, so the second run costs nothing
+2. Full suite green three consecutive times, plus once under coverage — the coverage run is slower
+   and has already exposed one timing-dependent test that passed bare
+3. Coverage has not dropped below the previous checkpoint's figure; record it in the status table
+4. **Mutation testing, scoped to the invariants this checkpoint owns** — the money rules, the
+   atomicity, the domain-specific ones. Ten to fifteen well-chosen mutations, not forty: mutating
+   request schemas and route wiring mostly re-proves what ordinary tests already assert
+5. Commit
+
+Tests must be capable of failing for the right reason. A test that passes against a deliberately
+broken implementation is not coverage — see Checkpoint 1, where thirteen `MagicMock`-based tests
+passed against a client that could never populate the cache, and Checkpoints 2 and 3, where
+mutation testing exposed vacuous tests every single time. This is why the step survives being
+scoped down; it must not be skipped.
 
 What each checkpoint's review should weight most heavily:
 
@@ -534,7 +567,7 @@ What each checkpoint's review should weight most heavily:
 | 9 | Flaky-test sources — fixed sleeps, unpinned versions, order dependence |
 | 10 | Stale claims in docs; dead code and abandoned scaffolding |
 
-#### Gate 3 — Record
+#### Gate 4 — Record
 
 **This document is the project's record. It is updated as part of every checkpoint, never
 retroactively in a batch at the end.**
@@ -547,33 +580,53 @@ retroactively in a batch at the end.**
    any relevant `planning/` doc, so the spec describes the built system. An undocumented divergence
    is how `MARKET_DATA_SUMMARY.md` came to describe a subsystem with a blocking bug as "Complete,
    tested, reviewed"
-4. Branch name `checkpoint-N-<slug>`; merge to `main` only after Gates 1 and 2 have both passed
+4. Branch name `checkpoint-N-<slug>`; open the PR to `main` **with `--repo` and `--base` given
+   explicitly** — this repo is a fork, and a bare `gh pr create` targets the upstream parent.
+   `.github/workflows/claude-code-review.yml` reviews on open and on every push; unresolved
+   comments block merge
 
 Items 1–3 land in the same commit as the code, not a follow-up commit. A green checkpoint with a
-stale `PLAN.md` has not passed Gate 3.
+stale `PLAN.md` has not passed Gate 4.
 
 If an exit criterion or a gate cannot be met, do not mark the checkpoint done and move on. Set the
 row to ⛔, write a log entry describing how far it got and what blocked it, and raise it.
 
+#### Hard rules — each one is a mistake already made
+
+- **Never run `git checkout --`, `git restore` or `git reset --hard` against a dirty tree.** In
+  Checkpoint 3 that command was used to clear a stray file and silently discarded every uncommitted
+  review fix in `app/` — eight files, rewritten from scratch to recover. Commit first, always; the
+  Gate 1 and Gate 2 commits exist so there is something to fall back to
+- **Run mutation testing in a `git worktree`, never the working tree.** The harness restores files
+  in a `finally`, which a `SIGKILL` skips — that is how a mutant was left behind and provoked the
+  destructive command above. A throwaway worktree makes the whole class of accident impossible
+- **Give every mutation subprocess a timeout.** Removing `snapshot_task.cancel()` does not fail the
+  suite, it hangs it; a timeout is a detection, not an error
+- **Use absolute paths in shell commands.** The working directory resets between calls, and
+  `cd backend` from an unknown cwd failed repeatedly in Checkpoint 3
+- **Prefer inline work to spawning agents.** A cold agent re-derives context that is already loaded.
+  Spawn for genuinely independent judgement — the code review, the structure pass — not for work
+  that can be done directly
+
 ### Status
 
-| # | Checkpoint | Depends on | G1 Test | G2 Review | G3 Record | Coverage | Status |
-|---|---|---|---|---|---|---|---|
-| 1 | Market data hardening | — | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #4) |
-| 2 | Backend skeleton + database | 1 | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #5) |
-| 3 | Portfolio & watchlist API | 2 | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #6) |
-| 4 | LLM chat integration | 3 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
-| 5 | Frontend scaffold + live prices | 2 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
-| 6 | Charts, portfolio visualisation, trade bar | 3, 5 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
-| 7 | Chat panel | 4, 6 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
-| 8 | Docker packaging + start/stop scripts | 7 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
-| 9 | End-to-end test suite | 8 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
-| 10 | Polish, docs, and release readiness | 9 | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| # | Checkpoint | Depends on | G1 Build | G2 Review | G3 Verify | G4 Record | Coverage | Status |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Market data hardening | — | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #4) |
+| 2 | Backend skeleton + database | 1 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #5) |
+| 3 | Portfolio & watchlist API | 2 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #6) |
+| 4 | LLM chat integration | 3 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 5 | Frontend scaffold + live prices | 2 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 6 | Charts, portfolio visualisation, trade bar | 3, 5 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 7 | Chat panel | 4, 6 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 8 | Docker packaging + start/stop scripts | 7 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 9 | End-to-end test suite | 8 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 10 | Polish, docs, and release readiness | 9 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 
 Legend: ⬜ not started · 🔨 in progress · ✅ complete · ⛔ blocked
 
-A checkpoint's Status may only read ✅ when G1, G2, and G3 all read ✅. Coverage records the backend
-figure at Gate 1, and must not fall from one checkpoint to the next.
+A checkpoint's Status may only read ✅ when G1, G2, G3 and G4 all read ✅. Coverage records the backend
+figure at Gate 3, and must not fall from one checkpoint to the next.
 
 Checkpoints 5 and 2 unblock in parallel — frontend work can begin against the SSE endpoint as soon
 as the backend skeleton serves it, without waiting for the portfolio API.
@@ -807,7 +860,7 @@ covering every scenario listed in §12, running with `LLM_MOCK=true`.
 
 ### Checkpoint log
 
-Append-only. One entry per checkpoint, written at Gate 3, in the same commit as the code. Newest
+Append-only. One entry per checkpoint, written at Gate 4, in the same commit as the code. Newest
 last. An agent picking up this project should be able to read the log and know the true state of the
 build without running anything.
 
