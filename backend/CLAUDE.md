@@ -106,12 +106,31 @@ Import from `app.db` only, the same contract `app.market` keeps.
 takes an open connection as its first argument, which is what lets a trade
 compose four of them inside one `transaction()`. Nothing there validates.
 
-`app/portfolio.py` is the **only** implementation of what a trade does and what
-the account is worth. Checkpoint 4's chat handler must call `execute_trade()`,
-not reimplement it, so a trade the LLM asks for is validated exactly like one
-the user typed. Its rounding policy — cash to cents, quantities and `avg_cost`
-never rounded — is documented at the top of that module; do not re-decide it
-per call site.
+`app/portfolio.py` and `app/watchlist.py` are the **only** implementations of
+what a trade does, what the account is worth, and what the watchlist means.
+They take no `Request` and raise no `HTTPException`, so Checkpoint 4's chat
+handler calls them exactly as the routers do:
+
+```python
+from app.portfolio import TradeError, execute_trade
+from app.watchlist import WatchlistError, add, remove, reconcile
+```
+
+`execute_trade` raises `TradeError`; the watchlist functions raise
+`WatchlistError` subclasses. Catch those and report the message — never
+re-implement the rule. A trade the LLM asks for must be validated exactly like
+one the user typed.
+
+`app/portfolio.py`'s rounding policy — cash to cents via `_fill_value`,
+quantities and `avg_cost` never rounded, display rounding through `_money` and
+`_rate` — is documented at the top of that module. Do not re-decide it per call
+site.
+
+**The tracked set is `watchlist ∪ positions(quantity != 0)`, and
+`watchlist.reconcile(source)` is its only enforcer.** Call it after any change
+that could alter either side rather than adding or removing tickers by hand; it
+is idempotent, and it re-reads after its removals so a buy landing mid-flight
+cannot strand a holding with no price source.
 
 One connection per operation, opened and closed inside the helper — about
 500 µs each, most of it WAL sidecar setup, since no connection is held open.

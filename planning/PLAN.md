@@ -1070,7 +1070,11 @@ item must be resolved or restated in a later entry — it does not expire by bei
   - `app/portfolio.py` — **new**: the single implementation of valuation and trade execution.
     `execute_trade`, `get_portfolio`, `get_history`, `record_snapshot`, `TradeError`, and the
     `PortfolioView` / `PositionView` / `TradeResult` shapes. CP4's chat handler calls these
-  - `app/api/portfolio.py`, `app/api/watchlist.py`, `app/api/schemas.py` — the six §8 endpoints
+  - `app/watchlist.py` — **new**: the same treatment for the watchlist. `add`, `remove`,
+    `reconcile`, and a `WatchlistError` hierarchy. `reconcile()` is the sole enforcer of
+    "tracked = watchlist ∪ positions"
+  - `app/api/portfolio.py`, `app/api/watchlist.py`, `app/api/schemas.py` — the six §8 endpoints,
+    now thin: they translate HTTP to those two modules and hold no rules of their own
   - `app/main.py` — the 30-second `portfolio_snapshots` task, cancelled *and awaited* at shutdown
 - **Exit criteria:** all five met. The last four were verified against a live `uvicorn` over HTTP,
   not only in the suite
@@ -1086,14 +1090,16 @@ item must be resolved or restated in a later entry — it does not expire by bei
     apart from the background task, then a fifth at the trade's timestamp
   - *Every endpoint returns the documented shape and correct status codes* — every path exercised
     live: 200/201/400/404/409/422/503. §8 now records the codes and the 400-versus-422 rule
-- **Tests:** 295 → **429** (+134). Three consecutive full runs green, twice — once at Gate 1 and
-  again after the review fixes. Coverage **100%** on `app/`, holding CP1's and CP2's floor; `ruff
-  check` and `ruff format --check` clean. Runtime 4.2 s, still no network access
+- **Tests:** 295 → **443** (+148). Three consecutive full runs green, three times over — at Gate 1,
+  after the review fixes, and after the simplify refactor. Coverage **100%** on `app/`, holding
+  CP1's and CP2's floor; `ruff check` and `ruff format --check` clean. Runtime 4.2 s, still no
+  network access
 
-  **32 mutations were run against the new code and all 32 were killed** — including one per money
-  rule (drop the cash check, mean instead of weighted average, re-average on a sell, drop the
-  oversell check, zero the tolerance, autocommit instead of `transaction()`) and one per review
-  fix. Two survived the first pass and both were real test gaps:
+  **36 mutations were run against the final code and all 36 were killed** — one per money rule
+  (drop the cash check, mean instead of weighted average, re-average on a sell, drop the oversell
+  check, zero the tolerance, round to the dollar, autocommit instead of `transaction()`), one per
+  review fix, and one per watchlist rule including all three failure modes `reconcile()` exists to
+  prevent. Two survived the first pass and both were real test gaps:
   - The exact-balance buy test could not distinguish `>` from `>=`, because a `CASH_TOLERANCE` of
     1e-9 made them equivalent at equality. Investigating it showed **the cash tolerance was dead
     weight**: cash and cost are both `round(…, 2)`, so each is the nearest double to a whole number
@@ -1103,6 +1109,13 @@ item must be resolved or restated in a later entry — it does not expire by bei
   - "The trade and its snapshot read the same prices" passed against a version that re-read the
     cache, because a static cache cannot tell one read from two. It now runs against a
     `DriftingPriceCache` that moves on its second read
+
+  Two further things the mutation run surfaced. Removing `snapshot_task.cancel()` does not fail the
+  suite — it **hangs** it, because shutdown then awaits a task that never ends; the harness treats
+  a timeout as detection, since the unmutated code returns in seconds. And a shutdown assertion
+  read its baseline count *inside* the lifespan, so the loop could tick once more before shutdown
+  and the comparison would fail on a slow enough machine: green bare, red under coverage. Both the
+  ordering and the reason are now in the test.
 - **Review:** `/code-review high` returned **7 findings, all 7 fixed.**
 
   | # | Finding | Disposition |
@@ -1114,6 +1127,42 @@ item must be resolved or restated in a later entry — it does not expire by bei
   | 5 | Snapshots persist a total that silently omits unpriced positions — a permanent phantom drawdown that later "recovers" | **Fixed.** `_record_snapshot` skips and logs instead; a gap is honest, a fabricated drawdown is not. §7 corrected to match |
   | 6 | `POST /api/portfolio/trade` took no `get_market_source` dependency, so after a failed failover it kept filling against frozen prices while the watchlist endpoints returned 503 | **Fixed.** It now depends on the source it does not use, and says why |
   | 7 | Rollback asymmetry: POST undoes its row if the source refuses, DELETE did not | **Fixed.** Both directions now compensate |
+
+  `/simplify` (reuse, simplification, altitude; the efficiency agent died on a session limit and
+  that angle was reviewed directly instead) found one structural problem and a list of smaller ones:
+
+  - **The watchlist had no callable path.** Its rules lived entirely inside FastAPI handlers that
+    signal by raising `HTTPException`, so CP4 — which must execute the LLM's `watchlist_changes`
+    "through the *same* validation path as Checkpoint 3" — had nothing to call. It would have had
+    to re-implement them, or catch a `409` that FastAPI would then apply to `POST /api/chat`,
+    aborting the whole reply instead of saying "AAPL was already watched". `app/watchlist.py` now
+    holds them, and the handlers are a 12-line error-code map
+  - **`reconcile()` replaced three pieces of incremental bookkeeping.** The tracked-set rule was
+    already written down once in `load_tracked_tickers()`, but after startup nothing recomputed it —
+    each mutation maintained it by hand, which is why the delete path had grown an unsubscribe, a
+    re-query and a re-subscribe. One idempotent diff against the source's set deleted all of that,
+    and closes the same race by re-reading after its removals
+  - One owner each for things that had grown three: the history limit (api, domain, repository),
+    `round(price * quantity, 2)` (buy, sell, and the receipt — which is *why* they must agree), and
+    the money/rate display precisions
+  - `TradeResult.position` was a second, narrower copy of a row already in `portfolio.positions`,
+    with its own rounding rule to keep in step. Dropped; `result.position()` derives it
+  - `get_history(price_cache)` deleted its own argument, which forced the endpoint to inject a
+    dependency it only forwarded into a `del`. The docstring carries the warning by itself
+  - `delete_position` was exported while `apply_position`'s docstring explained that callers must
+    never call it. Now `_delete_position`
+  - Test hygiene: `RecordingSource`, `snapshot_count`, `snapshot_values` and the SSE helpers moved
+    to `tests/conftest.py`; `test_stream.py`'s three aliased imports became one name each; and a
+    test filed under `TestGetMarketSource` that only exercised `get_price_cache` was rewritten, so
+    the per-request read that actually matters for failover is now covered
+
+  Skipped, with reasons: Pydantic response models for the five endpoints (they would create a
+  second definition of every shape beside the dataclass `to_dict`, which is the drift this codebase
+  keeps eliminating — worth revisiting at CP5 when the frontend wants typed responses); a staleness
+  bound on quotes instead of `require_live_market` (it needs a threshold derived from the poll
+  interval, 0.5 s on the simulator against 15 s on Massive, and guessing it would silently block
+  valid trades — recorded below instead); and `list_trades`, which stays with a docstring saying it
+  is CP6/CP7 scaffolding rather than becoming dead code nobody can date.
 
   `/security-review` was **run and required** for this checkpoint. **No HIGH or MEDIUM findings.**
   What it checked and cleared: every new query is parameterised, with no interpolation of user
@@ -1164,6 +1213,16 @@ item must be resolved or restated in a later entry — it does not expire by bei
     source subscription and the database row under one lock, which the async/sync split prevents
   - `read_transaction()` has one caller. Any future multi-statement read must use it — autocommit
     across two queries is exactly the bug #3 was
+  - **A source that is alive but stalled is still undetected.** `require_live_market` catches the
+    feed being *gone*; it cannot catch a poller that is wedged while its object still exists, and
+    trades would fill against frozen prices. The fix is a staleness bound on `PriceUpdate.timestamp`
+    inside `_require_price`, which protects every caller including CP4's. It was not guessed at
+    here because the threshold has to come from the poll interval — 0.5 s on the simulator against
+    15 s or more on Massive — and too tight a bound silently blocks valid trades
+  - `watchlist.reconcile()` costs two `load_tracked_tickers()` reads per mutation, about 1 ms of
+    connection setup. Deliberate: the second read is what turns a buy-during-removal into an add,
+    and skipping it when no removals happened would trade the simplicity of an unconditional
+    invariant for 500 µs on a user's click
   - Coverage is 100% on `app/` and remains a floor, not an achievement. Two of this checkpoint's
     tests passed against deliberately broken code until mutation testing exposed them, which is
     now the third checkpoint running where that has been true
