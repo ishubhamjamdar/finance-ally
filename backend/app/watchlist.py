@@ -27,6 +27,7 @@ from app.db import (
     DEFAULT_USER_ID,
     WatchlistEntry,
     add_watchlist_entry,
+    count_watchlist,
     delete_watchlist_entry,
     load_tracked_tickers,
     transaction,
@@ -34,6 +35,18 @@ from app.db import (
 from app.market import MarketDataSource, normalize_ticker
 
 logger = logging.getLogger(__name__)
+
+#: How many tickers may be watched at once.
+#:
+#: Checkpoint 3 shipped without a cap and carried the gap forward, because
+#: Checkpoint 4 hands `add` to an LLM that can call it in a loop — and every
+#: entry joins every Massive poll for the life of the process, where the free
+#: tier allows five calls a minute. A refusal the model can read and report is
+#: better than a watchlist of two hundred symbols nothing can price.
+#:
+#: 50 is five times PLAN.md §7's ten seeded tickers: far past any real screen,
+#: far short of a runaway.
+MAX_WATCHLIST_SIZE = 50
 
 
 class WatchlistError(Exception):
@@ -46,6 +59,10 @@ class TickerAlreadyWatchedError(WatchlistError):
 
 class TickerNotWatchedError(WatchlistError):
     """The ticker was not on the watchlist, so there was nothing to remove."""
+
+
+class WatchlistFullError(WatchlistError):
+    """The watchlist is at `MAX_WATCHLIST_SIZE` and cannot take another ticker."""
 
 
 class MarketSourceUnavailableError(WatchlistError):
@@ -61,6 +78,10 @@ async def add(
     again: a watchlist row whose ticker nothing prices would sit there showing
     an em dash forever, with no way for the user to find out why
     (MARKET_DATA_DESIGN.md §13.4).
+
+    Raises `WatchlistFullError` at `MAX_WATCHLIST_SIZE`, `TickerAlreadyWatchedError`
+    for a duplicate — and a duplicate is reported as a duplicate even when the
+    list is full, since re-adding a watched ticker adds nothing to poll.
     """
     ticker = normalize_ticker(ticker)
 
@@ -128,8 +149,23 @@ async def reconcile(source: MarketDataSource, user_id: str = DEFAULT_USER_ID) ->
 
 
 def _insert_row(ticker: str, user_id: str) -> WatchlistEntry | None:
+    """Insert under the size cap, or raise `WatchlistFullError`.
+
+    Insert first and count after, inside the one `BEGIN IMMEDIATE`. Counting
+    first would need a separate "is it already there?" test to keep a duplicate
+    on a full list reporting as a duplicate; letting `INSERT OR IGNORE` decide
+    answers both questions with one statement, because a duplicate leaves the
+    count unchanged and so cannot exceed the cap. The rollback on the raise is
+    what un-does the row for a genuine add.
+    """
     with transaction() as conn:
-        return add_watchlist_entry(conn, ticker, user_id)
+        entry = add_watchlist_entry(conn, ticker, user_id)
+        if count_watchlist(conn, user_id) > MAX_WATCHLIST_SIZE:
+            raise WatchlistFullError(
+                f"The watchlist is full at {MAX_WATCHLIST_SIZE} tickers. "
+                f"Remove one before adding {ticker}."
+            )
+        return entry
 
 
 def _delete_row(ticker: str, user_id: str) -> bool:

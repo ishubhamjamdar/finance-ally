@@ -8,12 +8,13 @@ from .cache import PriceCache
 from .events import EventLog
 from .factory import create_market_data_source, create_simulator_source, start_market_data
 from .interface import MarketDataSource, PermanentMarketDataError
-from .models import MarketEvent, PriceUpdate, normalize_ticker
+from .models import TICKER_PATTERN, MarketEvent, PriceUpdate, normalize_ticker
 from .seed_prices import DEFAULT_TICKERS
 from .stream import create_stream_router
 
 __all__ = [
     "DEFAULT_TICKERS",
+    "TICKER_PATTERN",
     "PriceUpdate",
     "MarketEvent",
     "normalize_ticker",

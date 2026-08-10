@@ -5,6 +5,19 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
+#: What this application accepts as a ticker symbol: letters, digits, dot and
+#: hyphen, starting with a letter, at most 10 characters — ordinary symbols
+#: plus the dotted class shares Massive uses ("BRK.B").
+#:
+#: It lives here, beside `normalize_ticker`, because "what is a symbol?" is a
+#: market-data question and there are now three unrelated callers: the REST
+#: request models, the `{ticker}` path parameter, and the schema the LLM's
+#: structured output is validated against. Owned by the HTTP layer, as it was
+#: until Checkpoint 4, the LLM contract would have had to import from
+#: `app.api` — a domain rule reached through the transport that happens to
+#: have needed it first.
+TICKER_PATTERN = r"^[A-Za-z][A-Za-z0-9.\-]{0,9}$"
+
 
 def normalize_ticker(ticker: str) -> str:
     """Canonical ticker form: upper-case, stripped.

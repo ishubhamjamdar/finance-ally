@@ -11,10 +11,12 @@ import pytest
 
 from app.db import connect, list_watchlist
 from app.watchlist import (
+    MAX_WATCHLIST_SIZE,
     MarketSourceUnavailableError,
     TickerAlreadyWatchedError,
     TickerNotWatchedError,
     WatchlistError,
+    WatchlistFullError,
     add,
     reconcile,
     remove,
@@ -161,6 +163,69 @@ class TestReconcile:
         assert "PYPL" in source.get_tickers()
 
 
+class TestSizeCap:
+    """Checkpoint 3 shipped without a cap and carried it forward to here,
+    because Checkpoint 4 hands `add` to a model that can call it in a loop and
+    every entry joins every Massive poll thereafter."""
+
+    async def fill_to_cap(self, source) -> None:
+        for n in range(MAX_WATCHLIST_SIZE - len(PLAN_DEFAULT_WATCHLIST)):
+            await add(source, f"F{n:03d}")
+
+    async def test_adds_are_refused_at_the_cap(self, source):
+        await self.fill_to_cap(source)
+        assert len(stored()) == MAX_WATCHLIST_SIZE
+
+        with pytest.raises(WatchlistFullError, match="full"):
+            await add(source, "PYPL")
+
+    async def test_the_refused_row_is_not_left_behind(self, source):
+        """The check runs inside the insert's transaction, so the rollback is
+        what un-does it. A committed row would put the list one over the cap
+        and make the next add refuse for a ticker that is genuinely there."""
+        await self.fill_to_cap(source)
+
+        with pytest.raises(WatchlistFullError):
+            await add(source, "PYPL")
+
+        assert "PYPL" not in stored()
+        assert len(stored()) == MAX_WATCHLIST_SIZE
+
+    async def test_the_source_is_never_told_about_a_refused_add(self, source):
+        await self.fill_to_cap(source)
+        source.added.clear()
+
+        with pytest.raises(WatchlistFullError):
+            await add(source, "PYPL")
+
+        assert source.added == []
+
+    async def test_a_duplicate_at_the_cap_reports_the_duplicate(self, source):
+        """A full list must not turn "AAPL is already watched" into "the list is
+        full": re-adding a watched ticker adds nothing to poll, and the wrong
+        message would send the user deleting things they did not need to."""
+        await self.fill_to_cap(source)
+
+        with pytest.raises(TickerAlreadyWatchedError):
+            await add(source, "AAPL")
+
+    async def test_removing_one_makes_room_again(self, source):
+        await self.fill_to_cap(source)
+        await remove(source, "AAPL")
+
+        assert (await add(source, "PYPL")).ticker == "PYPL"
+
+    async def test_the_last_slot_is_usable(self, source):
+        """Off-by-one guard: the cap is the number of tickers allowed, not the
+        number below which adds are allowed."""
+        for n in range(MAX_WATCHLIST_SIZE - len(PLAN_DEFAULT_WATCHLIST) - 1):
+            await add(source, f"F{n:03d}")
+
+        assert len(stored()) == MAX_WATCHLIST_SIZE - 1
+        await add(source, "PYPL")
+        assert len(stored()) == MAX_WATCHLIST_SIZE
+
+
 def test_every_failure_is_a_watchlist_error():
     """The handlers and Checkpoint 4's chat path both catch the base class, so
     a subclass that escaped it would surface as a 500 rather than a message."""
@@ -168,5 +233,6 @@ def test_every_failure_is_a_watchlist_error():
         TickerAlreadyWatchedError,
         TickerNotWatchedError,
         MarketSourceUnavailableError,
+        WatchlistFullError,
     ):
         assert issubclass(error, WatchlistError)

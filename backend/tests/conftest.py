@@ -89,6 +89,99 @@ def no_massive_key(monkeypatch):
     monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def no_llm_network(monkeypatch):
+    """Make an unmocked LLM call impossible, not merely unlikely.
+
+    `app.main` loads the repo's `.env` at import (PLAN.md §5), so from
+    Checkpoint 4 on, a real `OPENROUTER_API_KEY` is in `os.environ` for the
+    whole suite. Without this, a test that reached `complete()` by accident
+    would spend money and take seconds, and would pass or fail depending on
+    whose laptop it ran on.
+
+    Both variables are cleared rather than `LLM_MOCK` being set: with no key
+    and no mock, `complete()` raises `LLMUnavailableError` before it can open a
+    socket. A test that wants the mock opts into it explicitly, so no test is
+    silently exercising a path it did not choose.
+    """
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_MOCK", raising=False)
+
+
+@pytest.fixture
+def mock_llm(monkeypatch):
+    """Select the deterministic mock (PLAN.md §5's `LLM_MOCK=true`)."""
+    monkeypatch.setenv("LLM_MOCK", "true")
+
+
+class StubModel:
+    """Stands in for the provider, patched over `app.chat.complete`.
+
+    Patched at the *call site* rather than inside `app.llm.client`, so a test
+    can hand `app.chat` any raw string at all — including text no real provider
+    would produce — and watch it travel through the real `parse_reply` and the
+    real execution path. That is the only way to drive the malformed-reply
+    branches, which is where PLAN.md §Checkpoint 4's "never a 500" lives.
+    """
+
+    def __init__(self) -> None:
+        self.raw = json.dumps({"message": "Noted.", "trades": [], "watchlist_changes": []})
+        self.error: Exception | None = None
+        self.messages: list[dict] | None = None
+        self.calls = 0
+
+    def replies(self, message="Noted.", trades=None, watchlist_changes=None) -> None:
+        """Answer with a well-formed reply carrying these actions."""
+        self.raw = json.dumps(
+            {
+                "message": message,
+                "trades": trades or [],
+                "watchlist_changes": watchlist_changes or [],
+            }
+        )
+
+    def replies_raw(self, raw: str) -> None:
+        """Answer with exactly this text, valid or not."""
+        self.raw = raw
+
+    def fails(self, error: Exception) -> None:
+        """Fail the way an unreachable provider does."""
+        self.error = error
+
+    def __call__(self, messages):
+        self.calls += 1
+        self.messages = messages
+        if self.error is not None:
+            raise self.error
+        return self.raw
+
+
+@pytest.fixture
+def stub_model(monkeypatch):
+    model = StubModel()
+    monkeypatch.setattr("app.chat.complete", model)
+    return model
+
+
+def stored_messages(user_id: str = "default") -> list[tuple[str, str, str | None]]:
+    """Chat rows as (role, content, actions JSON), in written order.
+
+    Reads the table rather than the response, so a test can catch a handler
+    that reported an exchange it never persisted.
+    """
+    from app.db import connect
+
+    with connect() as conn:
+        return [
+            (row["role"], row["content"], row["actions"])
+            for row in conn.execute(
+                "SELECT role, content, actions FROM chat_messages"
+                " WHERE user_id = ? ORDER BY created_at, rowid",
+                (user_id,),
+            )
+        ]
+
+
 class RecordingSource(MarketDataSource):
     """A market source that records what it was told, and prices on demand.
 
