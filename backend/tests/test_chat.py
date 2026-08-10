@@ -283,6 +283,106 @@ class TestActionOrdering:
         assert [a.kind for a in reply.actions] == ["watchlist", "trade"]
         assert read_cash() == 9750.0  # 5 × $50, the price RecordingSource seeds
 
+    async def test_a_removal_follows_a_trade_of_the_same_ticker(self, chat, stub_model, read_cash):
+        """The other half, and the one an earlier version got wrong. A remove
+        evicts the ticker from the cache, so run first it would delete the price
+        the buy in the same reply needed and refuse the trade."""
+        stub_model.replies(
+            watchlist_changes=[{"ticker": "AAPL", "action": "remove"}],
+            trades=[{"ticker": "AAPL", "side": "buy", "quantity": 2}],
+        )
+
+        reply = await chat("buy 2 AAPL then stop watching it")
+
+        assert [a.kind for a in reply.actions] == ["trade", "watchlist"]
+        assert [a.ok for a in reply.actions] == [True, True]
+        assert read_cash() == 9600.0  # 2 × $200 — the trade filled
+
+    async def test_a_sell_out_and_remove_in_one_turn_still_fills(
+        self, chat, stub_model, add_position, read_cash
+    ):
+        """The phrasing a user would actually reach for. Selling the whole
+        position also stops it being tracked, so ordering the remove first would
+        strand the sell with no price."""
+        add_position("AAPL", quantity=3.0)
+        stub_model.replies(
+            trades=[{"ticker": "AAPL", "side": "sell", "quantity": 3}],
+            watchlist_changes=[{"ticker": "AAPL", "action": "remove"}],
+        )
+
+        reply = await chat("sell all my AAPL and take it off the watchlist")
+
+        assert all(a.ok for a in reply.actions)
+        assert read_cash() == 10600.0
+        assert held("AAPL") is None
+
+    async def test_adds_and_removes_in_one_reply_both_land(self, chat, stub_model):
+        stub_model.replies(
+            watchlist_changes=[
+                {"ticker": "PYPL", "action": "add"},
+                {"ticker": "NFLX", "action": "remove"},
+            ]
+        )
+
+        reply = await chat("swap NFLX for PYPL")
+
+        assert all(a.ok for a in reply.actions)
+        assert "PYPL" in watched()
+        assert "NFLX" not in watched()
+
+
+class TestTickerNormalisation:
+    """The schema accepts "aapl" and the domain layer upper-cases it, so an
+    un-normalised echo would report two spellings of one symbol — and
+    Checkpoint 7 matches actions to watchlist and position rows by this field."""
+
+    async def test_a_trade_reports_the_normalised_ticker(self, chat, stub_model):
+        stub_model.replies(trades=[{"ticker": "aapl", "side": "buy", "quantity": 1}])
+
+        (action,) = (await chat("buy aapl")).actions
+
+        assert action.ticker == "AAPL"
+        assert action.result["ticker"] == "AAPL"
+        assert "AAPL" in action.summary
+        assert "aapl" not in action.detail
+
+    async def test_a_refused_trade_reports_the_normalised_ticker(self, chat, stub_model):
+        stub_model.replies(trades=[{"ticker": "aapl", "side": "buy", "quantity": 9999}])
+
+        (action,) = (await chat("buy aapl")).actions
+
+        assert action.ok is False
+        assert action.ticker == "AAPL"
+
+    async def test_a_watchlist_add_reports_the_normalised_ticker(self, chat, stub_model):
+        stub_model.replies(watchlist_changes=[{"ticker": "pypl", "action": "add"}])
+
+        (action,) = (await chat("watch pypl")).actions
+
+        assert action.ticker == "PYPL"
+        assert action.result["ticker"] == "PYPL"
+        assert "pypl" not in action.detail
+
+    async def test_a_watchlist_remove_reports_the_normalised_ticker(self, chat, stub_model):
+        """The branch that disagreed with the add branch: it echoed the raw
+        string while the add reported `entry.ticker`."""
+        stub_model.replies(watchlist_changes=[{"ticker": "nflx", "action": "remove"}])
+
+        (action,) = (await chat("drop nflx")).actions
+
+        assert action.ticker == "NFLX"
+        assert action.result["ticker"] == "NFLX"
+        assert "nflx" not in action.detail
+
+    async def test_the_stored_actions_carry_the_normalised_ticker(self, chat, stub_model):
+        """`chat_messages.actions` is replayed and rendered; a lower-case ticker
+        there outlives the request that produced it."""
+        stub_model.replies(trades=[{"ticker": "aapl", "side": "buy", "quantity": 1}])
+
+        await chat("buy aapl")
+
+        assert json.loads(stored_messages()[1][2])[0]["ticker"] == "AAPL"
+
 
 class TestMalformedReplies:
     @pytest.mark.parametrize(
@@ -465,3 +565,39 @@ class TestTranscript:
 
     def test_an_empty_conversation_is_an_empty_list(self):
         assert get_transcript() == []
+
+
+class TestPersistenceFailure:
+    """A transcript write that fails must not undo a trade that succeeded."""
+
+    async def test_a_completed_trade_is_still_reported(
+        self, chat, stub_model, monkeypatch, read_cash
+    ):
+        """By the time the transcript is written the fill has committed.
+        Raising here would return a 500 for a request that moved cash, and the
+        obvious client response to a 500 — resend — would buy twice."""
+        stub_model.replies(
+            message="Bought.", trades=[{"ticker": "AAPL", "side": "buy", "quantity": 1}]
+        )
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr("app.chat._persist", explode)
+
+        reply = await chat("buy 1 AAPL")
+
+        assert reply.message == "Bought."
+        assert reply.actions[0].ok is True
+        assert read_cash() == 9800.0
+
+    async def test_the_failure_is_logged(self, chat, stub_model, monkeypatch, caplog):
+        def explode(*args, **kwargs):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr("app.chat._persist", explode)
+
+        with caplog.at_level("ERROR"):
+            await chat("hello")
+
+        assert "Could not record the chat exchange" in caplog.text

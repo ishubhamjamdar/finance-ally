@@ -190,24 +190,34 @@ def _validate_items(
 
     valid: list[BaseModel] = []
     rejected: list[RejectedAction] = []
+    over_cap: list[object] = []
 
     for item in items:
         if len(valid) >= cap:
-            # Reported, not truncated silently: the model was told the cap, so
-            # exceeding it is worth the user knowing about. One line for the
-            # remainder rather than one per item.
-            rejected.append(
-                RejectedAction(
-                    kind=kind,
-                    excerpt=_excerpt(item),
-                    reason=f"Ignored: more than {cap} {kind} actions in one reply.",
-                )
-            )
+            over_cap.append(item)
             continue
         try:
             valid.append(model.model_validate(item))
         except ValidationError as exc:
             rejected.append(RejectedAction(kind=kind, excerpt=_excerpt(item), reason=_reason(exc)))
+
+    if over_cap:
+        # Reported, not truncated silently: the model was told the cap, so
+        # exceeding it is worth the user knowing about. **One** line for the
+        # whole remainder — a per-item rejection would put twenty identical
+        # sentences in the reply and in the stored transcript, burying whatever
+        # else went wrong on that turn.
+        rejected.append(
+            RejectedAction(
+                kind=kind,
+                excerpt=_excerpt(over_cap[0])
+                + (f" (and {len(over_cap) - 1} more)" if len(over_cap) > 1 else ""),
+                reason=(
+                    f"Ignored {len(over_cap)} {kind} action(s): a reply may carry at most "
+                    f"{cap}. Ask again to run the rest."
+                ),
+            )
+        )
 
     return valid, rejected
 

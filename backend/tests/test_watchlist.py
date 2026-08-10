@@ -215,6 +215,25 @@ class TestSizeCap:
 
         assert (await add(source, "PYPL")).ticker == "PYPL"
 
+    async def test_a_compensating_restore_is_not_refused_by_the_cap(self, price_cache):
+        """`remove` puts the row back when the source refuses. Enforcing the cap
+        on that restore would let a concurrent add turn a source failure into
+        "the watchlist is full", replacing the real reason and leaving the row
+        deleted after all."""
+        source = RecordingSource(price_cache, tickers=list(PLAN_DEFAULT_WATCHLIST))
+        await self.fill_to_cap(source)
+
+        async def refuse(ticker):
+            raise RuntimeError("source is down")
+
+        source.remove_ticker = refuse
+
+        with pytest.raises(MarketSourceUnavailableError):
+            await remove(source, "AAPL")
+
+        assert "AAPL" in stored()
+        assert len(stored()) == MAX_WATCHLIST_SIZE
+
     async def test_the_last_slot_is_usable(self, source):
         """Off-by-one guard: the cap is the number of tickers allowed, not the
         number below which adds are allowed."""

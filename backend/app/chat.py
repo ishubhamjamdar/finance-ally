@@ -43,7 +43,7 @@ from app.llm import (
     complete,
     parse_reply,
 )
-from app.market import MarketDataSource, PriceCache, PriceUpdate
+from app.market import MarketDataSource, PriceCache, PriceUpdate, normalize_ticker
 from app.portfolio import PortfolioView, TradeError, execute_trade, get_portfolio
 from app.watchlist import WatchlistError
 from app.watchlist import add as add_to_watchlist
@@ -158,12 +158,26 @@ async def handle_message(
         logger.warning("Discarding an unusable model reply: %s", exc)
         return await _finish(text, MALFORMED_REPLY_MESSAGE, [], price_cache, user_id)
 
-    # Watchlist changes run before trades, because on the simulator an add
-    # makes a ticker priceable immediately — so "add PYPL and buy 5" works in
-    # one turn. The reverse order never helps: removing a ticker does not
-    # untrack a holding, so a sell after a remove is unaffected either way.
-    actions = await _apply_watchlist_changes(source, parsed.watchlist_changes, user_id)
+    # Adds, then trades, then removes — because subscribing is what *creates* a
+    # price and unsubscribing is what destroys one, so both have to sit on the
+    # far side of the trades from each other.
+    #
+    # Adds first: on the simulator `add_ticker` prices a symbol immediately, so
+    # "add PYPL and buy 5" fills in one turn instead of being refused for having
+    # no price.
+    #
+    # Removes last, which is the half an earlier version got wrong. A remove
+    # reconciles the ticker off the source, and `SimulatorDataSource.remove_ticker`
+    # evicts it from the cache; run before the trades, "sell my AAPL and stop
+    # watching it" would delete the price its own sell needed and refuse the
+    # trade. Only a ticker already *held* survives the eviction, which is why
+    # the bug hid — an unheld buy-then-remove is the case that breaks.
+    adds = [change for change in parsed.watchlist_changes if change.action == "add"]
+    removes = [change for change in parsed.watchlist_changes if change.action != "add"]
+
+    actions = await _apply_watchlist_changes(source, adds, user_id)
     actions += await _apply_trades(price_cache, parsed.trades, user_id)
+    actions += await _apply_watchlist_changes(source, removes, user_id)
     actions += [_rejection_result(rejection) for rejection in parsed.rejected]
 
     return await _finish(text, parsed.message, actions, price_cache, user_id)
@@ -189,10 +203,17 @@ async def _apply_trades(
     results: list[ActionResult] = []
 
     for trade in trades:
-        summary = f"{trade.side} {trade.quantity:g} {trade.ticker}"
+        # Normalised here, not just inside `execute_trade`. The schema accepts
+        # "aapl" and the domain layer upper-cases it internally, so an
+        # un-normalised echo would put `ticker: "aapl"` in the reply and in
+        # `chat_messages.actions` beside a fill that says "AAPL" — two spellings
+        # of one symbol, and Checkpoint 7 matches actions to watchlist and
+        # position rows by exactly this field.
+        ticker = normalize_ticker(trade.ticker)
+        summary = f"{trade.side} {trade.quantity:g} {ticker}"
         try:
             outcome = await run_in_threadpool(
-                execute_trade, price_cache, trade.ticker, trade.side, trade.quantity, user_id
+                execute_trade, price_cache, ticker, trade.side, trade.quantity, user_id
             )
         except TradeError as exc:
             # An ordinary outcome — insufficient cash, no price yet, oversell.
@@ -204,7 +225,7 @@ async def _apply_trades(
                     ok=False,
                     summary=summary,
                     detail=str(exc),
-                    ticker=trade.ticker,
+                    ticker=ticker,
                     action=trade.side,
                 )
             )
@@ -215,10 +236,8 @@ async def _apply_trades(
                 kind="trade",
                 ok=True,
                 summary=summary,
-                detail=(
-                    f"Filled {trade.quantity:g} {trade.ticker} at ${outcome.trade.price:,.2f}."
-                ),
-                ticker=trade.ticker,
+                detail=f"Filled {trade.quantity:g} {ticker} at ${outcome.trade.price:,.2f}.",
+                ticker=ticker,
                 action=trade.side,
                 result=outcome.to_dict()["trade"],
             )
@@ -239,21 +258,26 @@ async def _apply_watchlist_changes(
     results: list[ActionResult] = []
 
     for change in changes:
-        summary = f"{change.action} {change.ticker}"
+        # Normalised for the same reason as a trade's ticker — see `_apply_trades`.
+        # The two branches below previously disagreed with each other: an add
+        # reported `entry.ticker` (normalised) while a remove reported the raw
+        # string, so the same request produced two different spellings.
+        ticker = normalize_ticker(change.ticker)
+        summary = f"{change.action} {ticker}"
         try:
             if change.action == "add":
-                entry = await add_to_watchlist(source, change.ticker, user_id)
-                detail = f"{change.ticker} added to the watchlist."
+                entry = await add_to_watchlist(source, ticker, user_id)
+                detail = f"{ticker} added to the watchlist."
                 result = {"ticker": entry.ticker, "added_at": entry.added_at}
             else:
-                still_tracked = await remove_from_watchlist(source, change.ticker, user_id)
-                detail = f"{change.ticker} removed from the watchlist."
+                still_tracked = await remove_from_watchlist(source, ticker, user_id)
+                detail = f"{ticker} removed from the watchlist."
                 if still_tracked:
                     # Not a caveat worth hiding: the price keeps arriving, and
                     # a user who expected it to stop would otherwise think the
                     # removal failed.
                     detail += " It is still held, so it keeps streaming."
-                result = {"ticker": change.ticker, "still_tracked": still_tracked}
+                result = {"ticker": ticker, "still_tracked": still_tracked}
         except WatchlistError as exc:
             logger.info("Chat watchlist change refused (%s): %s", summary, exc)
             results.append(
@@ -262,7 +286,7 @@ async def _apply_watchlist_changes(
                     ok=False,
                     summary=summary,
                     detail=str(exc),
-                    ticker=change.ticker,
+                    ticker=ticker,
                     action=change.action,
                 )
             )
@@ -274,7 +298,7 @@ async def _apply_watchlist_changes(
                 ok=True,
                 summary=summary,
                 detail=detail,
-                ticker=change.ticker,
+                ticker=ticker,
                 action=change.action,
                 result=result,
             )
@@ -308,9 +332,19 @@ def _load_context(price_cache: PriceCache, user_id: str) -> _Context:
     prices = price_cache.get_all()
     portfolio = get_portfolio(price_cache, user_id)
 
-    # One snapshot across both reads, per the rule in backend/CLAUDE.md: two
-    # autocommit queries could straddle a watchlist change and replay a history
-    # that never coexisted with that watchlist.
+    # The watchlist and the history share one snapshot, per the rule in
+    # backend/CLAUDE.md: two autocommit queries could straddle a watchlist
+    # change and replay a history that never coexisted with that watchlist.
+    #
+    # The portfolio above is a *separate* read and is deliberately not folded
+    # in. `get_portfolio` opens its own `read_transaction`, and reaching past it
+    # to value the account against this connection would mean exporting
+    # `app.portfolio`'s private valuation just so a block of advisory prose
+    # could be atomic with a watchlist listing. What that costs is a mark on a
+    # position and a quote on the watchlist row for the same ticker drifting by
+    # one simulator tick within the rendered text. Nothing is computed from the
+    # pair, and `GET /api/portfolio` — where a total is actually reported — is
+    # consistent because it goes through the one transaction that matters.
     with read_transaction() as conn:
         watchlist = [
             (entry.ticker, prices.get(entry.ticker)) for entry in list_watchlist(conn, user_id)
@@ -327,13 +361,25 @@ async def _finish(
     price_cache: PriceCache,
     user_id: str,
 ) -> ChatReply:
-    """Persist the exchange and value the account it left behind."""
+    """Persist the exchange and value the account it left behind.
+
+    A failure to write the transcript is logged and swallowed, which is the
+    uncomfortable choice and still the right one. By this point the trades have
+    already committed; raising would return a 500 for a request that moved real
+    cash, and the obvious client response to a 500 — resend the message — would
+    execute them a second time. A missing pair of transcript rows costs the user
+    their scrollback for one turn. Losing the reply that says what was bought,
+    while the fill sits in `trades`, costs them the ability to know it happened.
+    """
     reply = ChatReply(
         message=reply_message,
         actions=actions,
         portfolio=await run_in_threadpool(get_portfolio, price_cache, user_id),
     )
-    await run_in_threadpool(_persist, user_text, reply_message, actions, user_id)
+    try:
+        await run_in_threadpool(_persist, user_text, reply_message, actions, user_id)
+    except Exception:
+        logger.exception("Could not record the chat exchange; the reply is returned regardless")
     return reply
 
 

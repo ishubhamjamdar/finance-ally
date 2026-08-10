@@ -157,8 +157,47 @@ class TestTrades:
         )
 
         assert len(parsed.trades) == MAX_TRADES_PER_REPLY
-        assert len(parsed.rejected) == 3
-        assert all(str(MAX_TRADES_PER_REPLY) in r.reason for r in parsed.rejected)
+        assert str(MAX_TRADES_PER_REPLY) in parsed.rejected[0].reason
+
+    def test_the_whole_overflow_is_one_rejection_not_one_each(self):
+        """Twenty identical "over the cap" lines in the reply and in the stored
+        transcript would bury whatever else went wrong on that turn."""
+        parsed = parse_reply(
+            reply(
+                message="Rebalancing.",
+                trades=[{"ticker": "AAPL", "side": "buy", "quantity": 1}]
+                * (MAX_TRADES_PER_REPLY + 20),
+            )
+        )
+
+        assert len(parsed.rejected) == 1
+        assert "20" in parsed.rejected[0].reason
+        assert "19 more" in parsed.rejected[0].excerpt
+
+    def test_a_single_over_cap_item_says_so_without_a_count(self):
+        parsed = parse_reply(
+            reply(
+                message="?",
+                trades=[{"ticker": "AAPL", "side": "buy", "quantity": 1}]
+                * (MAX_TRADES_PER_REPLY + 1),
+            )
+        )
+
+        assert len(parsed.rejected) == 1
+        assert "more)" not in parsed.rejected[0].excerpt
+
+    def test_over_cap_and_invalid_items_are_both_reported(self):
+        """Two different things went wrong; collapsing them would hide one."""
+        parsed = parse_reply(
+            reply(
+                message="?",
+                trades=[{"ticker": "!!", "side": "buy", "quantity": 1}]
+                + [{"ticker": "AAPL", "side": "buy", "quantity": 1}] * (MAX_TRADES_PER_REPLY + 2),
+            )
+        )
+
+        assert len(parsed.trades) == MAX_TRADES_PER_REPLY
+        assert len(parsed.rejected) == 2
 
     def test_a_non_list_trades_field_is_one_rejection(self):
         parsed = parse_reply(reply(message="?", trades={"ticker": "AAPL"}))
@@ -204,6 +243,7 @@ class TestWatchlistChanges:
 
         assert len(parsed.watchlist_changes) == MAX_WATCHLIST_CHANGES_PER_REPLY
         assert len(parsed.rejected) == 1
+        assert "watchlist" in parsed.rejected[0].reason
 
 
 class TestRejectionReporting:

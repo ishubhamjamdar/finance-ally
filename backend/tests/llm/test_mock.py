@@ -78,6 +78,16 @@ class TestTradeExtraction:
 
         assert [(t["side"], t["ticker"]) for t in trades] == [("buy", "AAPL"), ("sell", "MSFT")]
 
+    @pytest.mark.parametrize(
+        "text",
+        ["I want to buy 3 shares", "sell 2 shares please", "buy 5 of them"],
+    )
+    def test_a_quantity_with_no_symbol_is_not_a_trade(self, text):
+        """The `shares? of` group is optional, so "buy 3 shares" used to match
+        with `shares` itself as the ticker — a failed trade action in the E2E
+        suite for a symbol the user never named."""
+        assert ask(text)["trades"] == []
+
     def test_conversation_without_an_order_trades_nothing(self):
         reply = ask("how is my portfolio doing?")
 

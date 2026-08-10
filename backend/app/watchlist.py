@@ -115,7 +115,13 @@ async def remove(source: MarketDataSource, ticker: str, user_id: str = DEFAULT_U
         tracked = await reconcile(source, user_id)
     except Exception as exc:
         logger.exception("Source could not drop %s; restoring the watchlist row", ticker)
-        await run_in_threadpool(_insert_row, ticker, user_id)
+        # `enforce_cap=False`: this is putting back a row that was already
+        # there, not adding one. With the cap enforced, a concurrent add that
+        # refilled the list in the meantime would make the *restore* raise
+        # `WatchlistFullError`, which would replace the real reason for the
+        # failure and leave the row deleted after all — a compensating action
+        # that loses the thing it was compensating for.
+        await run_in_threadpool(_insert_row, ticker, user_id, enforce_cap=False)
         raise MarketSourceUnavailableError(f"Could not stop streaming {ticker}.") from exc
 
     return ticker in tracked
@@ -148,7 +154,7 @@ async def reconcile(source: MarketDataSource, user_id: str = DEFAULT_USER_ID) ->
 # --- blocking database work, called through run_in_threadpool ------------
 
 
-def _insert_row(ticker: str, user_id: str) -> WatchlistEntry | None:
+def _insert_row(ticker: str, user_id: str, enforce_cap: bool = True) -> WatchlistEntry | None:
     """Insert under the size cap, or raise `WatchlistFullError`.
 
     Insert first and count after, inside the one `BEGIN IMMEDIATE`. Counting
@@ -157,10 +163,14 @@ def _insert_row(ticker: str, user_id: str) -> WatchlistEntry | None:
     answers both questions with one statement, because a duplicate leaves the
     count unchanged and so cannot exceed the cap. The rollback on the raise is
     what un-does the row for a genuine add.
+
+    `enforce_cap=False` is for `remove`'s compensating restore only: putting a
+    row back where it was cannot be what pushed the list over, and refusing it
+    would strand the caller with neither the row nor the real error.
     """
     with transaction() as conn:
         entry = add_watchlist_entry(conn, ticker, user_id)
-        if count_watchlist(conn, user_id) > MAX_WATCHLIST_SIZE:
+        if enforce_cap and count_watchlist(conn, user_id) > MAX_WATCHLIST_SIZE:
             raise WatchlistFullError(
                 f"The watchlist is full at {MAX_WATCHLIST_SIZE} tickers. "
                 f"Remove one before adding {ticker}."

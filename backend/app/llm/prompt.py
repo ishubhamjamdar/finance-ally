@@ -89,9 +89,34 @@ def build_messages(
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "system", "content": render_context(portfolio, watchlist)},
     ]
-    messages += [{"role": message.role, "content": message.content} for message in history]
+    messages += [{"role": message.role, "content": _replayed(message)} for message in history]
     messages.append({"role": "user", "content": user_message})
     return messages
+
+
+def _replayed(message: ChatMessage) -> str:
+    """One stored turn as the model should re-read it.
+
+    An assistant turn is replayed with an outcome line appended, because the
+    stored `content` is what the model *said* and the `actions` column is what
+    actually happened — and the model writes its message before knowing which
+    trades cleared. A refused buy leaves "I've bought 10 AAPL for you" in the
+    transcript; replayed bare, the model reads its own claim back as fact and
+    will happily discuss a position the user does not own.
+
+    The fresh PORTFOLIO CONTEXT block corrects the *numbers* but not the
+    narrative — nothing in a list of holdings says "the thing you told the user
+    you did last turn did not happen".
+    """
+    if message.role != "assistant" or not message.actions:
+        return message.content
+
+    outcomes = "; ".join(
+        f"{action.get('summary', 'action')} — "
+        f"{'done' if action.get('ok') else f'FAILED: {action.get("detail", "no reason recorded")}'}"
+        for action in message.actions
+    )
+    return f"{message.content}\n[what actually executed: {outcomes}]"
 
 
 def render_context(

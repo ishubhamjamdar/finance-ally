@@ -23,8 +23,8 @@ def portfolio(price_cache):
     return get_portfolio(price_cache)
 
 
-def turn(role: str, content: str) -> ChatMessage:
-    return ChatMessage(id="x", role=role, content=content, actions=None, created_at="now")
+def turn(role: str, content: str, actions=None) -> ChatMessage:
+    return ChatMessage(id="x", role=role, content=content, actions=actions, created_at="now")
 
 
 class TestMessageStructure:
@@ -133,3 +133,84 @@ class TestHistoryBound:
         context window mid-conversation. The bound is applied by the caller's
         query, so this pins the constant the caller uses."""
         assert 0 < MAX_HISTORY_MESSAGES <= 100
+
+
+class TestReplayedOutcomes:
+    """The stored `content` is what the assistant *said*; the `actions` column
+    is what happened. The model writes its message before knowing which trades
+    cleared, so replaying the text bare lets it read its own failed claim as
+    fact — and a fresh PORTFOLIO CONTEXT corrects the numbers but not the
+    narrative."""
+
+    def test_a_failed_action_is_replayed_as_failed(self, portfolio):
+        history = [
+            turn(
+                "assistant",
+                "I've bought 10 AAPL for you.",
+                actions=[
+                    {
+                        "kind": "trade",
+                        "ok": False,
+                        "summary": "buy 10 AAPL",
+                        "detail": "Insufficient cash: ...",
+                    }
+                ],
+            )
+        ]
+
+        (replayed,) = [
+            m for m in build_messages(portfolio, [], history, "?") if m["role"] == "assistant"
+        ]
+
+        assert "I've bought 10 AAPL for you." in replayed["content"]
+        assert "FAILED" in replayed["content"]
+        assert "Insufficient cash" in replayed["content"]
+
+    def test_a_successful_action_is_replayed_as_done(self, portfolio):
+        history = [
+            turn(
+                "assistant",
+                "Bought.",
+                actions=[
+                    {"kind": "trade", "ok": True, "summary": "buy 10 AAPL", "detail": "Filled"}
+                ],
+            )
+        ]
+
+        (replayed,) = [
+            m for m in build_messages(portfolio, [], history, "?") if m["role"] == "assistant"
+        ]
+
+        assert "buy 10 AAPL — done" in replayed["content"]
+        assert "FAILED" not in replayed["content"]
+
+    def test_a_turn_with_no_actions_is_replayed_untouched(self, portfolio):
+        history = [turn("assistant", "You are entirely in cash.")]
+
+        (replayed,) = [
+            m for m in build_messages(portfolio, [], history, "?") if m["role"] == "assistant"
+        ]
+
+        assert replayed["content"] == "You are entirely in cash."
+
+    def test_a_user_turn_is_never_annotated(self, portfolio):
+        """Only the assistant claims things. Appending to a user turn would put
+        words in their mouth."""
+        history = [turn("user", "buy 10 AAPL", actions=[{"ok": False, "summary": "x"}])]
+
+        (replayed,) = [
+            m for m in build_messages(portfolio, [], history, "?") if m["role"] == "user"
+        ][:1]
+
+        assert replayed["content"] == "buy 10 AAPL"
+
+    def test_an_action_missing_its_fields_does_not_break_replay(self, portfolio):
+        """`actions` is decoded from a JSON column. A row written by an older
+        version, or edited by hand, must not make every later request fail."""
+        history = [turn("assistant", "Did something.", actions=[{}])]
+
+        (replayed,) = [
+            m for m in build_messages(portfolio, [], history, "?") if m["role"] == "assistant"
+        ]
+
+        assert "Did something." in replayed["content"]

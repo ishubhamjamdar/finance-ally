@@ -79,33 +79,42 @@ def temp_db(tmp_path, monkeypatch):
     return TempDb(path)
 
 
+#: Every environment variable the application reads, except `DB_PATH`, which
+#: `temp_db` sets to a throwaway file of its own.
+#:
+#: All of them are cleared for every test. From Checkpoint 4 on, `app.main`
+#: loads the repo's `.env` at *import*, and an import-time mutation of
+#: `os.environ` is not something `monkeypatch` can undo — so without this a
+#: developer with `SIM_UPDATE_INTERVAL` or `MASSIVE_POLL_INTERVAL` in their
+#: `.env` would run a quietly different suite from CI, and find out at review
+#: time. The list is exhaustive on purpose: a new variable that is not added
+#: here is one whose value the suite inherits from whoever is running it.
+_APP_ENV_VARS = (
+    "LLM_MOCK",
+    "LOG_LEVEL",
+    "MASSIVE_API_KEY",
+    "MASSIVE_POLL_INTERVAL",
+    "OPENROUTER_API_KEY",
+    "SIM_EVENT_PROBABILITY",
+    "SIM_UPDATE_INTERVAL",
+    "STATIC_DIR",
+)
+
+
 @pytest.fixture(autouse=True)
-def no_massive_key(monkeypatch):
-    """Force the simulator, whatever the developer has in their environment.
+def clean_environment(monkeypatch):
+    """Run every test against defaults, whatever is in the shell or in `.env`.
 
-    A real MASSIVE_API_KEY in the shell would otherwise send the app tests over
-    the network on every run.
+    Clearing `MASSIVE_API_KEY` forces the simulator — a real key would send the
+    app tests over the network on every run. Clearing `OPENROUTER_API_KEY` and
+    `LLM_MOCK` together makes an unmocked LLM call *impossible* rather than
+    merely unlikely: with neither set, `complete()` raises
+    `LLMUnavailableError` before it can open a socket, so a test that reached it
+    by accident fails loudly instead of spending money. A test that wants the
+    mock opts in through the `mock_llm` fixture.
     """
-    monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
-
-
-@pytest.fixture(autouse=True)
-def no_llm_network(monkeypatch):
-    """Make an unmocked LLM call impossible, not merely unlikely.
-
-    `app.main` loads the repo's `.env` at import (PLAN.md §5), so from
-    Checkpoint 4 on, a real `OPENROUTER_API_KEY` is in `os.environ` for the
-    whole suite. Without this, a test that reached `complete()` by accident
-    would spend money and take seconds, and would pass or fail depending on
-    whose laptop it ran on.
-
-    Both variables are cleared rather than `LLM_MOCK` being set: with no key
-    and no mock, `complete()` raises `LLMUnavailableError` before it can open a
-    socket. A test that wants the mock opts into it explicitly, so no test is
-    silently exercising a path it did not choose.
-    """
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.delenv("LLM_MOCK", raising=False)
+    for name in _APP_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture

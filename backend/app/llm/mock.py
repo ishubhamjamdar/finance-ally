@@ -35,43 +35,97 @@ _WATCHLIST_PATTERN = re.compile(
 
 _ACTION_FOR_VERB = {"add": "add", "watch": "add", "remove": "remove", "unwatch": "remove"}
 
-#: Words the watchlist pattern would otherwise take for a ticker in ordinary
-#: phrasing — "add some cash", "remove it". A mock that opened a position in
-#: `SOME` would fail an E2E test for a reason having nothing to do with the
-#: code under test.
+#: Words that sit where a ticker sits in ordinary phrasing, and are therefore
+#: not tickers: "add some cash", "watch for a dip", "buy 3 shares".
+#:
+#: Applied to **both** patterns, which is the fix for two ways the mock used to
+#: invent symbols. "buy 3 shares" matched with `shares` as the ticker, because
+#: the `shares? of` group is optional and nothing followed it. "watch for a dip
+#: before you buy 2 NVDA" added `FOR` to the watchlist — and that one was not
+#: cosmetic, because `SimulatorDataSource.add_ticker` invents a price for any
+#: symbol at all, so the junk row then streamed for the life of the process.
+#:
+#: A stop list is not a parser and does not pretend to be. It is the smallest
+#: thing that keeps the Checkpoint 9 E2E suite asserting on the code under test
+#: rather than on this file's grammar.
 _NOT_TICKERS = frozenset(
     {
         "a",
+        "about",
+        "after",
         "all",
         "an",
         "and",
         "any",
+        "anything",
+        "as",
+        "at",
+        "back",
+        "before",
+        "both",
+        "but",
+        "by",
+        "cash",
+        "closely",
+        "down",
         "everything",
-        "his",
+        "for",
+        "from",
+        "half",
         "her",
+        "his",
+        "if",
         "in",
+        "into",
+        "is",
         "it",
         "its",
+        "later",
         "me",
         "more",
+        "most",
         "my",
+        "now",
+        "of",
+        "off",
+        "on",
         "one",
+        "only",
+        "or",
         "our",
+        "out",
+        "over",
+        "please",
+        "share",
+        "shares",
+        "so",
         "some",
+        "soon",
+        "thanks",
         "that",
         "the",
         "their",
         "them",
+        "then",
         "these",
         "they",
         "this",
         "those",
         "to",
+        "today",
+        "tomorrow",
         "up",
         "us",
+        "when",
+        "with",
+        "worth",
         "your",
     }
 )
+
+
+def _is_ticker(candidate: str) -> bool:
+    return candidate.lower() not in _NOT_TICKERS
 
 
 def mock_completion(messages: list[dict[str, str]]) -> str:
@@ -105,6 +159,7 @@ def _extract_trades(text: str) -> list[dict]:
             "quantity": float(match.group("quantity")),
         }
         for match in _TRADE_PATTERN.finditer(text)
+        if _is_ticker(match.group("ticker"))
     ]
 
 
@@ -120,7 +175,7 @@ def _extract_watchlist_changes(text: str, exclude: set[str]) -> list[dict]:
 
     for match in _WATCHLIST_PATTERN.finditer(text):
         ticker = match.group("ticker").upper()
-        if ticker.lower() in _NOT_TICKERS or ticker in exclude or ticker in seen:
+        if not _is_ticker(ticker) or ticker in exclude or ticker in seen:
             continue
         seen.add(ticker)
         changes.append({"ticker": ticker, "action": _ACTION_FOR_VERB[match.group("verb").lower()]})
