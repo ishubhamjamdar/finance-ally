@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.db import connect, list_watchlist
+from app.db import add_watchlist_entry, connect, list_watchlist, transaction
 from app.watchlist import (
     MAX_WATCHLIST_SIZE,
     MarketSourceUnavailableError,
@@ -215,24 +215,34 @@ class TestSizeCap:
 
         assert (await add(source, "PYPL")).ticker == "PYPL"
 
-    async def test_a_compensating_restore_is_not_refused_by_the_cap(self, price_cache):
+    async def test_a_compensating_restore_survives_a_concurrent_refill(self, price_cache):
         """`remove` puts the row back when the source refuses. Enforcing the cap
-        on that restore would let a concurrent add turn a source failure into
-        "the watchlist is full", replacing the real reason and leaving the row
-        deleted after all."""
+        on that restore turns a source failure into "the watchlist is full" —
+        the wrong error — and leaves the row deleted after all, which is a
+        compensating action losing the very thing it was compensating for.
+
+        The refill is what makes this reachable, and is why the obvious version
+        of this test was worthless: `remove` deletes before it restores, so on
+        its own the restore only ever returns the list to the cap and never
+        past it. Something else has to take the freed slot in between. That is
+        exactly the window the review raised, and mutation testing is what
+        showed the first version of this test could not fail.
+        """
         source = RecordingSource(price_cache, tickers=list(PLAN_DEFAULT_WATCHLIST))
         await self.fill_to_cap(source)
 
-        async def refuse(ticker):
+        async def take_the_slot_then_fail(ticker):
+            with transaction() as conn:
+                add_watchlist_entry(conn, "TAKEN")
             raise RuntimeError("source is down")
 
-        source.remove_ticker = refuse
+        source.remove_ticker = take_the_slot_then_fail
 
         with pytest.raises(MarketSourceUnavailableError):
             await remove(source, "AAPL")
 
         assert "AAPL" in stored()
-        assert len(stored()) == MAX_WATCHLIST_SIZE
+        assert len(stored()) == MAX_WATCHLIST_SIZE + 1
 
     async def test_the_last_slot_is_usable(self, source):
         """Off-by-one guard: the cap is the number of tickers allowed, not the
