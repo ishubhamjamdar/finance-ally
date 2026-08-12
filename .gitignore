@@ -14,8 +14,18 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Anchored to the repo root, unlike the rest of this block.
+#
+# These patterns come from GitHub's Python template and are unanchored, so
+# `lib/` matches a directory named `lib` at *any* depth. That silently excluded
+# `frontend/src/lib/` — six source files, none of them committed, and a clean
+# clone that could not build, typecheck or test. It passed every local check
+# because the files were sitting untracked on disk.
+#
+# `test/smoke_frontend.sh` now fails if anything under `frontend/src` is
+# ignored, so the next one of these is loud.
+/lib/
+/lib64/
 parts/
 sdist/
 var/

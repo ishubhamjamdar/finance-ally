@@ -2,6 +2,7 @@
 
 import json
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -100,6 +101,16 @@ _APP_ENV_VARS = (
     "STATIC_DIR",
 )
 
+#: What `STATIC_DIR` is pinned to for the suite. It must not exist.
+#:
+#: Deleting the variable is *not* neutral for this one: its default is a
+#: filesystem search that ends at `frontend/out`, so from Checkpoint 5 on, a
+#: developer who has run `npm run build` gets `StaticFiles` mounted at "/" and
+#: a materially different app — one where every unmatched `/api/*` path is
+#: answered by the static handler instead of by FastAPI. That is a 405 rather
+#: than a 404 for a method it does not serve, and it failed a real test.
+_NO_STATIC_BUILD = Path(__file__).parent / "no-frontend-build"
+
 
 @pytest.fixture(autouse=True)
 def clean_environment(monkeypatch):
@@ -112,9 +123,13 @@ def clean_environment(monkeypatch):
     `LLMUnavailableError` before it can open a socket, so a test that reached it
     by accident fails loudly instead of spending money. A test that wants the
     mock opts in through the `mock_llm` fixture.
+
+    `STATIC_DIR` is pinned rather than cleared — see `_NO_STATIC_BUILD`. Tests
+    that want the frontend mounted set it to a `tmp_path` of their own.
     """
     for name in _APP_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("STATIC_DIR", str(_NO_STATIC_BUILD))
 
 
 @pytest.fixture

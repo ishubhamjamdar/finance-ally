@@ -1,0 +1,90 @@
+@import "tailwindcss";
+
+/* PLAN.md §2 — the terminal palette. Backgrounds near #0d1117, muted grey
+   borders, no pure black, and the three brand colours verbatim.
+
+   Tailwind v4 generates a utility for every token here: `--color-panel`
+   becomes `bg-panel` / `text-panel` / `border-panel`. Add a colour here rather
+   than writing a hex literal in a component. */
+@theme {
+  --color-terminal: #0d1117;
+  --color-panel: #12161f;
+  --color-raised: #171d28;
+  --color-edge: #232b38;
+  --color-grid: #1b2230;
+
+  --color-ink: #e6edf3;
+  --color-muted: #8b98a9;
+  --color-faint: #5c6875;
+
+  --color-accent: #ecad0a;
+  --color-brand: #209dd7;
+  --color-submit: #753991;
+
+  --color-up: #26d07c;
+  --color-down: #f0616d;
+
+  /* No webfont: `next/font/google` fetches at build time, which would put a
+     network dependency inside Checkpoint 8's `docker build`. A system stack
+     also has no swap flash and no layout shift, and every platform's default
+     monospace already has the tabular figures a price grid wants. */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+html {
+  background-color: var(--color-terminal);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  /* Prices are read as columns of digits. Proportional figures make them
+     jitter every tick. */
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- price flash (PLAN.md §2) -------------------------------------------
+
+   A background highlight that fades out, not one that sticks. The class is
+   applied by `usePriceFlash` on a change and removed when the animation is
+   over; the element also carries a `key` that changes per tick, so two moves
+   inside one animation window restart it rather than being swallowed. */
+
+@keyframes flash-up {
+  from {
+    background-color: color-mix(in srgb, var(--color-up) 30%, transparent);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+@keyframes flash-down {
+  from {
+    background-color: color-mix(in srgb, var(--color-down) 30%, transparent);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+.flash-up {
+  animation: flash-up 500ms ease-out;
+}
+
+.flash-down {
+  animation: flash-down 500ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flash-up,
+  .flash-down {
+    animation: none;
+  }
+}
+
+/* Scrollbars that belong to the palette rather than the operating system. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-edge) transparent;
+}

@@ -135,6 +135,11 @@ LLM_MOCK=false
 DB_PATH=            # SQLite file. Default <repo>/db/finally.db; the container sets /app/db/finally.db
 STATIC_DIR=         # Built frontend. Default backend/static, then frontend/out
 LOG_LEVEL=INFO
+
+# Frontend, build-time only. Empty in production: the export and the API share
+# an origin. Set it for `next dev`, which serves the UI on :3000 while the API
+# is on :8000 — `output: 'export'` ignores rewrites, so there is no dev proxy.
+NEXT_PUBLIC_API_BASE=   # e.g. http://localhost:8000
 ```
 
 ### Behavior
@@ -145,6 +150,8 @@ LOG_LEVEL=INFO
 - The backend reads `.env` from the project root (mounted into the container or read via docker `--env-file`)
 - `DB_PATH`, `STATIC_DIR` and `LOG_LEVEL` are read at call time, not at import, and every one of
   them has a working default — a `.env` with only `OPENROUTER_API_KEY` runs the whole app
+- `NEXT_PUBLIC_API_BASE` is the one variable the *frontend* reads, and it is **inlined into the
+  bundle at build time** rather than read at runtime. Nothing secret may ever go in it
 
 ---
 
@@ -421,6 +428,14 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 - **Trade bar** — simple input area: ticker field, quantity field, buy button, sell button. Market orders, instant fill.
 - **AI chat panel** — docked/collapsible sidebar. Message input, scrolling conversation history, loading indicator while waiting for LLM response. Trade executions and watchlist changes shown inline as confirmations.
 - **Header** — portfolio total value (updating live), connection status indicator, cash balance
+- **Feed panel** — frames received, time of the last update, tickers priced, and the notable moves
+  the SSE `event: shock` frames carry. Added at Checkpoint 5: it is what distinguishes a quiet
+  market from a dead connection, and until then nothing consumed those frames
+
+**One `EventSource` per page.** `usePriceStream` opens a connection per call, so `TerminalProvider`
+is its only caller and every panel reads prices through `useMarket()`. A component that opens its
+own stream costs the backend a second copy of every frame, and nothing looks wrong until the count
+is high.
 
 ### Technical Notes
 
@@ -658,7 +673,7 @@ row to ⛔, write a log entry describing how far it got and what blocked it, and
 | 2 | Backend skeleton + database | 1 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #5) |
 | 3 | Portfolio & watchlist API | 2 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #6) |
 | 4 | LLM chat integration | 3 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #7) |
-| 5 | Frontend scaffold + live prices | 2 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 5 | Frontend scaffold + live prices | 2 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #8) |
 | 6 | Charts, portfolio visualisation, trade bar | 3, 5 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 7 | Chat panel | 4, 6 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 8 | Docker packaging + start/stop scripts | 7 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
@@ -928,552 +943,491 @@ item must be resolved or restated in a later entry — it does not expire by bei
 
 #### Entries
 
+Entries 1–4 were condensed on 2026-08-12. No fact was dropped — every exit criterion, review
+finding, divergence and carried-forward item survives; the narrative retellings were cut.
+
 #### Checkpoint 1 — Market data hardening
 
-- **Closed:** 2026-08-09 · branch `checkpoint-1-market-data-hardening` · PR #4, squash-merged to
-  `main` · all three gates passed. The automated review workflow ran on each push and raised nothing
-  ("No buffered inline comments" on every run)
-- **Built:** all 17 changes from `MARKET_DATA_DESIGN.md` §17, across `backend/app/market/`
-  - `models.py` — `normalize_ticker()`, `previous_close` + `day_change`/`day_change_percent` on
-    `PriceUpdate`, new `MarketEvent`
-  - `events.py` — **new**: `EventLog`, a bounded ring buffer with per-client cursors
-  - `cache.py` — normalisation at every entry point, sticky `previous_close`, `is None` timestamp
-    check, `version` read under the lock
-  - `interface.py` — `PermanentMarketDataError`
-  - `simulator.py` — injected RNGs, log-space shocks, `event_probability` 0.001 → 2e-5,
-    session-open baseline, `drain_events()`, Cholesky `LinAlgError` degradation
-  - `massive_client.py` — the `extract_price`/`extract_timestamp`/`extract_previous_close` ladder,
-    permanent-vs-transient classification, 5 s timeouts, `get_market_status()` polling
-  - `factory.py` — `start_market_data()` with fail-fast-then-fallback, `MASSIVE_POLL_INTERVAL` /
-    `SIM_UPDATE_INTERVAL` / `SIM_EVENT_PROBABILITY`
-  - `stream.py` — router built inside the factory, heartbeat comments, `event: shock` and
-    `event: status` frames
-- **Exit criteria:**
-  - *Massive fixture test fails if the ladder is reverted* — **verified by mutation.** Restoring
-    `snap.last_trade.timestamp / 1000.0` fails 16 tests; the previous `MagicMock` suite passed that
-    same mutation. Two further mutations run: removing the Cholesky multiply fails 2 correlation
-    tests; switching shocks back to `*= (1 ± m)` fails 2 shock tests
-  - *Contract tests pass for both sources* — `test_source_contract.py`, 7 tests × 2 sources
-  - *Invalid key yields a running simulator* — `test_falls_back_on_permanent_failure`, plus
-    `test_falls_back_when_authenticated_but_no_prices` for the Basic-plan case
-  - *Realised volatility within a factor of two of `TICKER_PARAMS`* — measured over a full
-    46,800-tick session per ticker, shocks disabled: every ticker lands at **1.00–1.07×** its
-    configured sigma (AAPL 0.230 vs 0.22, TSLA 0.501 vs 0.50, JPM 0.193 vs 0.18)
-  - *Suite green, coverage ≥ 85% on `app/market/`* — **228 passed, 100%**
-- **Tests:** 73 → **228** (+155). Three consecutive full runs green after every pass, no flakes.
-  `ruff check` and `ruff format --check` clean. Coverage 84% → **100%** on `app/market/`, every
-  module at 100%. Runtime 6.5 s → **2.0 s**, with no network access at all
+- **Closed:** 2026-08-09 · branch `checkpoint-1-market-data-hardening` · PR #4 · all gates passed;
+  the review workflow raised nothing on any push
+- **Built:** all 17 changes from `MARKET_DATA_DESIGN.md` §17 across `backend/app/market/` —
+  `models.py` (`normalize_ticker`, `previous_close`/`day_change*`, `MarketEvent`) · `events.py`
+  (**new** `EventLog`, bounded ring buffer with per-client cursors) · `cache.py` (normalisation at
+  every entry, sticky `previous_close`) · `interface.py` (`PermanentMarketDataError`, plus
+  `market_status` and `on_permanent_failure` on the ABC) · `simulator.py` (injected RNGs, log-space
+  shocks, `event_probability` 2e-5, session-open baseline, `drain_events()`) · `massive_client.py`
+  (the `extract_price`/`extract_timestamp`/`extract_previous_close` ladder,
+  permanent-vs-transient classification, 5 s timeouts) · `factory.py` (`start_market_data()`,
+  fail-fast-then-fallback; `MASSIVE_POLL_INTERVAL` / `SIM_UPDATE_INTERVAL` /
+  `SIM_EVENT_PROBABILITY`) · `stream.py` (heartbeats, `event: shock`, `event: status`)
+- **Exit criteria:** all met
+  - Fixture test fails if the ladder is reverted — mutation-verified: restoring
+    `snap.last_trade.timestamp / 1000.0` fails 16 tests, which the old `MagicMock` suite passed
+  - `test_source_contract.py` — 7 tests × 2 sources
+  - Invalid key yields a running simulator, plus the authenticated-but-no-prices case
+  - Realised volatility over a full 46,800-tick session, shocks off: every ticker **1.00–1.07×** its
+    configured sigma (AAPL 0.230/0.22, TSLA 0.501/0.50, JPM 0.193/0.18) — target was within 2×
+  - **228 passed, 100%** on `app/market/` (target ≥ 85%)
+- **Tests:** 73 → **228**. Three consecutive green runs, lint clean. Coverage 84% → **100%**.
+  Runtime 6.5 s → **2.0 s**, zero network. Two of my own tests were wrong and were rewritten — one
+  derived the shock magnitude from its own result, one hung instead of failing; mutation testing
+  caught both
+- **Review:** `/code-review high` — **8 findings, 7 fixed, 1 deferred**
+  1. `is_permanent_failure` matched the raw body: real Polygon bodies missed, a hex `request_id`
+     could false-positive → parses `status`/`message`/`error` and matches real wording
+  2. `on_permanent_failure` accepted but never wired → **deferred to CP2**, where the lifespan
+     exists; carried forward below
+  3. Unguarded `status_provider()` raised `AttributeError` under the simulator, aborting the SSE
+     response and looping `EventSource` → guarded, in code and in the documented snippet
+  4. `_poll_loop` caught only `PermanentMarketDataError`; anything else killed the poller for the
+     process lifetime → catch-all plus per-snapshot guarding
+  5. `len(price_cache) == 0` passes vacuously on a shared cache → checks the requested tickers and
+     names the missing ones
+  6. Fallback simulator ignored the `SIM_*` env vars → one `_create_simulator` helper
+  7. `MASSIVE_POLL_INTERVAL=` crashed startup → `_env_float`
+  8. `update_interval` not propagated to `dt`, silently mis-scaling volatility → derived from the
+     tick rate
 
-  One test of mine was itself wrong and was rewritten: the first log-space-shock test derived the
-  magnitude from the result and inverted it, so it passed under `*= (1 ± m)` too. Mutation testing
-  is what caught it. A second used `"401"` as an error body — which the corrected classifier rightly
-  treats as transient — and hung the suite rather than failing; the permanent-failure loop tests now
-  use real bodies and `asyncio.wait_for`, so a regression fails instead of hanging
-- **Review:** `/code-review high` returned 8 findings — **7 fixed, 1 deferred with reason.**
-
-  | # | Finding | Disposition |
-  |---|---|---|
-  | 1 | `is_permanent_failure` classified on the raw body, so `"401"`/`"403"` could never match a real Polygon body (false negative on a dead key) while a random hex `request_id` could match one (false positive on a 429) | **Fixed.** The SDK raises `BadResponse(resp.data.decode())` and discards `resp.status` — verified in `massive/rest/base.py` — so the HTTP code is genuinely unavailable. Now parses the body's `status`/`message`/`error` fields and matches on real wording (`Unknown API Key`, `NOT_AUTHORIZED`); `AuthError` is permanent. Test bodies replaced with real ones |
-  | 2 | `on_permanent_failure` accepted but never wired, so mid-run failover doesn't happen | **Deferred to Checkpoint 2.** `MARKET_DATA_DESIGN.md` §11 specifies it is wired in the lifespan (§13), which does not exist until Checkpoint 2. Already listed under Carried forward |
-  | 3 | `status_provider()` unguarded, and the wiring documented in `backend/CLAUDE.md` raises `AttributeError` under the default simulator — escaping the generator, aborting the response, and putting `EventSource` into an infinite reconnect loop | **Fixed** in both places: guarded in `stream.py`, and the documented snippet now uses `getattr(source, "market_status", None)` |
-  | 4 | `_poll_loop` handled only `PermanentMarketDataError`; anything else silently killed the poller for the life of the process | **Fixed.** Catch-all in the loop, plus per-snapshot guarding in `_poll_once` so one malformed entry costs one ticker for one poll |
-  | 5 | Usability check was `len(price_cache) == 0`, which passes vacuously on a shared cache and accepts 1-of-10 tickers priced | **Fixed.** Checks the requested tickers specifically; warns and names the missing ones on partial coverage rather than forcing a fallback |
-  | 6 | Fallback simulator ignored `SIM_UPDATE_INTERVAL` / `SIM_EVENT_PROBABILITY` | **Fixed.** Both paths go through one `_create_simulator` helper |
-  | 7 | Bare `float(os.environ.get(...))` crashed startup on `MASSIVE_POLL_INTERVAL=` | **Fixed.** `_env_float` falls back to the default with a warning |
-  | 8 | `update_interval` not propagated to `dt`, so `SIM_UPDATE_INTERVAL` silently mis-scaled volatility | **Fixed.** `dt` is derived from the tick rate, so `sigma` stays annualised at any interval |
-
-  Fixes verified by mutation in both directions: restoring whole-body matching fails the
-  `request_id` test; restoring the original marker list fails 3 tests including a real 401 body.
-  `/security-review` not run — optional for this checkpoint per the gate definition.
-
-  `/simplify` (4 agents) then found one thing that mattered and several that tightened the design:
-
-  - **The `[massive]` contract tests were making real HTTPS calls to `api.massive.com`.** Stubbing
-    the instance was never enough — `start()` overwrites `_client` with a real `RESTClient` and then
-    polls market status. Seven round trips, ~4.5 s of a 6.4 s suite, and the tests failed offline.
-    Now patched at the class level: **suite 6.5 s → 2.0 s, zero network access**
-  - `market_status` and `on_permanent_failure` moved onto the `MarketDataSource` ABC. Consumers stop
-    needing `getattr`, the SSE guard stops being load-bearing, and Checkpoint 2's lifespan will not
-    have to reach into a private attribute to wire failover
-  - `EventLog.__len__` deleted — no production caller, and its only legacy was the falsy-empty-log
-    trap that had already caused one silent bug plus three documented workarounds
-  - `start_market_data` now starts and verifies every source identically; `isinstance` guards only
-    the recursion. Tuning defaults have one owner each; test builders and real error bodies moved to
-    `conftest.py`; `extract_price` reuses `extract_previous_close`
-  - The ABC's `start()` docstring promised "populate the cache or raise", which `MassiveDataSource`
-    does not honour — which is exactly why the factory re-verifies. Corrected to match reality
-
-  Skipped, with reasons: hoisting the duplicated `stop()` into the ABC (§7 deliberately chose
-  contract over inheritance); deleting `_classifiable_text` (it keeps classification off the opaque
-  `request_id` by construction, rather than by luck about which markers happen to be hex);
-  parametrising the seven pre-existing factory tests (outside this diff).
-- **Diverged from plan:** one deliberate divergence. §16.4 specified SSE tests driven through
-  `httpx.ASGITransport`; that cannot work, because the SSE generator is infinite by design and
-  ASGITransport never delivers an `http.disconnect`, so `request.is_disconnected()` stays False and
-  closing the response hangs forever (verified — it blocks before the first frame). `test_stream.py`
-  instead drives `_generate_events` directly with a stub request that disconnects after N ticks, and
-  asserts the HTTP wiring off the router. Deterministic, no sleeps, and it reaches 97% on a module
-  that had none. §16.4 of the design doc has been corrected to match
-- **Closing pass (2026-08-09, same branch):** the three loose ends that were CP1's own rather than
-  CP2's were closed before merge, taking `app/market/` to **100%** coverage:
-  - The two uncovered lines are now tested, and both tests were **mutation-verified**. Removing the
-    `CancelledError` handler fails the two new stream tests. The `_refresh_market_status` guard
-    needed the stronger assertion: a plain "does not raise" test *survived* removing the guard,
-    because the catch-all below swallows the resulting `AttributeError`. It now asserts the silence
-    — no "Market status unavailable" log — and that kills the mutation. Note the log entry above
-    misdescribed this line as "the `get_market_status` success path"; it is the `self._client is
-    None` early return, which is reached when `_poll_loop` refreshes status before `start()`
-  - `market_data_demo.py` now consumes `EventLog` instead of its own `abs(change_percent) > 1.0`
-    heuristic. That heuristic was effectively dead: tick-over-tick change at 500 ms is ~0.02%, so
-    the panel never populated. The demo also raises `event_probability` to `2.5e-3` — at the 2e-5
-    production default a 60-second run expects 0.02 shocks. Measured over 30 seeded runs the demo
-    now averages **3.2 shocks per run** (min 0, max 6)
-  - `httpx` is **kept, not dropped**: starlette's `TestClient` requires it, and Checkpoint 2 needs
-    that for `GET /api/health`. Its `pyproject.toml` comment, which still claimed it was for the
-    SSE integration tests, has been corrected
+  `/security-review` not run (optional here). `/simplify` found one thing that mattered — **the
+  `[massive]` contract tests were making real HTTPS calls**, since `start()` overwrites `_client`;
+  patched at class level, 6.5 s → 2.0 s — plus: `market_status`/`on_permanent_failure` onto the ABC,
+  `EventLog.__len__` deleted, one owner per tuning default, the ABC's over-promising `start()`
+  docstring corrected
+- **Diverged from plan:** one. §16.4's `httpx.ASGITransport` SSE tests cannot work — the generator
+  is infinite and ASGITransport never delivers `http.disconnect`, so closing the response hangs.
+  `test_stream.py` drives `_generate_events` with a stub request that disconnects after N ticks.
+  §16.4 corrected
+- **Closing pass (same branch):** last two uncovered lines tested and mutation-verified — the
+  `_refresh_market_status` guard needed an assertion on *silence*, since the catch-all below
+  swallows the `AttributeError` a "does not raise" test allows. `market_data_demo.py` now consumes
+  `EventLog` instead of a dead `abs(change_percent) > 1.0` heuristic. `httpx` kept: `TestClient`
+  needs it
 - **Carried forward:**
-  - `on_permanent_failure` is now a public attribute on the `MarketDataSource` ABC and is
-    unit-tested, but nothing assigns it yet — Checkpoint 2's lifespan must, so mid-run failover
-    reassigns the active source. **This is review finding #2, deferred rather than resolved; it must
-    not be lost**
-  - `status_provider` can now be wired as plain `lambda: source.market_status` — `market_status` is
-    on the ABC, so the old `getattr` workaround is no longer needed
-  - `EventLog` is threaded through simulator → factory → stream, and `market_data_demo.py` now
-    constructs one, but no *server* consumer does; Checkpoint 2 must create it in the lifespan and
-    pass it to both the source and the stream router
-  - `app/market/` is at 100% line coverage. That is a floor to hold, not a target reached: it says
-    every line runs, not that every line is pinned. Two of the newest tests only became meaningful
-    once mutation testing showed the obvious version passing against broken code
+  - `on_permanent_failure` is public and tested but nothing assigns it — **CP2's lifespan must**
+    (review finding #2, deferred not resolved)
+  - `status_provider` can now be `lambda: source.market_status`
+  - `EventLog` reaches simulator → factory → stream but no *server* consumer builds one; CP2 must
+    create it in the lifespan and pass it to both
+  - 100% on `app/market/` is a floor, not a target reached: two of the newest tests only became
+    meaningful once mutation testing showed the obvious version passing against broken code
 
 #### Checkpoint 2 — Backend skeleton + database
 
-- **Closed:** 2026-08-09 · branch `checkpoint-2-backend-skeleton-db` · PR #5 · all three gates
-  passed
-- **Built:**
-  - `app/main.py` — `create_app()` factory (own `PriceCache` + `EventLog` per instance), lifespan
-    that loads tracked tickers from the database, starts the feed, wires failover, and stops on
-    shutdown; static mount tolerating an absent frontend build
-  - `app/db/schema.sql` — the six §7 tables plus three `(user_id, time)` indexes
-  - `app/db/database.py` — `connect()`, `transaction()`, race-safe lazy init, seeding,
-    `load_tracked_tickers()`
-  - `app/api/health.py` — `GET /api/health`, probing the database for real
-  - `app/paths.py` — **new**: one owner for `BACKEND_DIR` / `REPO_ROOT` / `is_source_checkout()`
-  - `app/market/` additions: `DEFAULT_TICKERS` (derived from `SEED_PRICES`), public
-    `create_simulator_source()`, `MassiveDataSource._teardown()`, and the `on_permanent_failure`
-    contract on the ABC
-- **Exit criteria:** all four met, verified by running them against a live server, twice — once at
-  Gate 1 and again after the review and simplify passes
-  - *`uvicorn app.main:app` starts, `GET /api/health` → 200* — 200, reporting
-    `SimulatorDataSource`, 10 tickers
-  - *Deleting `db/finally.db` and issuing any request recreates it, twice in a row* — both passes:
-    6 tables, profile at $10,000, 10 watchlist rows. Also covered at both layers in the suite
-  - *SSE emits price frames within two seconds and a heartbeat when idle* — 4 frames in 2 s; the
-    `: keep-alive` needs a genuinely idle cache, so it was observed with `SIM_UPDATE_INTERVAL=600`
-  - *Seeded watchlist == the tickers the source was started with* — database, stream and
-    `/api/health` all agree on the same ten
-- **Tests:** 228 → **295** (+67). Three consecutive full runs green. Coverage 100% → **100%** on
-  `app/`, every module at 100%, `app/market/`'s CP1 floor held
-- **Review:** `/code-review high` returned **6 findings, all 6 fixed.** Two were HIGH and
-  compounding — the second is why the first survived Gate 1:
+- **Closed:** 2026-08-09 · branch `checkpoint-2-backend-skeleton-db` · PR #5 · all gates passed
+- **Built:** `app/main.py` (`create_app()` with its own `PriceCache` + `EventLog`; lifespan loads
+  tracked tickers, starts the feed, wires failover, stops on shutdown; static mount tolerating an
+  absent build) · `app/db/schema.sql` (the six §7 tables + three `(user_id, time)` indexes) ·
+  `app/db/database.py` (`connect()`, `transaction()`, race-safe lazy init, seeding,
+  `load_tracked_tickers()`) · `app/api/health.py` (probes the database for real) · `app/paths.py`
+  (**new** — one owner for `BACKEND_DIR` / `REPO_ROOT` / `is_source_checkout()`) · `app/market/`:
+  `DEFAULT_TICKERS`, public `create_simulator_source()`, `MassiveDataSource._teardown()`
+- **Exit criteria:** all four met against a live server, twice — at Gate 1 and after the review
+  - `GET /api/health` → **200**, reporting `SimulatorDataSource`, 10 tickers
+  - Deleting `db/finally.db` and issuing any request recreates it, **twice in a row**: 6 tables,
+    profile at $10,000, 10 watchlist rows; also covered at both layers in the suite
+  - SSE: 4 price frames in 2 s; `: keep-alive` observed with `SIM_UPDATE_INTERVAL=600`, since the
+    heartbeat needs a genuinely idle cache
+  - Database, stream and `/api/health` agree on the same ten seeded tickers
+- **Tests:** 228 → **295**. Three consecutive green runs. Coverage **100%** on `app/`, holding CP1's
+  floor
+- **Review:** `/code-review high` — **6 findings, all fixed.** The first two were HIGH and
+  compounding
+  1. Lazy init was not atomic: `executescript()` implicitly COMMITs a pending transaction, so
+     `BEGIN IMMEDIATE` committed before the schema ran and `rollback()` rolled back nothing. A
+     failed seed left six empty tables whose *presence* was the "initialised" test → the app ran
+     forever with no cash balance. Fixed twice over: the schema is split with
+     `sqlite3.complete_statement` and run inside the transaction, and `_is_initialized` requires the
+     seeded profile row, so such a database repairs itself
+  2. The test for #1 was vacuous — `monkeypatch.undo()` also reverted the autouse `DB_PATH` fixture,
+     so it asserted against the developer's real database → `MonkeyPatch.context()`, and it now
+     asserts `DB_PATH` survived
+  3. The health probe discarded its result, so an unseeded database reported "ok" → fixed at the
+     root in #1; the shallow duplicate deleted during `/simplify`
+  4. `load_tracked_tickers` normalised *after* the `UNION`, so `aapl` and `AAPL` both survived —
+     one ticker priced and sent twice per Massive request → dedupe after normalising
+  5. A failure inside the failover handler escaped into the dying source's task, surfacing only as
+     "Task exception was never retrieved" while `/api/health` reported the dead source as live →
+     caught, logged, slot cleared, callback assigned to the replacement
+  6. Shutdown read `app.state.market_source` once, so a failover mid-shutdown left a simulator
+     ticking on → a `shutting_down` flag that closes the window rather than draining it
 
-  | # | Finding | Disposition |
-  |---|---|---|
-  | 1 | Lazy init was not atomic. `executescript()` issues an implicit COMMIT when a transaction is pending, so `BEGIN IMMEDIATE` was committed before the schema ran and `rollback()` rolled back nothing. A failed seed left six empty tables — and since their presence *was* the "initialised" test, every later connection skipped init and the app ran forever with no cash balance | **Fixed**, two ways. The schema is split with `sqlite3.complete_statement` and executed inside the transaction; and `_is_initialized` now requires the seeded profile row, so a database in that state repairs itself |
-  | 2 | The test for #1 was vacuous: `monkeypatch.undo()` also reverted the autouse `DB_PATH` fixture, so its assertions ran against the developer's real, fully seeded database. Verified — running it alone recreated `db/finally.db` in a clean repo | **Fixed.** The `_seed` patch uses its own `MonkeyPatch.context()`, and the test asserts `DB_PATH` survived |
-  | 3 | The health probe discarded its result; `SELECT 1 … LIMIT 1` returns `None` on an empty table without error, so an unseeded database reported "ok" | **Fixed at the root** in #1, and the shallow duplicate then removed during `/simplify` — see below |
-  | 4 | `load_tracked_tickers` normalised *after* the `UNION`, so `aapl` and `AAPL` both survived and both became `AAPL`: one ticker priced twice and sent twice in every Massive request | **Fixed.** Deduplicated after normalising, and `UNION ALL` since SQL's dedupe was doing nothing useful |
-  | 5 | A failure inside the failover handler escaped into an `except` block in the dying source's task, surfacing only as "Task exception was never retrieved" while `/api/health` kept reporting the dead source as live | **Fixed.** Caught, logged, slot cleared; the callback is also assigned to the replacement |
-  | 6 | Shutdown read `app.state.market_source` once, so a failover completing mid-shutdown left a simulator ticking past shutdown; the failed source's `RESTClient` was never released | **Fixed**, later deepened by `/simplify` into a `shutting_down` flag that closes the window rather than draining it |
-
-  `/security-review` not run — optional for this checkpoint per the gate definition. Every fix was
-  mutation-verified: reverting any one of the seven changes fails the test written for it and
-  nothing else. Gate 1 was then re-run in full.
-
-  `/simplify` (4 agents) found the efficiency angle clean and the other three not:
-
-  - **The invariant moved to the layer that owns it.** "Never stop the source that just failed" was
-    a rule the *app* had to know, because the callback runs inside that source's own task.
-    `MassiveDataSource` now tears down before awaiting the callback, and the ABC states that
-    handlers may call `stop()`. The app does the obvious thing again
-  - **The shutdown/failover race is closed, not absorbed** — a `shutting_down` flag means no
-    failover can install a replacement once shutdown has begun
-  - **`app/paths.py`** — the database default and the static search path stopped counting
-    `parents[N]` independently, and `frontend/out` is only guessed at inside a source checkout
-  - **The health endpoint's unseeded-database branch was deleted.** It was review finding #3's
-    shallow form, living in a router, and unreachable except through a stub once #1 fixed the root
-  - Test duplication consolidated into `tests/conftest.py`: the ten-ticker literal, `add_position`,
-    the five-times-repeated failover stub, and the delete-the-database glob
-  - Efficiency measured rather than assumed: `connect()` costs ~500 µs, not the "microseconds" the
-    docstring claimed — most of it WAL sidecar setup, since no connection is held open. The claim
-    is corrected in `database.py` and `CLAUDE.md`, with the threshold that matters spelled out:
-    fine at human cadence, never on the 500 ms tick
-
-  Two things found while verifying those changes were worse than any of the findings:
-
-  1. **`tests/db` flaked with "database is locked", about one run in six.** Real, not test noise.
-     `PRAGMA journal_mode=WAL` takes a brief exclusive lock, SQLite returns `SQLITE_BUSY` for it
-     *without* consulting the busy handler, and it ran before `busy_timeout` was even set — so
-     several first requests arriving together (a browser opening the page) could 500. Fixed:
-     `busy_timeout` first, and a contended WAL switch tolerated, since whoever wins sets the
-     identical mode. **12/12 clean; the old ordering fails 2/12.** A deterministic test covers the
-     tolerance, because a 1-in-6 reproduction is not a gate
-  2. **A new test of mine was vacuous twice over.** It awaited `_poll_loop()` directly, so `_task`
-     was never set and `stop()` had nothing to cancel. Fixed, it *still* passed against the broken
-     source, because `stop()`'s own `except CancelledError` absorbs a self-cancel and the callback
-     completes either way — no assertion on its result can separate the two. It now asserts
-     `task.cancelling() == 0`: a cancellation requested and swallowed still leaves a trace
-- **Diverged from plan:** three deliberate divergences, all recorded in the spec above
-  - `MARKET_DATA_DESIGN.md` §13.1 shows `await load_tracked_tickers()` and a `hasattr` probe for
-    `_on_permanent_failure`. The database layer is **synchronous** — the lifespan calls it directly
-    at startup, where nothing else is running — and `on_permanent_failure` is a public ABC
-    attribute since CP1, so it is assigned plainly. §13.1 has been corrected
-  - Three environment variables the plan did not list — `DB_PATH`, `STATIC_DIR`, `LOG_LEVEL` — now
-    appear in §5. All three have working defaults; a `.env` holding only `OPENROUTER_API_KEY` runs
-    the whole app
-  - `schema.sql` adds three indexes on `(user_id, <time column>)` beyond the §7 columns, for the
-    trade blotter, the P&L series and chat replay
+  `/security-review` not run (optional here). Every fix mutation-verified. `/simplify`: the "never
+  stop the source that just failed" invariant moved into `MassiveDataSource`, which tears down
+  before awaiting the callback; `app/paths.py` created; the health endpoint's unreachable branch
+  deleted; test duplication consolidated into `conftest.py`; `connect()` measured at ~500 µs, not
+  the "microseconds" its docstring claimed — fine at human cadence, never on the 500 ms tick. Two
+  things found while verifying were worse than any finding:
+  - **`tests/db` flaked "database is locked" ~1 run in 6.** Real: `PRAGMA journal_mode=WAL` takes a
+    brief exclusive lock, SQLite returns `SQLITE_BUSY` for it without consulting the busy handler,
+    and it ran before `busy_timeout` was set — so several first requests together could 500. Fixed
+    by setting `busy_timeout` first and tolerating a contended WAL switch: **12/12 clean, the old
+    ordering fails 2/12**, with a deterministic test because a 1-in-6 reproduction is not a gate
+  - **A new test of mine was vacuous twice over** — it awaited `_poll_loop()` directly so `stop()`
+    had nothing to cancel, and once fixed still passed against the broken source because `stop()`
+    swallows a self-cancel. It now asserts `task.cancelling() == 0`
+- **Diverged from plan:** three, all reflected in the spec — `load_tracked_tickers` is synchronous
+  and `on_permanent_failure` assigned plainly (§13.1 corrected); `DB_PATH`, `STATIC_DIR`,
+  `LOG_LEVEL` added to §5 with working defaults; `schema.sql` adds three `(user_id, <time>)` indexes
 - **Carried forward:**
-  - **`app/api/deps.py` is Checkpoint 3's first task.** `MARKET_DATA_DESIGN.md` §13.1 specifies
-    `Depends(get_price_cache)` / `Depends(get_market_source)`; CP2 has one handler and did not need
-    them, but CP3 adds six that do, each otherwise repeating "what if `market_source` is `None`?".
-    `get_market_source` should raise `HTTPException(503)` there, once. `/api/health` stays the
-    deliberate exception — reporting "no source" is its job
+  - **`app/api/deps.py` is CP3's first task** — six new handlers would each repeat "what if
+    `market_source` is `None`?"; `get_market_source` should 503 once, with `/api/health` the
+    deliberate exception
   - Watchlist handlers must be `async def` with the SQLite call in `run_in_threadpool`: a `def`
     handler cannot `await source.add_ticker()`, and mutating the watchlist without telling the
-    source leaves a new ticker permanently unpriced. Written up in `backend/CLAUDE.md`
-  - `transaction()` exists and is tested but has no production caller yet. CP3's trade path is its
-    first: a trade touches `positions`, `trades`, `users_profile` and `portfolio_snapshots` and
-    must not land partially
-  - The §7 background task writing a `portfolio_snapshots` row every 30 seconds is **not built** —
-    it is Checkpoint 3 scope, and the lifespan is where it goes
-  - `app.state.shutting_down` is read by the failover handler. Anything else that installs a source
-    must respect it, or it will leak a task past shutdown
-  - Coverage is 100% on `app/` and that is a floor, not an achievement. Three of this
-    checkpoint's tests passed against deliberately broken code before mutation testing exposed them
+    source leaves a ticker permanently unpriced
+  - `transaction()` is tested but has no production caller; CP3's trade path is its first
+  - The 30-second `portfolio_snapshots` task is **not built** — CP3 scope, in the lifespan
+  - `app.state.shutting_down` is read by the failover handler; anything else installing a source
+    must respect it
+  - Coverage 100% is a floor: three of this checkpoint's tests passed against deliberately broken
+    code before mutation testing exposed them
 
 #### Checkpoint 3 — Portfolio & watchlist API
 
-- **Closed:** 2026-08-10 · branch `checkpoint-3-portfolio-watchlist-api` · PR #6 · all three gates
-  passed
-- **Built:**
-  - `app/api/deps.py` — `get_price_cache` / `get_market_source`, the latter 503-ing once so no
-    handler repeats the check. Closes CP2's first carried-forward item
-  - `app/db/repository.py` — **new**: row access for all six §7 tables as connection-taking
-    functions, so a trade composes four of them inside one `transaction()`. `Position`, `Trade`,
-    `Snapshot`, `WatchlistEntry` dataclasses. `apply_position()` owns "quantity zero means no row"
-  - `app/db/database.py` — `read_transaction()` (`BEGIN DEFERRED`) for multi-statement reads
-  - `app/portfolio.py` — **new**: the single implementation of valuation and trade execution.
-    `execute_trade`, `get_portfolio`, `get_history`, `record_snapshot`, `TradeError`, and the
-    `PortfolioView` / `PositionView` / `TradeResult` shapes. CP4's chat handler calls these
-  - `app/watchlist.py` — **new**: the same treatment for the watchlist. `add`, `remove`,
-    `reconcile`, and a `WatchlistError` hierarchy. `reconcile()` is the sole enforcer of
-    "tracked = watchlist ∪ positions"
-  - `app/api/portfolio.py`, `app/api/watchlist.py`, `app/api/schemas.py` — the six §8 endpoints,
-    now thin: they translate HTTP to those two modules and hold no rules of their own
-  - `app/main.py` — the 30-second `portfolio_snapshots` task, cancelled *and awaited* at shutdown
-- **Exit criteria:** all five met. The last four were verified against a live `uvicorn` over HTTP,
-  not only in the suite
-  - *Unit tests cover the seven listed money cases* — all seven, in `tests/test_portfolio.py`, and
-    each one **mutation-verified** (see Tests below)
-  - *A ticker added via `POST /api/watchlist` appears in the SSE stream without a restart* — added
-    PYPL and SQ against a running server; both appear in the next `data:` frame at a real price.
-    Also asserted in-process against the real simulator and the real SSE generator
-  - *Removing a held ticker does not delete the position* — `DELETE /api/watchlist/AAPL` while
-    holding 5 returned `still_tracked: true`; the position kept its live mark, and after a restart
-    `/api/health` reported 12 tracked tickers for an 11-ticker watchlist
-  - *A trade writes a snapshot immediately* — the live history showed four points exactly 30 s
-    apart from the background task, then a fifth at the trade's timestamp
-  - *Every endpoint returns the documented shape and correct status codes* — every path exercised
-    live: 200/201/400/404/409/422/503. §8 now records the codes and the 400-versus-422 rule
-- **Tests:** 295 → **443** (+148). Three consecutive full runs green, three times over — at Gate 1,
-  after the review fixes, and after the simplify refactor. Coverage **100%** on `app/`, holding
-  CP1's and CP2's floor; `ruff check` and `ruff format --check` clean. Runtime 4.2 s, still no
-  network access
-
-  **36 mutations were run against the final code and all 36 were killed** — one per money rule
-  (drop the cash check, mean instead of weighted average, re-average on a sell, drop the oversell
-  check, zero the tolerance, round to the dollar, autocommit instead of `transaction()`), one per
-  review fix, and one per watchlist rule including all three failure modes `reconcile()` exists to
-  prevent. Two survived the first pass and both were real test gaps:
-  - The exact-balance buy test could not distinguish `>` from `>=`, because a `CASH_TOLERANCE` of
-    1e-9 made them equivalent at equality. Investigating it showed **the cash tolerance was dead
-    weight**: cash and cost are both `round(…, 2)`, so each is the nearest double to a whole number
-    of cents and the two compare exactly. It was deleted, and the asymmetry with
-    `QUANTITY_TOLERANCE` — which is load-bearing, because quantities are deliberately *not*
-    rounded — is now documented where the constant used to be
+- **Closed:** 2026-08-10 · branch `checkpoint-3-portfolio-watchlist-api` · PR #6 · all gates passed
+- **Built:** `app/api/deps.py` (`get_price_cache` / `get_market_source`, the latter 503-ing once) ·
+  `app/db/repository.py` (**new** — row access for all six tables as connection-taking functions, so
+  a trade composes four inside one `transaction()`; `Position`/`Trade`/`Snapshot`/`WatchlistEntry`;
+  `apply_position()` owns "quantity zero means no row") · `read_transaction()` (`BEGIN DEFERRED`) ·
+  `app/portfolio.py` (**new** — the single implementation of valuation and trade execution:
+  `execute_trade`, `get_portfolio`, `get_history`, `record_snapshot`, `TradeError`, and the
+  `PortfolioView`/`PositionView`/`TradeResult` shapes) · `app/watchlist.py` (**new** — `add`,
+  `remove`, `reconcile`, `WatchlistError`; `reconcile()` is the sole enforcer of
+  "tracked = watchlist ∪ positions") · `app/api/portfolio.py`, `app/api/watchlist.py`,
+  `app/api/schemas.py` (the six §8 endpoints, now thin) · the 30-second snapshot task in the
+  lifespan, cancelled *and awaited* at shutdown
+- **Exit criteria:** all five met; the last four over HTTP against a live `uvicorn`
+  - The seven money cases are in `tests/test_portfolio.py`, each mutation-verified
+  - PYPL and SQ added via `POST /api/watchlist` appear in the next `data:` frame at a real price
+  - `DELETE /api/watchlist/AAPL` while holding 5 → `still_tracked: true`, position and live mark
+    kept; after restart `/api/health` reported 12 tracked for an 11-ticker watchlist
+  - Live history: four points 30 s apart, then a fifth at the trade's timestamp
+  - Every documented shape and code exercised live: 200/201/400/404/409/422/503
+- **Tests:** 295 → **443**. Three consecutive green runs, three times over (Gate 1, post-review,
+  post-simplify). Coverage **100%**; lint clean; 4.2 s, no network. **36 mutations, all killed** —
+  one per money rule, per review fix, and per watchlist rule. Two survived the first pass, both real
+  test gaps:
+  - The exact-balance buy test could not distinguish `>` from `>=`, which showed **the cash
+    tolerance was dead weight**: cash and cost are both `round(…, 2)`, so they compare exactly. It
+    was deleted; the asymmetry with the load-bearing `QUANTITY_TOLERANCE` is documented where it was
   - "The trade and its snapshot read the same prices" passed against a version that re-read the
-    cache, because a static cache cannot tell one read from two. It now runs against a
-    `DriftingPriceCache` that moves on its second read
+    cache, since a static cache cannot tell one read from two → `DriftingPriceCache`
 
-  Two further things the mutation run surfaced. Removing `snapshot_task.cancel()` does not fail the
-  suite — it **hangs** it, because shutdown then awaits a task that never ends; the harness treats
-  a timeout as detection, since the unmutated code returns in seconds. And a shutdown assertion
-  read its baseline count *inside* the lifespan, so the loop could tick once more before shutdown
-  and the comparison would fail on a slow enough machine: green bare, red under coverage. Both the
-  ordering and the reason are now in the test.
-- **Review:** `/code-review high` returned **7 findings, all 7 fixed.**
+  Two side-findings: removing `snapshot_task.cancel()` **hangs** the suite rather than failing it
+  (a timeout is the detection), and a shutdown assertion read its baseline inside the lifespan —
+  green bare, red under coverage
+- **Review:** `/code-review high` — **7 findings, all fixed**
+  1. Gate 3 not performed; `backend/CLAUDE.md` still said CP3 *should* add `deps.py` → this entry,
+     the status row, §7, §8 and a rewritten wiring section
+  2. `monkeypatch.setattr("app.main.SNAPSHOT_INTERVAL_SECONDS", …)` did nothing — a default binds at
+     def time — so the lifespan test ran at the real 30 s → `interval` is `None`-defaulted and
+     resolved in the body
+  3. `get_portfolio()` read cash and positions in autocommit, so a trade committing between them
+     yields a total that never existed → `read_transaction()`, tested by running a real trade from
+     inside the cash read
+  4. The DELETE held-check and `remove_ticker()` were not atomic, stranding a position with no price
+     source → `_unsubscribe()` re-reads after eviction and re-subscribes
+  5. Snapshots persisted a total that silently omitted unpriced positions — a permanent phantom
+     drawdown → skip and log; §7 corrected
+  6. `POST /api/portfolio/trade` took no `get_market_source` dependency, so it kept filling against
+     frozen prices after a failed failover → now depends on the source it does not use
+  7. Rollback asymmetry: POST compensated, DELETE did not → both directions now do
 
-  | # | Finding | Disposition |
-  |---|---|---|
-  | 1 | Gate 3 not performed — the diff touched no documentation, and `backend/CLAUDE.md` still read "**Checkpoint 3 should add `app/api/deps.py`**" | **Fixed.** This entry, the status row, §7, §8, and a rewritten `backend/CLAUDE.md` wiring section |
-  | 2 | `monkeypatch.setattr("app.main.SNAPSHOT_INTERVAL_SECONDS", 0.01)` did nothing — `interval: float = SNAPSHOT_INTERVAL_SECONDS` binds at def time — so the lifespan test ran at the real 30 s and its shutdown assertion could not fail | **Fixed** at the root: `interval` is `None`-defaulted and resolved in the body. The test now asserts several points rather than one, and a new test pins the resolution itself |
-  | 3 | `get_portfolio()` read cash and positions in autocommit, so a trade committing between the two statements yields pre-trade cash beside a post-trade position — a total that never existed | **Fixed.** `read_transaction()` (`BEGIN DEFERRED`) added and used. Tested by running a real trade from *inside* the cash read |
-  | 4 | The DELETE handler's held-check and `remove_ticker()` are not atomic, so a buy landing between them strands a position with no price source, permanently | **Fixed.** `_unsubscribe()` re-reads after the eviction and re-subscribes. The window does not fully close, but a buy landing after the eviction has no price to fill against and is rejected |
-  | 5 | Snapshots persist a total that silently omits unpriced positions — a permanent phantom drawdown that later "recovers" | **Fixed.** `_record_snapshot` skips and logs instead; a gap is honest, a fabricated drawdown is not. §7 corrected to match |
-  | 6 | `POST /api/portfolio/trade` took no `get_market_source` dependency, so after a failed failover it kept filling against frozen prices while the watchlist endpoints returned 503 | **Fixed.** It now depends on the source it does not use, and says why |
-  | 7 | Rollback asymmetry: POST undoes its row if the source refuses, DELETE did not | **Fixed.** Both directions now compensate |
+  `/simplify` found one structural problem: **the watchlist had no callable path** — its rules lived
+  inside handlers that signal by raising `HTTPException`, so CP4 would have had to re-implement them
+  or catch a `409` FastAPI would then apply to `POST /api/chat`. Hence `app/watchlist.py`, handlers
+  reduced to an error-code map. **`reconcile()` replaced three pieces of incremental bookkeeping**
+  and closes the delete race by re-reading after its removals. Also: one owner each for the history
+  limit, `round(price * quantity, 2)` and display precisions; `TradeResult.position` →
+  `result.position()`; `get_history`'s unused argument deleted; `delete_position` made private; test
+  helpers moved to `conftest.py`. Skipped, with reasons: Pydantic response models (a second
+  definition of every shape — revisit at CP5), a staleness bound on quotes (threshold must come from
+  the poll interval — carried forward), deleting `list_trades` (kept as dated CP6/CP7 scaffolding).
 
-  `/simplify` (reuse, simplification, altitude; the efficiency agent died on a session limit and
-  that angle was reviewed directly instead) found one structural problem and a list of smaller ones:
-
-  - **The watchlist had no callable path.** Its rules lived entirely inside FastAPI handlers that
-    signal by raising `HTTPException`, so CP4 — which must execute the LLM's `watchlist_changes`
-    "through the *same* validation path as Checkpoint 3" — had nothing to call. It would have had
-    to re-implement them, or catch a `409` that FastAPI would then apply to `POST /api/chat`,
-    aborting the whole reply instead of saying "AAPL was already watched". `app/watchlist.py` now
-    holds them, and the handlers are a 12-line error-code map
-  - **`reconcile()` replaced three pieces of incremental bookkeeping.** The tracked-set rule was
-    already written down once in `load_tracked_tickers()`, but after startup nothing recomputed it —
-    each mutation maintained it by hand, which is why the delete path had grown an unsubscribe, a
-    re-query and a re-subscribe. One idempotent diff against the source's set deleted all of that,
-    and closes the same race by re-reading after its removals
-  - One owner each for things that had grown three: the history limit (api, domain, repository),
-    `round(price * quantity, 2)` (buy, sell, and the receipt — which is *why* they must agree), and
-    the money/rate display precisions
-  - `TradeResult.position` was a second, narrower copy of a row already in `portfolio.positions`,
-    with its own rounding rule to keep in step. Dropped; `result.position()` derives it
-  - `get_history(price_cache)` deleted its own argument, which forced the endpoint to inject a
-    dependency it only forwarded into a `del`. The docstring carries the warning by itself
-  - `delete_position` was exported while `apply_position`'s docstring explained that callers must
-    never call it. Now `_delete_position`
-  - Test hygiene: `RecordingSource`, `snapshot_count`, `snapshot_values` and the SSE helpers moved
-    to `tests/conftest.py`; `test_stream.py`'s three aliased imports became one name each; and a
-    test filed under `TestGetMarketSource` that only exercised `get_price_cache` was rewritten, so
-    the per-request read that actually matters for failover is now covered
-
-  Skipped, with reasons: Pydantic response models for the five endpoints (they would create a
-  second definition of every shape beside the dataclass `to_dict`, which is the drift this codebase
-  keeps eliminating — worth revisiting at CP5 when the frontend wants typed responses); a staleness
-  bound on quotes instead of `require_live_market` (it needs a threshold derived from the poll
-  interval, 0.5 s on the simulator against 15 s on Massive, and guessing it would silently block
-  valid trades — recorded below instead); and `list_trades`, which stays with a docstring saying it
-  is CP6/CP7 scaffolding rather than becoming dead code nobody can date.
-
-  `/security-review` was **run and required** for this checkpoint. **No HIGH or MEDIUM findings.**
-  What it checked and cleared: every new query is parameterised, with no interpolation of user
-  input; `TradeRequest` has no `price` field and sets `extra="forbid"`, so a client cannot name its
-  own fill price; `user_id` is threaded through every layer but is not reachable from any request,
-  so the no-auth single-user model exposes no cross-tenant path; the `{ticker}` path parameter is
-  pattern-bound and reaches only SQL parameters and dict keys, never a filesystem path; the ticker
-  forbids `/`, `:` and `%` and reaches Massive as a query argument rather than a URL path, so there
-  is no host or protocol control; and `BEGIN IMMEDIATE` takes the write lock before reading cash,
-  so two concurrent buys cannot both spend the same balance. Unbounded watchlist growth is real but
-  is resource exhaustion, excluded from that review's scope — it is carried forward below instead.
-- **Diverged from plan:** three, all now reflected in the spec above
-  - **§7's "immediately after each trade execution" is now qualified.** No snapshot is written
-    while a held ticker is unpriced — review finding #5. The exit criterion still holds for every
-    ordinary run, since a position can only be opened for a ticker that had a price
-  - **§8 gained a status-code column and the 400-versus-422 rule.** The plan named the endpoints
-    but not what they answer, and "correct status codes" is an exit criterion that needed something
-    to be correct against
-  - **`POST /api/portfolio/trade` requires a running market source**, which §8 did not say. Filling
-    against prices frozen by a dead feed is worse than refusing
-  - No new environment variables. `SNAPSHOT_INTERVAL_SECONDS` is a module constant, not a §5
-    variable: nothing outside a test wants a different value, and tests pass their own interval
-- **Resolved from Checkpoint 2's carried-forward list**, so none of it expires by being ignored:
-  - `app/api/deps.py` — built, with `get_market_source` raising 503 in one place; `/api/health`
-    still reads `app.state` directly
-  - Watchlist handlers are `async def` with the SQLite work in `run_in_threadpool`; the portfolio
-    handlers are plain `def`, because they never await the source. The rule in `backend/CLAUDE.md`
-    has been rewritten to say which colour applies where, rather than "all handlers"
-  - `transaction()` has its first production caller: the trade path, writing `users_profile`,
-    `positions`, `trades` and `portfolio_snapshots` atomically. `BEGIN IMMEDIATE` also turns out to
-    be what stops two concurrent buys spending the same balance
-  - The 30-second `portfolio_snapshots` task is built and lives in the lifespan
-  - `app.state.shutting_down` is untouched by this checkpoint — the snapshot task installs no
-    source. It is cancelled *and awaited* before the source is stopped, so it cannot be mid-write
-    when the interpreter tears down
+  `/security-review` **run and required. No HIGH or MEDIUM findings.** Cleared: every new query
+  parameterised; `TradeRequest` has no `price` field and forbids extras; `user_id` unreachable from
+  any request; the `{ticker}` path parameter is pattern-bound and reaches only SQL parameters and
+  dict keys; the ticker forbids `/`, `:` and `%` and reaches Massive as a query argument;
+  `BEGIN IMMEDIATE` stops two concurrent buys spending the same balance. Unbounded watchlist growth
+  is real but out of that review's scope — carried forward
+- **Diverged from plan:** three, all now in the spec — §7's "immediately after each trade" is
+  qualified by review #5; §8 gained a status-code column and the 400-versus-422 rule;
+  `POST /api/portfolio/trade` requires a running market source. No new env vars
+- **Resolved from CP2:** `deps.py` built; handler colours settled (`async def` for watchlist, plain
+  `def` for portfolio) and `backend/CLAUDE.md` rewritten; `transaction()` has its first production
+  caller; the snapshot task is built; `shutting_down` untouched, and the snapshot task is cancelled
+  *and awaited* before the source stops
 - **Carried forward:**
-  - **The watchlist has no size limit.** Nothing stops `POST /api/watchlist` being called a
-    thousand times, and every entry joins every Massive poll thereafter. Out of scope for the
-    security review by its own rules, and not a product rule the plan states — but Checkpoint 4
-    hands this endpoint to an LLM that can call it in a loop, so **CP4 should add a cap**
-  - **A ticker stays subscribed after its position closes.** Selling out of a ticker that is not on
-    the watchlist leaves it tracked for the life of the process. Deliberate — the chart going flat
-    the instant you sell would be worse — but it means the tracked set only ever grows within a
-    session
-  - `list_trades()` is written and tested but has no production caller. The blotter has no endpoint
-    yet; §10's positions table does not need one, so it is there for CP6 or CP7 to surface
-  - The `_unsubscribe` race (review #4) is narrowed, not eliminated. Closing it properly needs the
-    source subscription and the database row under one lock, which the async/sync split prevents
-  - `read_transaction()` has one caller. Any future multi-statement read must use it — autocommit
-    across two queries is exactly the bug #3 was
-  - **A source that is alive but stalled is still undetected.** `require_live_market` catches the
-    feed being *gone*; it cannot catch a poller that is wedged while its object still exists, and
-    trades would fill against frozen prices. The fix is a staleness bound on `PriceUpdate.timestamp`
-    inside `_require_price`, which protects every caller including CP4's. It was not guessed at
-    here because the threshold has to come from the poll interval — 0.5 s on the simulator against
-    15 s or more on Massive — and too tight a bound silently blocks valid trades
-  - `watchlist.reconcile()` costs two `load_tracked_tickers()` reads per mutation, about 1 ms of
-    connection setup. Deliberate: the second read is what turns a buy-during-removal into an add,
-    and skipping it when no removals happened would trade the simplicity of an unconditional
-    invariant for 500 µs on a user's click
-  - Coverage is 100% on `app/` and remains a floor, not an achievement. Two of this checkpoint's
-    tests passed against deliberately broken code until mutation testing exposed them, which is
-    now the third checkpoint running where that has been true
+  - **The watchlist has no size limit** and every entry joins every Massive poll — **CP4 should add
+    a cap**, since CP4 hands this endpoint to an LLM that can call it in a loop
+  - **A ticker stays subscribed after its position closes.** Deliberate — the chart going flat the
+    instant you sell would be worse — but the tracked set only grows within a session
+  - `list_trades()` is written and tested with no production caller — for CP6 or CP7
+  - The `_unsubscribe` race is narrowed, not eliminated: closing it needs the subscription and the
+    row under one lock, which the async/sync split prevents
+  - `read_transaction()` has one caller; any future multi-statement read must use it
+  - **A source that is alive but stalled is still undetected** — `require_live_market` catches a
+    feed that is *gone*, not a wedged poller. The fix is a staleness bound on `PriceUpdate.timestamp`
+    inside `_require_price`; the threshold must come from the poll interval (0.5 s simulator against
+    15 s Massive) and too tight a bound silently blocks valid trades
+  - `reconcile()` costs two `load_tracked_tickers()` reads per mutation (~1 ms). Deliberate: the
+    second read is what turns a buy-during-removal into an add
+  - Coverage 100% remains a floor — two of this checkpoint's tests passed against broken code until
+    mutation testing exposed them, the third checkpoint running where that is true
 
 #### Checkpoint 4 — LLM chat integration
 
 - **Closed:** 2026-08-10 · branch `checkpoint-4-llm-chat` · PR #7 · all four gates passed. First
-  checkpoint run under the reworked gate order, and it paid for itself: review landed before the
-  expensive verification, so the ten review fixes cost one mutation run rather than three
-- **Built:**
-  - `app/llm/` — **new package**, the contract with the model
-    - `schema.py` — `AssistantReply` (the wire schema), `LLMTrade` / `LLMWatchlistChange`, and
-      `parse_reply`, which validates **action by action** rather than as one document. Also
-      `wire_schema()`, which strips the keywords Cerebras rejects
-    - `prompt.py` — `SYSTEM_PROMPT` per §9, `render_context`, `build_messages`. Rules and account
-      data are `system` messages; anything a user or the model wrote is `user`/`assistant`
-    - `client.py` — LiteLLM → OpenRouter → Cerebras, `LLMUnavailableError`, `is_mock_enabled`,
-      and `_log_provider`
-    - `mock.py` — the deterministic `LLM_MOCK=true` stand-in, returning **raw JSON** so mock runs
-      exercise the real parser
-  - `app/chat.py` — **new**: `handle_message`, `get_transcript`, `ChatReply`, `ActionResult`. The
-    turn's orchestration and persistence. It executes nothing itself
-  - `app/api/chat.py`, `ChatRequest` — `POST /api/chat` and `GET /api/chat/history`
-  - `app/config.py` — **new**: `load_env()`, delivering §5's promise that the backend reads `.env`
-  - `app/db/repository.py` — `ChatMessage`, `insert_chat_message`, `list_chat_messages`,
-    `count_watchlist`
-  - `app/watchlist.py` — `MAX_WATCHLIST_SIZE` (50) and `WatchlistFullError`, resolving Checkpoint
-    3's first carried-forward item
-  - `app/market/models.py` — `TICKER_PATTERN` moved here from `app/api/schemas.py`
-- **Exit criteria:** all five met, the last four verified over HTTP against a live `uvicorn` via
-  `test/smoke.sh`, and the fifth against OpenRouter for real
-  - *A `LLM_MOCK=true` request returns a schema-valid response and a mocked trade moves cash and
-    positions* — `POST /api/chat {"message":"buy 2 MSFT"}` returned `ok: true` and the balance fell;
-    asserted in the smoke script and in `TestMockMode`, which runs the production `complete()`
-  - *A malformed or non-JSON response is graceful, never a 500* — every shape in the parametrised
-    set (`""`, `not json`, `[1,2,3]`, no `message`, `message: null`) returns 200 with
+  checkpoint under the reworked gate order, and it paid for itself: review landed before the
+  expensive verification, so ten fixes cost one mutation run rather than three
+- **Built:** `app/llm/` (**new package**) — `schema.py` (`AssistantReply`, `LLMTrade`,
+  `LLMWatchlistChange`, `parse_reply` validating **action by action**, `wire_schema()` stripping
+  what Cerebras rejects) · `prompt.py` (`SYSTEM_PROMPT`, `render_context`, `build_messages`; rules
+  and account data are `system` messages, anything a user or the model wrote is `user`/`assistant`)
+  · `client.py` (LiteLLM → OpenRouter → Cerebras, `LLMUnavailableError`, `is_mock_enabled`,
+  `_log_provider`) · `mock.py` (returns **raw JSON**, so mock runs exercise the real parser). Plus
+  `app/chat.py` (**new** — `handle_message`, `get_transcript`, `ChatReply`, `ActionResult`;
+  orchestration and persistence, executing nothing itself) · `app/api/chat.py` + `ChatRequest` ·
+  `app/config.py` (**new** — `load_env()`, delivering §5's promise) · repository additions
+  (`ChatMessage`, `insert_chat_message`, `list_chat_messages`, `count_watchlist`) ·
+  `MAX_WATCHLIST_SIZE` (50) and `WatchlistFullError` · `TICKER_PATTERN` moved to
+  `app/market/models.py`
+- **Exit criteria:** all five met, the middle three over HTTP via `test/smoke.sh`
+  - `{"message":"buy 2 MSFT"}` under `LLM_MOCK=true` → `ok: true`, balance moved; also asserted in
+    `TestMockMode`, which runs the production `complete()`
+  - Every malformed shape (`""`, `not json`, `[1,2,3]`, no `message`, `message: null`) → 200 with
     `MALFORMED_REPLY_MESSAGE`
-  - *A trade that fails validation returns its error rather than vanishing* — `buy 100000 AAPL`
-    over HTTP: 200, `ok: false`, "Insufficient cash…", cash unmoved
-  - *Messages and actions persist and are replayed as history* — both turns written in one
-    transaction, `actions` JSON on the assistant row, and the next call's prompt carries them back
-  - *One live call succeeds, confirming model id, provider routing and structured-output handling*
-    — **this is the criterion that found the checkpoint's worst defect.** See below
-- **Tests:** 443 → **692** (+249). Coverage **100%** on `app/`, holding the floor from Checkpoints
-  1–3. `ruff check` and `ruff format --check` clean. Runtime 8.1 s, still no network access in the
-  suite
+  - `buy 100000 AAPL` → 200, `ok: false`, "Insufficient cash…", cash unmoved
+  - Both turns persist in one transaction with `actions` JSON on the assistant row, and the next
+    call's prompt carries them back
+  - One live call succeeded — **and found the checkpoint's worst defect** (below)
+- **Tests:** 443 → **692**. Coverage **100%**; lint clean; 8.1 s, no network in the suite.
+  **37 mutations, all killed** — 19 inherited plus 18 for this checkpoint's invariants: the model
+  naming its own fill price, an infinite order size, the per-reply cap, a refused action being
+  swallowed, the action ordering, ticker normalisation, persisting a turn the provider never
+  answered, the context block arriving as a `user` message, `LLM_MOCK` falling through to a live
+  call, provider error text reaching the user, and both halves of the watchlist cap. One survived
+  and was genuinely vacuous — the **third checkpoint running** where that is true: "the compensating
+  restore is not refused by the cap" never reached the check, because `remove()` deletes before it
+  restores. Something else now takes the freed slot first
+- **Review:** `/code-review high` — **11 findings, 10 fixed, 1 was Gate 4 work**
+  1. Watchlist changes ran before trades, so a `remove` evicted the price a `buy` in the same reply
+     needed → adds, then trades, then removes
+  2. Un-normalised tickers reached `ActionResult` and `chat_messages.actions`, so one request could
+     report two spellings of one symbol — the field CP7 matches rows by → normalised once per action
+  3. The mock read "buy 3 shares" as a trade in `SHARES` → the stop-list applies to trades too
+  4. "watch for a dip" added `FOR`, and the simulator invents a price for any symbol, so the junk
+     row really streamed → same change, prepositions added
+  5. History replay dropped `actions`, so a refused buy left "I've bought 10 AAPL" in the transcript
+     and the model read its own claim back as fact → an assistant turn replays with what actually
+     executed appended
+  6. `remove()`'s compensating restore could itself raise `WatchlistFullError`, replacing the real
+     error and leaving the row deleted → the restore bypasses the cap
+  7. `_load_context` reads the portfolio outside its `read_transaction` — **comment corrected,
+     behaviour left**: folding it in means exporting private valuation so advisory prose can be
+     atomic; the cost is two rendered prices one tick apart, and nothing is computed from the pair
+  8. `_finish` persisted after the trades committed, so a failed write returned 500 for a request
+     that had already moved cash — where the obvious retry buys twice → logged and swallowed, the
+     reply returned regardless
+  9. The over-cap branch appended one rejection per item, not one for the remainder → fixed in
+     favour of the comment, so twenty identical sentences cannot bury the turn's other failures
+  10. `load_env()` ran at import, which `monkeypatch` cannot undo, leaking a developer's `.env` into
+      the suite → `conftest.py` clears every application variable, listed exhaustively
+  11. `PLAN.md` and `backend/CLAUDE.md` untouched → this entry and the docs
 
-  **37 mutations run, all 37 killed** — the 19 inherited from Checkpoint 3 plus 18 written for the
-  invariants this checkpoint owns: the model naming its own fill price, an infinite order size, the
-  per-reply cap, a refused action being swallowed, the action ordering, ticker normalisation, the
-  turn being persisted when the provider never answered, the context block arriving as a `user`
-  message, `LLM_MOCK` falling through to a live call, the provider's error text reaching the user,
-  and both halves of the watchlist cap.
+  `/security-review` **run and required. No HIGH or MEDIUM findings.** Cleared: `LLMTrade` has no
+  `price` field and forbids extras; `user_id` unreachable, since `ChatRequest` and both action
+  models forbid extras; every new query parameterised including the `limit`; `TICKER_PATTERN` still
+  forbids `/`, `:` and `%`; the provider's error text — which quotes the failing request back — is
+  confined to the server log, asserted by planting a key-shaped string in the exception;
+  `json.loads` is the only deserialisation. Prompt injection is out of that review's scope; the
+  substantive mitigation is that the model moves money only by returning an action that is then
+  re-validated.
 
-  One survived the first pass and was a genuinely vacuous test, the **third checkpoint running**
-  where that has been true. "The compensating restore is not refused by the cap" filled the
-  watchlist, made the source refuse, and asserted the row came back — but `remove()` deletes before
-  it restores, so the restore only ever returned the list *to* the cap and never past it. The check
-  it was written to guard was never reached. It now has something else take the freed slot first,
-  which is the window the review actually described.
-- **Review:** `/code-review high` returned **11 findings — 10 fixed, 1 was Gate 4 work.**
-
-  | # | Finding | Disposition |
-  |---|---|---|
-  | 1 | Watchlist changes ran before trades, so a `remove` in the same reply evicted the price a `buy` of that ticker needed and the trade was refused. The comment justified the order with "removing a ticker does not untrack a holding", which only covers a ticker already held | **Fixed.** Adds, then trades, then removes — subscribing creates a price and unsubscribing destroys one, so trades sit between them |
-  | 2 | Un-normalised tickers reached `ActionResult` and `chat_messages.actions`. The add branch reported `entry.ticker` and the remove branch the raw string, so one request could report two spellings of one symbol — the field CP7 matches rows by | **Fixed.** Normalised once per action, in both loops |
-  | 3 | The mock read "buy 3 shares" as a trade in `SHARES` | **Fixed.** The stop-list now applies to trades as well as watchlist verbs |
-  | 4 | "watch for a dip" added `FOR` to the watchlist — and the simulator invents a price for any symbol, so the junk row really did stream | **Fixed** by the same change; the stop-list gained the prepositions |
-  | 5 | History replay dropped `actions`, so a refused buy left "I've bought 10 AAPL" in the transcript and the model read its own claim back as fact | **Fixed.** An assistant turn replays with what actually executed appended |
-  | 6 | `remove()`'s compensating restore could itself raise `WatchlistFullError` if a concurrent add refilled the list, replacing the real error and leaving the row deleted | **Fixed.** The restore bypasses the cap: putting back a row that was already there cannot be what pushed the list over |
-  | 7 | `_load_context` reads the portfolio outside its `read_transaction`, so the comment claiming one snapshot overclaimed | **Comment corrected**, behaviour left. Folding it in would mean exporting `app.portfolio`'s private valuation so a block of advisory prose could be atomic; the cost is two rendered prices differing by one tick, and nothing is computed from the pair |
-  | 8 | `_finish` persists after the trades commit, so a failed write returned a 500 for a request that had already moved cash — where the client's obvious retry buys twice | **Fixed.** Logged and swallowed; the reply is returned regardless |
-  | 9 | Comment/code mismatch: the over-cap branch appended one rejection per item, not one for the remainder | **Fixed** in favour of the comment — one line, so twenty identical sentences cannot bury the turn's other failures |
-  | 10 | `load_env()` runs at import and `monkeypatch` cannot undo an import-time mutation, so a developer's `.env` tuning variables leaked into the suite | **Fixed.** `tests/conftest.py` clears every application variable, listed exhaustively |
-  | 11 | `PLAN.md` and `backend/CLAUDE.md` untouched by the code commit | **This entry and the docs below.** Gate 4 under the reworked process is a separate gate, but the reviewer is right that Checkpoint 3 raised the identical finding |
-
-  `/security-review` was **run and required** for this checkpoint. **No HIGH or MEDIUM findings.**
-  What it checked and cleared: the model cannot name its own fill price (`LLMTrade` has no `price`
-  field and forbids extras, so a request carrying one is a rejected action); `user_id` is not
-  reachable from any request, since `ChatRequest` and both action models forbid extras; every new
-  query is parameterised, including the `limit`; `TICKER_PATTERN` still forbids `/`, `:` and `%`,
-  so a model-supplied ticker reaches SQL parameters and dict keys but never a path or a host; the
-  provider's error text — which quotes the failing request back — is confined to the server log and
-  never reaches the response or `chat_messages`, asserted by planting a key-shaped string in the
-  exception; and `json.loads` is the only deserialisation. Prompt injection via user text and
-  resource exhaustion are excluded by that review's own rules; the substantive mitigation for the
-  former is that the model moves money only by returning an action that is then re-validated, and
-  the caps added here cover the latter.
-
-  The structure pass was done **inline**, not by a spawned agent: the review above had just covered
-  the same diff at length, and a cold agent would have re-derived it for the third time. Its one
-  finding is already in the build list — `app/llm/schema.py` imported `TICKER_PATTERN` from
-  `app.api.schemas`, an upward dependency from the LLM contract to the transport layer that happened
-  to define it first. It moved to `app/market/models.py`, beside `normalize_ticker`. With that done
-  nothing outside `app/api/` imports `app.api`, and `app.chat.handle_message` / `get_transcript`
-  take no `Request` and raise no `HTTPException`, so Checkpoint 7 can drive the whole turn without
-  HTTP.
-- **Diverged from plan:** four, all now reflected in the spec above
-  - **`GET /api/chat/history` is new**, and §8 did not list it. Checkpoint 7's "history survives a
-    page reload" needs it, the data was already being written, and the alternative was
-    `get_transcript()` sitting as undated scaffolding — the thing `list_trades` is already doing
-  - **`POST /api/chat` requires a running market source**, which §8 did not say, for the reason
-    `POST /api/portfolio/trade` does
-  - **The wire schema is not `AssistantReply` verbatim** — the `pattern` keyword is stripped,
-    because Cerebras rejects it. §9 now records this
-  - **The watchlist is capped at 50.** Not in the plan at all; it is Checkpoint 3's carried-forward
-    item, and §8 now states it
-  - No new environment variables. `LLM_MOCK` and `OPENROUTER_API_KEY` were already in §5 — what
-    changed is that `.env` is now actually read
-- **The live call was worth the whole checkpoint.** Everything passed — 683 tests, the smoke script,
-  a real trade filled end to end — while every request was being served by **CoreWeave**, not
-  Cerebras. `provider.order` is a preference, not a pin, and Cerebras had been refusing the request
-  outright with `Invalid fields for schema with types ['string']: {'pattern'}`: `Field(pattern=...)`
-  puts `pattern` into the generated JSON schema, and Cerebras' structured-output implementation does
-  not accept it. Nothing failed, so nothing was visible. It surfaced only because the live check
-  printed which provider had answered.
-
-  Fixed by deriving the wire schema with that keyword removed. After the fix: `provider='Cerebras'`,
-  **0.43 s** for a full turn, against several seconds before — and the model, given the same
-  context block, started reporting the cash balance correctly instead of claiming it could not see
-  one. Per the gate rules this Gate 3 failure returned to Gate 2 rather than being patched forward.
-  `test_the_wire_schema_avoids_what_cerebras_rejects` and `_log_provider` exist so the next such
-  drift is loud.
-- **Resolved from Checkpoint 3's carried-forward list:**
-  - **The watchlist size cap is built** — `MAX_WATCHLIST_SIZE = 50`, enforced inside the insert's
-    transaction so a duplicate on a full list still reports as a duplicate
-  - `list_trades()` still has no production caller. Restated below rather than resolved
-  - The `_unsubscribe` race, `read_transaction()`'s single caller and the stalled-source gap are
-    unchanged by this checkpoint and are restated below
+  The structure pass was **inline** — the review had just covered the same diff. Its one finding:
+  `app/llm/schema.py` imported `TICKER_PATTERN` from `app.api.schemas`, an upward dependency from
+  the LLM contract to the transport layer; moved to `app/market/models.py`. Nothing outside
+  `app/api/` now imports `app.api`, and `handle_message` / `get_transcript` take no `Request` and
+  raise no `HTTPException`, so CP7 can drive a whole turn without HTTP
+- **The live call was worth the whole checkpoint.** 683 tests, the smoke script and a real
+  end-to-end fill all passed while every request was served by **CoreWeave, not Cerebras**:
+  `provider.order` is a preference, not a pin, and Cerebras was refusing outright with
+  `Invalid fields for schema with types ['string']: {'pattern'}` — `Field(pattern=...)` puts
+  `pattern` into the generated JSON schema. Nothing failed, so nothing was visible; it surfaced only
+  because the live check printed the provider. Fixed by stripping the keyword from the wire schema:
+  `provider='Cerebras'`, **0.43 s** per turn against several seconds, and the model started reading
+  the cash balance correctly. Per the gate rules this Gate 3 failure returned to Gate 2.
+  `test_the_wire_schema_avoids_what_cerebras_rejects` and `_log_provider` make the next drift loud
+- **Diverged from plan:** four, all now in the spec — `GET /api/chat/history` is new (CP7 needs it,
+  and the alternative was undated scaffolding); `POST /api/chat` requires a running market source;
+  the wire schema is not `AssistantReply` verbatim; the watchlist is capped at 50. No new env vars —
+  what changed is that `.env` is now actually read
+- **Resolved from CP3:** the watchlist cap is built, enforced inside the insert's transaction so a
+  duplicate on a full list still reports as a duplicate
 - **Carried forward:**
-  - **One unreproducible test failure.** A single full-suite run failed once — `1 failed, 691
-    passed` — and could not be reproduced in **63 subsequent runs**: bare, under coverage, under
-    tenfold CPU load, and repeating the exact smoke-then-suite sequence that produced it. Its
-    identity is lost because the run was piped through `tail -1`. Every fixed-sleep test in the
-    suite is inherited from Checkpoints 1–3 (`test_main.py`, `test_simulator_source.py`,
-    `test_massive.py`); Checkpoint 4 added no timing-dependent test. **Checkpoint 9 owns
-    flaky-test sources by its review focus and must resolve this**; until then, capture full pytest
-    output when verifying, because that is the only reason this one cannot be named
-  - **A stalled-but-alive market source is still undetected**, unchanged from Checkpoint 3 and now
-    reachable through one more path: `require_live_market` and `get_market_source` catch a feed that
-    is *gone*, not a poller wedged while its object lives, and the chat would fill against frozen
-    prices exactly as the trade endpoint would. The fix remains a staleness bound on
-    `PriceUpdate.timestamp` inside `_require_price`, and the threshold still has to come from the
-    poll interval — 0.5 s on the simulator against 15 s on Massive
-  - **A ticker stays subscribed after its position closes**, unchanged. The chat can now reach this
-    too, so a long conversation only ever grows the tracked set within a session
-  - **The mock's stop-list is a heuristic, not a parser.** "buy 3 widgets" will still trade
-    `WIDGETS`. It is bounded to `LLM_MOCK=true`, so it costs Checkpoint 9 a carefully worded fixture
-    rather than anything in production
-  - `list_trades()` is still written, tested and uncalled. Checkpoint 6 or 7 surfaces it, or
-    Checkpoint 10 deletes it — it is now one checkpoint older than the note that said so
-  - The `_unsubscribe` race narrowed at Checkpoint 3 is unchanged, and `read_transaction()` now has
-    two callers rather than one
-  - **`app/llm/prompt.py` renders the model's context as prose, and nothing tests what the model
-    *does* with it.** The system prompt is asserted to contain its rules; whether the model obeys
-    them is only ever established by a live call, and there is exactly one of those
-  - Coverage is 100% on `app/` and is still a floor, not an achievement. One of this checkpoint's
-    tests passed against deliberately broken code until mutation testing exposed it — four
-    checkpoints, four times
+  - **One unreproducible test failure.** A single full-suite run failed once (`1 failed, 691
+    passed`) and could not be reproduced in **63 further runs** — bare, under coverage, under
+    tenfold CPU load, and repeating the exact smoke-then-suite sequence. Its identity is lost
+    because the run was piped through `tail -1`. CP4 added no timing-dependent test; every fixed
+    sleep is inherited from CP1–CP3 (`test_main.py`, `test_simulator_source.py`, `test_massive.py`).
+    **CP9 owns flaky-test sources and must resolve this**; until then capture full pytest output
+  - **A stalled-but-alive source is still undetected**, now reachable through one more path — the
+    chat would fill against frozen prices exactly as the trade endpoint would. Fix and threshold as
+    recorded at CP3
+  - **A ticker stays subscribed after its position closes**, unchanged; the chat can reach this too
+  - **The mock's stop-list is a heuristic, not a parser** — "buy 3 widgets" still trades `WIDGETS`.
+    Bounded to `LLM_MOCK=true`, so it costs CP9 a carefully worded fixture
+  - `list_trades()` is still uncalled — CP6/CP7 surfaces it or CP10 deletes it, one checkpoint older
+    than the note that said so
+  - `read_transaction()` now has two callers; the `_unsubscribe` race is unchanged
+  - **`app/llm/prompt.py` renders context as prose and nothing tests what the model *does* with
+    it** — obedience is established only by a live call, and there is exactly one
+  - Coverage 100% is still a floor. One of this checkpoint's tests passed against broken code until
+    mutation testing exposed it — four checkpoints, four times
+
+#### Checkpoint 5 — Frontend scaffold + live prices
+
+- **Closed:** 2026-08-12 · branch `checkpoint-5-frontend-scaffold` · PR #8 · all four gates passed
+- **Built:** `frontend/` — Next.js 16 + TypeScript, `output: 'export'`, Tailwind v4
+  - `next.config.ts` — static export, `trailingSlash` so Starlette's `StaticFiles(html=True)`
+    resolves a directory to its `index.html`
+  - `app/globals.css` — the §2 palette and the three brand colours as a Tailwind v4 `@theme`
+    block, plus the `flash-up` / `flash-down` keyframes and a `prefers-reduced-motion` opt-out
+  - `hooks/usePriceStream.ts` — one `EventSource`, four connection states, sparklines accumulated
+    from page load in a 120-point window, and the `event: shock` frames
+  - `hooks/usePriceFlash.ts` — direction plus a sequence used as the element's React `key`
+  - `hooks/useApiResource.ts` — fetch-once with a **derived** `loading`, so a reload or a changed
+    path is right without a flag to remember, and the effect holds no synchronous `setState`
+  - `state/TerminalProvider.tsx` — **the structure pass's finding.** The single stream, the
+    account, and `refresh()`; `useMarket()` / `useAccount()`
+  - `components/` — `WatchlistPanel` (+ `TickerRow`), `Sparkline`, `Header`, `ConnectionDot`,
+    `FeedPanel`
+  - `lib/` — `api.ts` (base URL, `getJson`, `ENDPOINTS`), `types.ts`, `format.ts`, `valuation.ts`
+  - `test/FakeEventSource.ts`, `test/fixtures.ts`; `frontend/CLAUDE.md`; `test/smoke_frontend.sh`
+- **Exit criteria:** all five met. The three visual ones were verified by driving a real browser
+  against a real server, not by reading the code
+  - *`npm run build` produces a static export in `out/` with no errors* — and, after review finding
+    1, **from a clean clone**: `git clone` of the branch, `npm ci`, build, `tsc`, 89 tests, all green
+  - *Prices visibly stream and flash green/red, fading rather than sticking* — over 24 samples at
+    250 ms, 118 up-flashes and 79 down-flashes observed across the grid. The fade is the second
+    half: when the feed was killed, **every flash class cleared** (0 stuck) while the last prices
+    stayed on screen
+  - *Stopping the backend turns the dot yellow then red; restarting reconnects without a page
+    reload* — observed in that order, `bg-accent`/"Reconnecting" → `bg-down`/"Disconnected", with
+    the feed panel reading "No price stream. Prices below are the last received." On restart the
+    server logged `SSE client connected` and the page returned to `bg-up`/"Live" with prices
+    moving, `performance.getEntriesByType('navigation').length === 1` — one navigation, no reload.
+    The accumulated sparklines survived the outage
+  - *Sparklines accumulate progressively from page load* — 13 → 25 points over six seconds after a
+    fresh load, one per 500 ms tick, every row drawing one. Empty at load, never fabricated
+  - *Component tests cover render-with-mock-data and a flash class on price change* — both, plus
+    the fade, plus flash isolation to the row that moved
+- **Tests:** **89 frontend** (new) and 694 backend (+2). Both suites green three consecutive times;
+  backend green a fourth time under coverage at **100%**, holding the floor from Checkpoints 1–4.
+  `npm run lint`, `tsc --noEmit`, `ruff check` and `ruff format --check` all clean
+
+  **17 mutations run, 17 killed** — the single connection, `close()` and listener removal on
+  unmount, the escalation timer's arming and clearing, CLOSED-versus-retrying, the grace period,
+  the sparkline cap and accumulation, quote validation, both flash guards and the restart key,
+  em-dash-not-zero, the unpriced-position rule, stream-beats-fetch in two places, and the provider
+  itself. One survived the first pass and was a genuine gap, the **fifth checkpoint running**
+  where that has been true: dropping the "first price is not a change" guard passed every test in
+  the file, because they all start from a price rather than from nothing. A ticker added to the
+  watchlist would have flashed green on being priced — reporting a gain that never happened.
+  `"does not flash when a row receives its first price"` now covers it
+- **Review:** `/code-review high` returned **5 findings, all 5 fixed**, each fix mutation-verified
+  1. **HIGH — `frontend/src/lib/` was never committed.** The root `.gitignore` carries `lib/` from
+     GitHub's Python template, and an unanchored pattern matches a directory of that name at *any*
+     depth. Six files untracked; a clean clone could not build, typecheck or test, and every local
+     check passed because the files were sitting on disk. The exit criterion was not satisfied by
+     what had been committed. **Fixed**: the pattern is anchored to the repo root, and
+     `test/smoke_frontend.sh` fails if anything under `frontend/src` is ignored or untracked
+  2. **MEDIUM — the header's P&L divided a live numerator by a stale denominator.**
+     `portfolio.cost_basis` covers the positions priced *at fetch time*; `valuePortfolio` marks
+     every position it can price now. Holding MSFT at 4,000 priced and AAPL at 2,000 unpriced, the
+     header read **+55%** where the truth was +3.7%, the instant AAPL's first quote arrived — and
+     `makePortfolio` mirrors the backend, so no fixture could have caught it. **Fixed**:
+     `LiveValuation` carries the cost of exactly the positions it marked
+  3. LOW — a price going from a number to `null` left the flash class set for the session.
+     **Fixed** by deriving it from the current price rather than clearing it in the effect; the
+     obvious fix tripped `react-hooks/set-state-in-effect`, and the derivation is better anyway
+  4. LOW — a frame whose every quote failed validation still advanced `frames` and `lastFrameAt`,
+     so the feed panel reported "Streaming" beside a grid of dashes: the one distinction it exists
+     to make. **Fixed**
+  5. LOW — the error branch replaced a grid that `useApiResource` deliberately keeps through a
+     failed reload, and those rows are still being marked by the stream. **Fixed**: a banner above
+     the rows. Not reachable until Checkpoint 6 calls `reload()`, which is when it would have bitten
+
+  The reviewer also confirmed the wire contract field-by-field against `PriceUpdate.to_dict`,
+  `MarketEvent.to_dict` and `_row`, and cleared the `EventSource` lifecycle — this checkpoint's
+  stated review focus — as sound.
+
+  `/security-review` not run: optional here by the gate definition, and this checkpoint adds no
+  untrusted input, no money movement and no secret handling. The one thing worth noting is that
+  `NEXT_PUBLIC_API_BASE` is inlined into the bundle at build time, so it must never hold anything
+  secret; it holds a localhost URL for `next dev` and is empty in production.
+
+  **Structure pass, done inline.** `usePriceStream` opens a connection per call, so "one
+  `EventSource` per page" was true only because `page.tsx` happened to call it once — a panel
+  reaching for prices in Checkpoint 6 would have silently doubled the streams the backend feeds,
+  and nothing in the hook's signature would have stopped it. `TerminalProvider` is now the only
+  caller. It also answers the account half: a trade from Checkpoint 6's trade bar and an
+  auto-executed trade from Checkpoint 7's chat both need every panel to agree again, and
+  `refresh()` is that one call
+- **Diverged from plan:** four, all deliberate
+  - **`FeedPanel` is not in §10's component list.** Checkpoint 5 fills the header and one panel,
+    which leaves the main column empty until Checkpoint 6, and §10's alternative was placeholder
+    text that Checkpoint 10 forbids. It shows feed health — frames, last update, tickers priced —
+    and consumes the `event: shock` frames the backend has published since Checkpoint 1 with
+    nothing reading them. It also carries the "prices below are the last received" line that makes
+    a dead feed legible
+  - **No webfont.** §10 does not require one and `create-next-app` supplies two; `next/font/google`
+    fetches at build time, which would put a network dependency inside Checkpoint 8's
+    `docker build`. The system stack has no swap flash and already has tabular figures
+  - **`NEXT_PUBLIC_API_BASE` is a new environment variable**, added to §5. It is empty in
+    production — the export and the API share an origin — and exists because `output: 'export'`
+    ignores `rewrites`, so `next dev` on :3000 has no other way to reach :8000
+  - **The backend test fixture now pins `STATIC_DIR`.** Not planned, and not optional: see below
+- **The suite was environment-dependent, and this checkpoint proved it.** Building the frontend
+  made `frontend/out` exist, `_resolve_static_dir()` found it, and the *test* app began mounting
+  `StaticFiles` at "/" — which answers every unmatched `/api/*` path. A watchlist test asserting
+  404-or-422 on an encoded-traversal path started returning 405 from the static handler.
+  `clean_environment` listed `STATIC_DIR` among the variables it cleared, but clearing it is not
+  neutral when the default is a filesystem search. It is now pinned to a path that cannot exist,
+  with `test_the_suite_itself_runs_with_no_static_mount` as the guard and
+  `test_an_unmatched_api_path_reaches_no_handler_behind_the_frontend` recording what production
+  actually does. Both fail with the pin removed. Until today, any developer who had built a
+  frontend was running a different suite from CI
+- **Resolved from Checkpoint 4's carried-forward list:** none of it belonged to this checkpoint.
+  The unreproducible failure, the stalled-source gap, the ticker that stays subscribed, the mock's
+  stop-list, `list_trades()`, the `_unsubscribe` race and the untested prompt behaviour are all
+  unchanged and restated below
+- **Carried forward:**
+  - **There is no watchlist add/remove control, and no checkpoint's scope claims one.** `POST` and
+    `DELETE /api/watchlist` have been live since Checkpoint 3 and §2 promises the user can manage
+    the list by hand, but §Checkpoint 5 lists only the panel's columns and §Checkpoint 6 lists
+    charts, the heatmap and the trade bar. **Checkpoint 6 should take it** — it is the checkpoint
+    with the trade bar, and the two belong side by side
+  - **Nothing renders `unpriced_tickers` except the header.** A position with no price is named
+    there; Checkpoint 6's positions table and heatmap must not quietly show it as zero
+  - **The main column is empty until Checkpoint 6.** Deliberate — an honest gap beats placeholder
+    text — but it is the one thing that makes the page look unfinished, and §2's "every pixel
+    earns its place" is not yet true
+  - **The render path has not been measured under load.** Ten rows at 2 Hz is nothing, but every
+    frame replaces the `prices` and `sparklines` objects and re-renders every consumer.
+    Checkpoint 6's review focus is exactly this, and it arrives with a chart and a treemap
+  - **`RECONNECT_GRACE_MS` is 6 s, chosen not derived.** Long enough that a one-second blip does
+    not read as an outage, short enough that a dead backend does not stay amber. Nothing measures
+    what a real reconnect costs
+  - **The browser verification is manual.** Gate 3's flash, dot and sparkline evidence came from
+    driving Playwright by hand; `test/smoke_frontend.sh` covers everything else and is re-runnable.
+    **Checkpoint 9 owns this** — those three observations are exactly its SSE-resilience and
+    fresh-start scenarios
+  - **`.playwright-mcp/` is written into the repo root** by the MCP browser tooling and was deleted
+    by hand after Gate 3. If Checkpoint 9 drives a browser the same way, that path needs a
+    `.gitignore` entry
+  - Frontend coverage is **not measured** — no coverage provider is installed, and the status
+    table's figure is the backend's by its own definition. Checkpoint 10 should decide whether the
+    frontend needs a floor of its own
+  - Mutation testing found a real gap for the **fifth checkpoint running**. The lesson has now held
+    across two languages and two test frameworks
