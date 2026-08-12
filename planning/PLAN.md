@@ -1270,10 +1270,11 @@ finding, divergence and carried-forward item survives; the narrative retellings 
     tenfold CPU load, and repeating the exact smoke-then-suite sequence. Its identity is lost
     because the run was piped through `tail -1`. CP4 added no timing-dependent test; every fixed
     sleep is inherited from CP1–CP3 (`test_main.py`, `test_simulator_source.py`, `test_massive.py`).
-    **CP9 owns flaky-test sources and must resolve this**; until then capture full pytest output
-  - **A stalled-but-alive source is still undetected**, now reachable through one more path — the
-    chat would fill against frozen prices exactly as the trade endpoint would. Fix and threshold as
-    recorded at CP3
+    ~~**CP9 owns flaky-test sources and must resolve this**~~ — **resolved** in Checkpoint 5's
+    follow-up pass: it is `test_keeps_appending_every_interval`, and it was I/O latency
+  - ~~**A stalled-but-alive source is still undetected**~~ — **resolved** in Checkpoint 5's
+    follow-up pass. The bound is on receipt time, not the venue timestamp, and comes from the
+    source's own cadence
   - **A ticker stays subscribed after its position closes**, unchanged; the chat can reach this too
   - **The mock's stop-list is a heuristic, not a parser** — "buy 3 widgets" still trades `WIDGETS`.
     Bounded to `LLM_MOCK=true`, so it costs CP9 a carefully worded fixture
@@ -1431,3 +1432,83 @@ finding, divergence and carried-forward item survives; the narrative retellings 
     frontend needs a floor of its own
   - Mutation testing found a real gap for the **fifth checkpoint running**. The lesson has now held
     across two languages and two test frameworks
+
+##### Checkpoint 5 — follow-up pass (2026-08-12, same branch, before merge)
+
+An audit of everything Checkpoints 1–5 carried forward, run against the live
+app rather than against the list. Two of the carried-forward items were real
+defects and are now closed; the rest are restated below with what changed.
+
+- **The stalled-but-alive market source is fixed.** Carried forward unresolved
+  from Checkpoint 3 and again from Checkpoint 4, both times because "the
+  threshold has to come from the poll interval" and guessing it would block
+  valid trades. The threshold now comes from the source, which is the only
+  thing that knows it:
+  - `MarketDataSource.quote_staleness_limit` on the ABC. The simulator answers
+    `max(interval * 20, 5 s)`, Massive `max(interval * 4, 60 s)`
+  - **The bound is on receipt time, not on `PriceUpdate.timestamp`.** That was
+    the trap behind the two deferrals: the venue timestamp is hours old the
+    moment the market closes, so bounding it would refuse every trade out of
+    hours. `PriceCache` now records when *it* was written, on the monotonic
+    clock, and `age_of` / `is_stale` answer from that
+  - `start()` stamps the limit on the cache it is about to write, rather than
+    the call sites doing it. There are two call sites — `start_market_data` and
+    the lifespan's failover handler — and the second is the one that would have
+    been forgotten: a simulator taking over from a dead Massive must install
+    its own 10-second bound, not inherit a 60-second one
+  - `app.portfolio._require_price` refuses the fill, so the chat path is
+    covered by the same rule as the trade bar. `get_portfolio` is untouched:
+    only trading is refused, and a blank portfolio would be worse than a stale
+    one
+  - **10 mutations, 10 killed**, including both halves of the stamping, both
+    bounds, and the trade path forgetting to ask
+- **Checkpoint 4's unreproducible test failure is identified and fixed.** It is
+  `tests/test_main.py::TestSnapshotTask::test_keeps_appending_every_interval`,
+  reproduced here at roughly **one run in seventeen** and captured with full
+  output this time. The mechanism: it slept 50 ms and expected two snapshots,
+  each of which opens a SQLite connection. It is **I/O latency, not CPU** —
+  twelve `yes` processes never reproduced it, and slowing the write to 30 ms
+  reproduces it **5 times out of 5**.
+  - `tests/conftest.wait_until` waits for a condition instead of a duration,
+    and eleven fixed-sleep assertions across `test_main.py`,
+    `test_simulator_source.py` and `test_massive.py` — every one of the form
+    "sleep, then assert N things happened" — now use it. The inverse form,
+    "assert nothing happened after shutdown", keeps its fixed sleep: there is
+    no condition to wait for and a longer sleep only makes it stronger
+  - `test_keeps_appending_even_when_each_write_is_slow` is the regression
+    guard, and the controlled experiment: with a 30 ms write the old form fails
+    5/5 and the new one passes 5/5
+  - **25 consecutive full-suite runs clean**, against a defect that showed at
+    about 1 in 17
+- **The dot no longer lies about a wedged feed.** The UI half of the same
+  defect: a wedged source keeps the SSE connection open and healthy, so the
+  page read "Live" over frozen numbers — the exact distinction `FeedPanel`'s
+  docstring claims to make. `usePriceStream` now reports `stalled` after
+  `STALL_AFTER_MS` (30 s) without a frame, on one interval for the life of the
+  mount rather than a timeout rescheduled per frame, cleared on unmount. The
+  dot shows amber "Stalled" and the panel says the values are frozen. A real
+  disconnection still wins over a stall. **7 mutations, 7 killed**
+- **`.playwright-mcp/` is now ignored**, closing Checkpoint 5's own note about
+  the browser tooling writing into the repo root
+- **Tests:** backend 694 → **717**, frontend 89 → **98**. Both suites green
+  three consecutive times, backend a fourth under coverage at **100%**, and 25
+  more full runs while hunting the flake. `ruff`, `eslint` and `tsc` clean
+- **Not fixed, and why.** `list_trades()` is still uncalled — it is scaffolding
+  with a named owner (Checkpoint 6 or 7 surfaces it, Checkpoint 10 deletes it),
+  not a defect. The `_unsubscribe` race is unchanged: closing it needs the
+  source subscription and the database row under one lock, which the async/sync
+  split prevents, and it is narrowed rather than open. A ticker still stays
+  subscribed after its position closes, which remains deliberate. The watchlist
+  add/remove UI is missing rather than broken and belongs to Checkpoint 6
+- **Carried forward, restated:**
+  - `MASSIVE_POLL_INTERVAL` above 30 seconds would make the frontend's
+    `STALL_AFTER_MS` fire on a healthy feed. The backend derives its bound from
+    the interval; the frontend cannot see it. If a deployment ever needs a slow
+    poll, the limit has to reach the client — an `event: status` field would do
+    it
+  - The staleness bound is not exercised end-to-end against a running server.
+    It is unit-tested, contract-tested across both sources, mutation-verified,
+    and driven once through a real `SimulatorDataSource` whose loop was taken
+    away — but wedging a live process from outside is exactly what Checkpoint 9
+    should automate
+  - Everything else on Checkpoint 4's and Checkpoint 5's lists is unchanged

@@ -21,8 +21,22 @@ class PriceCache:
 
     def __init__(self) -> None:
         self._prices: dict[str, PriceUpdate] = {}
+        #: When *we* last wrote each ticker, on the monotonic clock. Deliberately
+        #: not `PriceUpdate.timestamp`, which is the venue's trade time: on
+        #: Massive that is hours old the moment the market closes, and bounding
+        #: it would refuse every trade out of hours. What detects a wedged
+        #: poller is how long since anything arrived, which only receipt time
+        #: can say. Monotonic, so a clock adjustment cannot make a live feed
+        #: look stale.
+        self._received: dict[str, float] = {}
         self._lock = Lock()
         self._version: int = 0  # monotonic; +1 per update
+
+        #: How old an entry may be before `is_stale` reports it, in seconds, or
+        #: None for no bound. Stamped by whichever source is writing — see
+        #: `MarketDataSource.quote_staleness_limit`. A cache nobody is writing
+        #: keeps None, so tests that populate it by hand are unaffected.
+        self.staleness_limit: float | None = None
 
     def update(
         self,
@@ -60,6 +74,7 @@ class PriceCache:
                 previous_close=round(close, 2) if close is not None else None,
             )
             self._prices[ticker] = update
+            self._received[ticker] = time.monotonic()
             self._version += 1
             return update
 
@@ -81,7 +96,34 @@ class PriceCache:
     def remove(self, ticker: str) -> None:
         """Remove a ticker from the cache (e.g. when removed from the watchlist)."""
         with self._lock:
-            self._prices.pop(normalize_ticker(ticker), None)
+            ticker = normalize_ticker(ticker)
+            self._prices.pop(ticker, None)
+            self._received.pop(ticker, None)
+
+    def age_of(self, ticker: str) -> float | None:
+        """Seconds since this cache last received a price for `ticker`.
+
+        None when the ticker has never been written. Measured from receipt, not
+        from the quote's own timestamp — see `_received`.
+        """
+        with self._lock:
+            received = self._received.get(normalize_ticker(ticker))
+        return None if received is None else time.monotonic() - received
+
+    def is_stale(self, ticker: str) -> bool:
+        """Has this entry outlived what its source promised?
+
+        A factual question about the cache's own bookkeeping — what to *do*
+        about a stale quote is a money rule, and lives in `app.portfolio`.
+
+        False when no source has stamped a limit, and False for a ticker never
+        written: "no price at all" is a different refusal with a better message.
+        """
+        limit = self.staleness_limit
+        if limit is None:
+            return False
+        age = self.age_of(ticker)
+        return age is not None and age > limit
 
     @property
     def version(self) -> int:

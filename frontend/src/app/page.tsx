@@ -29,7 +29,12 @@ function Workstation() {
 
   return (
     <div className="flex h-dvh flex-col bg-terminal text-ink">
-      <Header portfolio={account.portfolio} prices={market.prices} status={market.status} />
+      <Header
+        portfolio={account.portfolio}
+        prices={market.prices}
+        status={market.status}
+        stalled={market.stalled}
+      />
 
       <main className="grid min-h-0 flex-1 grid-cols-1 gap-2 p-2 lg:grid-cols-[minmax(320px,380px)_1fr]">
         <WatchlistPanel
@@ -42,6 +47,7 @@ function Workstation() {
 
         <FeedPanel
           status={market.status}
+          stalled={market.stalled}
           frames={market.frames}
           lastFrameAt={market.lastFrameAt}
           tickerCount={Object.keys(market.prices).length}

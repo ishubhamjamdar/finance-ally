@@ -23,6 +23,7 @@ from app.market.massive_client import (
     is_permanent_failure,
     to_epoch_seconds,
 )
+from tests.conftest import wait_until
 
 from .conftest import (
     NOT_AUTHORIZED_BODY,
@@ -438,7 +439,7 @@ class TestPollLoop:
         source._fetch_snapshots = lambda: (_ for _ in ()).throw(Exception("503 upstream"))
 
         task = asyncio.create_task(source._poll_loop())
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: source._cache.version > 0 or task.done(), timeout=0.5)
         assert not task.done()  # still retrying
         task.cancel()
 
@@ -458,7 +459,7 @@ class TestPollLoop:
         source._poll_once = exploding_poll
 
         task = asyncio.create_task(source._poll_loop())
-        await asyncio.sleep(0.06)
+        await wait_until(lambda: calls["n"] > 1 or task.done())
         still_running = not task.done()
         task.cancel()
 
@@ -483,7 +484,7 @@ class TestPollLoop:
         source._refresh_market_status = counting_refresh
 
         task = asyncio.create_task(source._poll_loop())
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: refreshes["n"] >= 1 or task.done())
         task.cancel()
 
         assert refreshes["n"] >= 1

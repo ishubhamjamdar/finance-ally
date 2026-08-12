@@ -126,6 +126,27 @@ class TestTradeExecution:
         assert "Insufficient cash" in action.detail
         assert read_cash() == 10000.0
 
+    async def test_the_model_cannot_trade_on_a_frozen_price(
+        self, chat, stub_model, price_cache, read_cash
+    ):
+        """The staleness bound protects the chat path too, and for a better
+        reason than the trade bar: nobody is watching this one.
+
+        A user typing into the trade bar can see the prices are not moving. A
+        model asked to rebalance cannot, and would happily fill ten orders
+        against a wedged feed.
+        """
+        price_cache.staleness_limit = 10.0
+        price_cache._received["AAPL"] -= 120
+        stub_model.replies(trades=[{"ticker": "AAPL", "side": "buy", "quantity": 1}])
+
+        reply = await chat("buy some AAPL")
+
+        (action,) = reply.actions
+        assert action.ok is False
+        assert "stopped updating" in action.detail
+        assert read_cash() == 10000.0
+
     async def test_the_model_cannot_oversell(self, chat, stub_model, add_position):
         add_position("AAPL", quantity=2.0)
         stub_model.replies(trades=[{"ticker": "AAPL", "side": "sell", "quantity": 50}])

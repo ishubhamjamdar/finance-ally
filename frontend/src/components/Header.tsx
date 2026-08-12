@@ -19,9 +19,11 @@ interface HeaderProps {
   portfolio: Portfolio | null;
   prices: Record<string, Quote>;
   status: ConnectionStatus;
+  /** Connected but receiving nothing — see `usePriceStream`. */
+  stalled?: boolean;
 }
 
-export function Header({ portfolio, prices, status }: HeaderProps) {
+export function Header({ portfolio, prices, status, stalled = false }: HeaderProps) {
   const live = valuePortfolio(portfolio, prices);
 
   // Against what was paid for the positions actually marked — `live.costBasis`,
@@ -68,7 +70,7 @@ export function Header({ portfolio, prices, status }: HeaderProps) {
       </dl>
 
       <div className="ml-auto">
-        <ConnectionDot status={status} />
+        <ConnectionDot status={status} stalled={stalled} />
       </div>
     </header>
   );

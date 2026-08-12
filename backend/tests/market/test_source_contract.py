@@ -112,3 +112,38 @@ async def test_remove_unknown_ticker_is_a_noop(source_factory):
     await source.remove_ticker("NOSUCH")
     assert source.get_tickers() == ["AAPL"]
     await source.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_stamps_its_own_staleness_bound_on_the_cache(source_factory):
+    """Every source declares how fresh its writes will be, and stamps it when
+    it starts writing.
+
+    Stamped by the source rather than by the call sites because there are two
+    of those — `factory.start_market_data` and the lifespan's failover handler
+    — and the second one is the one that would have been forgotten: a
+    simulator taking over from a dead Massive must install its own bound, not
+    inherit a 60-second one meant for a 15-second poller.
+    """
+    cache = PriceCache()
+    assert cache.staleness_limit is None
+
+    source = source_factory(cache)
+    await source.start(["AAPL"])
+
+    assert cache.staleness_limit == source.quote_staleness_limit
+    assert source.quote_staleness_limit > 0
+    assert cache.is_stale("AAPL") is False
+    await source.stop()
+
+
+@pytest.mark.asyncio
+async def test_the_bound_is_looser_than_the_cadence_it_is_derived_from(source_factory):
+    """A bound tighter than the source's own interval would refuse valid
+    trades between two perfectly healthy updates."""
+    cache = PriceCache()
+    source = source_factory(cache)
+    await source.start(["AAPL"])
+
+    assert source.quote_staleness_limit > source._interval
+    await source.stop()

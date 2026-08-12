@@ -42,6 +42,21 @@ export const MAX_SPARKLINE_POINTS = 120;
 /** How long the browser may keep failing before the dot turns red. */
 export const RECONNECT_GRACE_MS = 6000;
 
+/**
+ * How long an open connection may deliver nothing before the page says so.
+ *
+ * A wedged market source is invisible to `EventSource`: the connection stays
+ * open and healthy, the server keeps sending heartbeats, and no price ever
+ * arrives. Without this the dot reads "Live" over a grid of frozen numbers,
+ * which is the one thing the feed panel exists to prevent.
+ *
+ * It must clear the longest legitimate gap between frames. The simulator sends
+ * one every 500 ms and Massive one per poll — 15 s on the free tier — so 30 s
+ * is quiet by any default configuration. A deployment that sets
+ * `MASSIVE_POLL_INTERVAL` above 30 would need this raised to match.
+ */
+export const STALL_AFTER_MS = 30_000;
+
 /** How many `event: shock` frames to keep. Oldest are dropped. */
 export const MAX_SHOCKS = 12;
 
@@ -57,6 +72,14 @@ export interface PriceStream {
   /** Notable moves, newest first. */
   shocks: MarketShock[];
   status: ConnectionStatus;
+  /**
+   * Connected, but nothing has arrived for `STALL_AFTER_MS`.
+   *
+   * Separate from `status` because it is a different failure with a different
+   * cause: the connection is fine and the *feed behind it* has stopped. The
+   * prices on screen are real, and stale.
+   */
+  stalled: boolean;
   /** Price frames received this mount. Diagnostic; also proves liveness. */
   frames: number;
   /** `Date.now()` of the last frame, or null before the first. */
@@ -68,11 +91,18 @@ const INITIAL: PriceStream = {
   sparklines: {},
   shocks: [],
   status: "connecting",
+  stalled: false,
   frames: 0,
   lastFrameAt: null,
 };
 
-export function usePriceStream(path = "/api/stream/prices"): PriceStream {
+/** How often the stall check runs. Coarse on purpose: it is a wall clock. */
+const STALL_CHECK_INTERVAL_MS = 1000;
+
+export function usePriceStream(
+  path = "/api/stream/prices",
+  stallAfterMs: number = STALL_AFTER_MS,
+): PriceStream {
   const [state, setState] = useState<PriceStream>(INITIAL);
 
   useEffect(() => {
@@ -83,6 +113,12 @@ export function usePriceStream(path = "/api/stream/prices"): PriceStream {
     // handler from a previous mount to reach the current timer.
     let status: ConnectionStatus = "connecting";
     let escalation: ReturnType<typeof setTimeout> | null = null;
+
+    // Frame arrival has to be tracked here as well as in state: the stall check
+    // runs on a timer with no event to carry the value, and reading it from
+    // state would need the effect to re-run — which would reopen the stream.
+    let lastFrame: number | null = null;
+    let stalled = false;
 
     const clearEscalation = () => {
       if (escalation !== null) {
@@ -114,6 +150,12 @@ export function usePriceStream(path = "/api/stream/prices"): PriceStream {
       if (frame === null || Object.keys(frame).length === 0) return;
 
       const receivedAt = Date.now();
+      lastFrame = receivedAt;
+      if (stalled) {
+        stalled = false;
+        setState((previous) => ({ ...previous, stalled: false }));
+      }
+
       setState((previous) => {
         const prices = { ...previous.prices };
         const sparklines = { ...previous.sparklines };
@@ -164,6 +206,15 @@ export function usePriceStream(path = "/api/stream/prices"): PriceStream {
       }
     };
 
+    // One interval for the life of the mount, not a timeout rescheduled per
+    // frame: at two frames a second that would be 7,200 timers an hour.
+    const stallCheck = setInterval(() => {
+      const next = lastFrame !== null && Date.now() - lastFrame > stallAfterMs;
+      if (next === stalled) return;
+      stalled = next;
+      setState((previous) => ({ ...previous, stalled: next }));
+    }, STALL_CHECK_INTERVAL_MS);
+
     source.addEventListener("open", onOpen);
     source.addEventListener("message", onMessage);
     source.addEventListener("shock", onShock);
@@ -171,13 +222,14 @@ export function usePriceStream(path = "/api/stream/prices"): PriceStream {
 
     return () => {
       clearEscalation();
+      clearInterval(stallCheck);
       source.removeEventListener("open", onOpen);
       source.removeEventListener("message", onMessage);
       source.removeEventListener("shock", onShock);
       source.removeEventListener("error", onError);
       source.close();
     };
-  }, [path]);
+  }, [path, stallAfterMs]);
 
   return state;
 }

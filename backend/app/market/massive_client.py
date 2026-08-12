@@ -189,10 +189,23 @@ class MassiveDataSource(MarketDataSource):
         self._poll_count = 0
         self.market_status: str | None = None  # "open" | "closed" | "extended-hours"
 
+    @property
+    def quote_staleness_limit(self) -> float:
+        """Four polls, and never under a minute.
+
+        Bounding *receipt* time rather than the venue timestamp, so this does
+        not fire when the market closes — polls keep succeeding and keep
+        writing, they just carry the same trade. A whole minute with nothing
+        arriving from a polling source is unambiguous, and the four-poll factor
+        keeps a slow tier from tripping on one retried request.
+        """
+        return max(self._interval * 4, 60.0)
+
     async def start(self, tickers: list[str]) -> None:
         # Normalised HERE too, not only in add/remove — a lower-case watchlist
         # row from SQLite would otherwise silently produce no data.
         self._tickers = [normalize_ticker(t) for t in tickers]
+        self._cache.staleness_limit = self.quote_staleness_limit
         self._client = RESTClient(
             api_key=self._api_key,
             connect_timeout=self._connect_timeout,  # tighter than the 10 s default, so a

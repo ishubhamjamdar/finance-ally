@@ -206,3 +206,96 @@ class TestConcurrency:
                 future.result()
 
         assert errors == []
+
+
+class TestStaleness:
+    """Receipt-time bookkeeping — what tells a wedged feed from a quiet one.
+
+    The distinction that matters throughout: `PriceUpdate.timestamp` is the
+    venue's trade time, which on Massive is hours old the moment the market
+    closes. These ages are measured from when *this cache* was written.
+    """
+
+    def test_a_fresh_write_has_a_small_age(self):
+        cache = PriceCache()
+        cache.update("AAPL", 190.0)
+
+        age = cache.age_of("AAPL")
+        assert age is not None
+        assert age < 1.0
+
+    def test_a_ticker_never_written_has_no_age(self):
+        assert PriceCache().age_of("AAPL") is None
+
+    def test_age_is_normalised_like_every_other_lookup(self):
+        cache = PriceCache()
+        cache.update("aapl", 190.0)
+
+        assert cache.age_of(" AAPL ") is not None
+
+    def test_nothing_is_stale_without_a_source_to_set_the_bound(self):
+        """A cache nobody is writing keeps `staleness_limit` at None, which is
+        what leaves hand-populated test caches — and every API test — alone."""
+        cache = PriceCache()
+        cache.update("AAPL", 190.0)
+        cache._received["AAPL"] -= 3600  # an hour old
+
+        assert cache.staleness_limit is None
+        assert cache.is_stale("AAPL") is False
+
+    def test_an_entry_older_than_the_bound_is_stale(self):
+        cache = PriceCache()
+        cache.staleness_limit = 10.0
+        cache.update("AAPL", 190.0)
+        cache._received["AAPL"] -= 11
+
+        assert cache.is_stale("AAPL") is True
+
+    def test_an_entry_inside_the_bound_is_not(self):
+        cache = PriceCache()
+        cache.staleness_limit = 10.0
+        cache.update("AAPL", 190.0)
+        cache._received["AAPL"] -= 9
+
+        assert cache.is_stale("AAPL") is False
+
+    def test_a_ticker_with_no_price_is_not_reported_as_stale(self):
+        """ "No price at all" is a different refusal with a better message, and
+        `_require_price` reaches it first."""
+        cache = PriceCache()
+        cache.staleness_limit = 10.0
+
+        assert cache.is_stale("AAPL") is False
+
+    def test_staleness_is_per_ticker(self):
+        """One ticker dropping out of a Massive snapshot must not condemn the
+        rest, and must not be hidden by them either."""
+        cache = PriceCache()
+        cache.staleness_limit = 10.0
+        cache.update("AAPL", 190.0)
+        cache.update("MSFT", 420.0)
+        cache._received["MSFT"] -= 30
+
+        assert cache.is_stale("AAPL") is False
+        assert cache.is_stale("MSFT") is True
+
+    def test_a_later_write_clears_staleness(self):
+        cache = PriceCache()
+        cache.staleness_limit = 10.0
+        cache.update("AAPL", 190.0)
+        cache._received["AAPL"] -= 30
+        assert cache.is_stale("AAPL") is True
+
+        cache.update("AAPL", 191.0)
+
+        assert cache.is_stale("AAPL") is False
+
+    def test_removing_a_ticker_forgets_when_it_arrived(self):
+        """Otherwise a ticker removed and re-added carries the old receipt, and
+        `remove` already exists to make re-adding a clean slate."""
+        cache = PriceCache()
+        cache.update("AAPL", 190.0)
+
+        cache.remove("AAPL")
+
+        assert cache.age_of("AAPL") is None

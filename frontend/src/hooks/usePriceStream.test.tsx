@@ -321,3 +321,105 @@ describe("usePriceStream", () => {
     expect(result.current.prices.AAPL.direction).toBe("up");
   });
 });
+
+describe("stall detection", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("reports a connection that is open but delivering nothing", () => {
+    // The failure EventSource cannot see: the socket is healthy, the server is
+    // sending heartbeats, and the market source behind it has wedged. Without
+    // this the dot reads Live over a grid of frozen numbers.
+    const { result } = renderHook(() => usePriceStream("/api/stream/prices", 30_000));
+
+    act(() => {
+      FakeEventSource.only.emitOpen();
+      FakeEventSource.only.emitMessage(makeFrame({ AAPL: 190 }));
+    });
+    expect(result.current.stalled).toBe(false);
+
+    act(() => {
+      vi.advanceTimersByTime(31_000);
+    });
+
+    expect(result.current.stalled).toBe(true);
+    expect(result.current.status).toBe("connected");
+  });
+
+  it("does not report a stall inside the window", () => {
+    const { result } = renderHook(() => usePriceStream("/api/stream/prices", 30_000));
+
+    act(() => {
+      FakeEventSource.only.emitOpen();
+      FakeEventSource.only.emitMessage(makeFrame({ AAPL: 190 }));
+    });
+    act(() => {
+      vi.advanceTimersByTime(29_000);
+    });
+
+    expect(result.current.stalled).toBe(false);
+  });
+
+  it("clears the moment a price arrives again", () => {
+    const { result } = renderHook(() => usePriceStream("/api/stream/prices", 30_000));
+
+    act(() => {
+      FakeEventSource.only.emitOpen();
+      FakeEventSource.only.emitMessage(makeFrame({ AAPL: 190 }));
+    });
+    act(() => {
+      vi.advanceTimersByTime(31_000);
+    });
+    expect(result.current.stalled).toBe(true);
+
+    act(() => {
+      FakeEventSource.only.emitMessage(makeFrame({ AAPL: 191 }));
+    });
+
+    expect(result.current.stalled).toBe(false);
+  });
+
+  it("does not call a page that has never received anything stalled", () => {
+    // Before the first frame the honest state is "connecting", which the dot
+    // already reports. Calling that a stall would fire on every page load.
+    const { result } = renderHook(() => usePriceStream("/api/stream/prices", 30_000));
+
+    act(() => {
+      vi.advanceTimersByTime(120_000);
+    });
+
+    expect(result.current.stalled).toBe(false);
+  });
+
+  it("stops its timer on unmount", () => {
+    const { unmount } = renderHook(() => usePriceStream());
+    act(() => {
+      FakeEventSource.only.emitOpen();
+    });
+
+    unmount();
+
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("uses one timer, not one per frame", () => {
+    // A timeout rescheduled on arrival would be 7,200 timers an hour at the
+    // 500 ms tick.
+    renderHook(() => usePriceStream());
+    act(() => {
+      FakeEventSource.only.emitOpen();
+    });
+    const timers = vi.getTimerCount();
+
+    act(() => {
+      for (let i = 0; i < 20; i++) FakeEventSource.only.emitMessage(makeFrame({ AAPL: 190 + i }));
+    });
+
+    expect(vi.getTimerCount()).toBe(timers);
+  });
+});
