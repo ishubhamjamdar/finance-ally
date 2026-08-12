@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,7 +19,7 @@ from app.main import (
 from app.market import MarketDataSource
 from app.market.simulator import SimulatorDataSource
 from app.portfolio import record_snapshot
-from tests.conftest import PLAN_DEFAULT_WATCHLIST, snapshot_count, snapshot_values
+from tests.conftest import PLAN_DEFAULT_WATCHLIST, snapshot_count, snapshot_values, wait_until
 
 DEFAULT_WATCHLIST = set(PLAN_DEFAULT_WATCHLIST)
 
@@ -99,8 +100,9 @@ class TestLifespan:
         async with app.router.lifespan_context(app):
             cache = app.state.price_cache
             before = cache.version
-            await asyncio.sleep(0.1)
-            assert cache.version > before, "positive control: prices should tick while running"
+            assert await wait_until(lambda: cache.version > before), (
+                "positive control: prices should tick while running"
+            )
 
         after_shutdown = cache.version
         await asyncio.sleep(0.1)
@@ -158,7 +160,7 @@ class TestSnapshotTask:
         app.state.price_cache = price_cache
 
         task = asyncio.create_task(_snapshot_loop(app, interval=3600))
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: snapshot_count() >= 1)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
@@ -169,12 +171,43 @@ class TestSnapshotTask:
         app.state.price_cache = price_cache
 
         task = asyncio.create_task(_snapshot_loop(app, interval=0.01))
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: snapshot_count() >= 2)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
         assert snapshot_count() >= 2, "the series is not accumulating"
         assert snapshot_values() == [10000.0] * snapshot_count()
+
+    async def test_keeps_appending_even_when_each_write_is_slow(self, price_cache, monkeypatch):
+        """The regression guard for the flake Checkpoint 4 carried forward.
+
+        `test_keeps_appending_every_interval` used to sleep 50 ms and expect two
+        snapshots. Each iteration opens a SQLite connection, so the bet was that
+        two of those finish inside the window — and about one run in seventeen
+        they did not. It is I/O latency, not CPU: twelve `yes` processes never
+        reproduced it, and one slow write reproduces it every time.
+
+        Slowing the write to 30 ms makes the old version fail deterministically
+        and leaves this one green, which is the whole difference between waiting
+        for a duration and waiting for a condition.
+        """
+        real = record_snapshot
+
+        def slow(cache, *args, **kwargs):
+            time.sleep(0.03)
+            return real(cache, *args, **kwargs)
+
+        monkeypatch.setattr("app.main.record_snapshot", slow)
+
+        app = create_app()
+        app.state.price_cache = price_cache
+
+        task = asyncio.create_task(_snapshot_loop(app, interval=0.01))
+        appended = await wait_until(lambda: snapshot_count() >= 2)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert appended, "the series stopped accumulating when writes got slow"
 
     async def test_one_failure_does_not_end_the_series(self, price_cache, monkeypatch):
         """A locked database or a transient I/O error must cost one point, not
@@ -194,7 +227,7 @@ class TestSnapshotTask:
         app.state.price_cache = price_cache
 
         task = asyncio.create_task(_snapshot_loop(app, interval=0.01))
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: calls["n"] >= 2)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
@@ -307,8 +340,7 @@ class TestFailover:
 
             # Running, not merely constructed: prices resume for the user.
             before = app.state.price_cache.version
-            await asyncio.sleep(0.1)
-            assert app.state.price_cache.version > before
+            assert await wait_until(lambda: app.state.price_cache.version > before)
 
     async def test_shutdown_stops_the_replacement(self, revoked_key_source, fast_simulator):
         stub = revoked_key_source(["AAPL"])

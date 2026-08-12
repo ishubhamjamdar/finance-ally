@@ -138,6 +138,36 @@ def mock_llm(monkeypatch):
     monkeypatch.setenv("LLM_MOCK", "true")
 
 
+async def wait_until(predicate, *, timeout: float = 5.0, poll: float = 0.005) -> bool:
+    """Wait for a condition, not for a duration. Returns whether it came true.
+
+    **Never write `await asyncio.sleep(0.05)` and then assert that N things
+    happened.** That is a bet that a background task touching SQLite or the
+    event loop will get enough scheduling inside a wall-clock window, and it is
+    a bet the suite loses: `test_keeps_appending_every_interval` slept 50 ms,
+    expected two snapshots, and failed roughly one run in seventeen. It is
+    almost certainly the `1 failed, 691 passed` that Checkpoint 4 could not
+    reproduce in 63 attempts and carried forward unidentified.
+
+    Waiting on the condition makes the fast machine fast and the slow machine
+    correct. The timeout is generous on purpose — it exists to fail a genuinely
+    broken loop, not to bound a healthy one.
+
+    The inverse assertion — "nothing happened after shutdown" — still uses a
+    fixed sleep, and rightly: there is no condition to wait for, and a longer
+    sleep only makes that test stronger.
+    """
+    import asyncio
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(poll)
+    return bool(predicate())
+
+
 class StubModel:
     """Stands in for the provider, patched over `app.chat.complete`.
 

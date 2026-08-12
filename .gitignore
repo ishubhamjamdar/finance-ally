@@ -227,3 +227,6 @@ frontend/out/
 
 # mutation testing scratch worktree (test/mutate.py)
 .mutation-worktree/
+
+# screenshots and traces from browser-driven verification
+.playwright-mcp/

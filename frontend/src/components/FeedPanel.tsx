@@ -24,8 +24,12 @@ const STATUS_DETAIL: Record<ConnectionStatus, string> = {
   disconnected: "No price stream. Prices below are the last received.",
 };
 
+/** What the panel says when the connection is fine and the feed is not. */
+const STALLED_DETAIL = "Connected, but no prices are arriving. The values below are frozen.";
+
 interface FeedPanelProps {
   status: ConnectionStatus;
+  stalled?: boolean;
   frames: number;
   lastFrameAt: number | null;
   tickerCount: number;
@@ -34,11 +38,14 @@ interface FeedPanelProps {
 
 export function FeedPanel({
   status,
+  stalled = false,
   frames,
   lastFrameAt,
   tickerCount,
   shocks,
 }: FeedPanelProps) {
+  const alarming = status === "disconnected" || stalled;
+  const detail = stalled && status === "connected" ? STALLED_DETAIL : STATUS_DETAIL[status];
   return (
     <section
       className="flex min-h-0 flex-col rounded border border-edge bg-panel"
@@ -52,10 +59,10 @@ export function FeedPanel({
           Market Feed
         </h2>
         <span
-          className={`text-[11px] ${status === "disconnected" ? "text-down" : "text-faint"}`}
+          className={`text-[11px] ${alarming ? "text-down" : "text-faint"}`}
           data-testid="feed-detail"
         >
-          {STATUS_DETAIL[status]}
+          {detail}
         </span>
       </header>
 

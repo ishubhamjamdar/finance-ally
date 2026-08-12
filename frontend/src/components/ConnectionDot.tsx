@@ -18,8 +18,22 @@ const APPEARANCE: Record<ConnectionStatus, { label: string; dot: string; text: s
   disconnected: { label: "Disconnected", dot: "bg-down", text: "text-down" },
 };
 
-export function ConnectionDot({ status }: { status: ConnectionStatus }) {
-  const { label, dot, text } = APPEARANCE[status];
+export function ConnectionDot({
+  status,
+  stalled = false,
+}: {
+  status: ConnectionStatus;
+  /**
+   * Connected, but no price has arrived for a long time. A separate failure
+   * from a dropped connection and, left unreported, a worse one: the page
+   * would read "Live" over frozen numbers.
+   */
+  stalled?: boolean;
+}) {
+  const { label, dot, text } =
+    stalled && status === "connected"
+      ? { label: "Stalled", dot: "bg-accent", text: "text-accent" }
+      : APPEARANCE[status];
   const pulsing = status === "connecting" || status === "reconnecting";
 
   return (
@@ -27,7 +41,7 @@ export function ConnectionDot({ status }: { status: ConnectionStatus }) {
       className="flex items-center gap-2"
       role="status"
       aria-label={`Market feed: ${label}`}
-      data-status={status}
+      data-status={stalled && status === "connected" ? "stalled" : status}
     >
       <span
         className={`h-2 w-2 rounded-full ${dot} ${pulsing ? "animate-pulse" : ""}`}

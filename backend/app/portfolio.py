@@ -249,7 +249,7 @@ def execute_trade(
     _validate_order(ticker, side, quantity)
 
     prices = price_cache.get_all()
-    price = _require_price(prices, ticker)
+    price = _require_price(prices, ticker, stale=price_cache.is_stale(ticker))
 
     with transaction() as conn:
         cash = get_cash_balance(conn, user_id)
@@ -298,18 +298,31 @@ def _validate_order(ticker: str, side: str, quantity: float) -> None:
         raise TradeError(f"Quantity must be greater than zero, not {quantity:g}.")
 
 
-def _require_price(prices: dict[str, PriceUpdate], ticker: str) -> float:
+def _require_price(prices: dict[str, PriceUpdate], ticker: str, *, stale: bool = False) -> float:
     """The fill price, or a `TradeError` explaining the wait.
 
     A ticker added moments ago has no price until the next poll — up to 15 s on
     Massive. Filling at 0, or at a stale price from before it was removed and
     re-added, is never the right answer (MARKET_DATA_DESIGN.md §13.2).
+
+    `stale` closes the gap `require_live_market` cannot: that dependency catches
+    a source that is *gone*, not a poller wedged while its object is still
+    there. In that state every price in the cache is frozen at its last value,
+    and a trade against one is a fill at a price the market has moved away
+    from — the account's own record of what it paid becomes fiction. Refusing
+    is the only honest answer, and it belongs here rather than in a route so
+    that Checkpoint 4's chat path is covered by the same rule.
     """
     update = prices.get(ticker)
     if update is None:
         raise TradeError(f"No price available for {ticker} yet. Try again in a moment.")
     if update.price <= 0:
         raise TradeError(f"Price for {ticker} is not usable ({update.price}).")
+    if stale:
+        raise TradeError(
+            f"The price for {ticker} has stopped updating, so it cannot be traded on. "
+            "Check the market data feed and try again."
+        )
     return update.price
 
 

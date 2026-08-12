@@ -46,6 +46,22 @@ class MarketDataSource(ABC):
     #: `stop()` here; keeping that true is the source's job, not theirs.
     on_permanent_failure: Callable[[Exception], Awaitable[None]] | None = None
 
+    #: How many seconds may pass without an update before a cached quote must
+    #: not be filled against. None means the source cannot say.
+    #:
+    #: It lives here because only the source knows its own cadence, and the
+    #: answer differs by two orders of magnitude: the simulator writes every
+    #: 0.5 s, Massive every 15 s on the free tier. A single constant would
+    #: either refuse valid trades on Massive or let the simulator freeze for a
+    #: minute unnoticed — which is why the bound was deferred through
+    #: Checkpoints 3 and 4 rather than guessed at.
+    #:
+    #: `start()` stamps it onto the cache it is about to write. Doing it there
+    #: rather than at the call sites is what keeps failover correct: the
+    #: simulator that takes over from a dead Massive installs its own 10 s
+    #: bound without the lifespan having to remember.
+    quote_staleness_limit: float | None = None
+
     @abstractmethod
     async def start(self, tickers: list[str]) -> None:
         """Begin producing updates. Call exactly once; twice is undefined.

@@ -467,3 +467,106 @@ class TestUserScoping:
         assert read_cash("other") == 300.0
         assert read_cash(DEFAULT_USER_ID) == 10000.0
         assert get_portfolio(price_cache, user_id=DEFAULT_USER_ID).positions == []
+
+
+class TestStalePrices:
+    """A source that is alive but wedged.
+
+    `require_live_market` catches a feed that is *gone*. It cannot catch a
+    poller stuck while its object still exists — and in that state every
+    price in the cache is frozen, so a fill records a price the market has
+    moved away from. Carried forward unfixed through Checkpoints 3 and 4
+    because the threshold had to come from the source's own cadence rather
+    than be guessed at.
+    """
+
+    @staticmethod
+    def _wedge(price_cache, ticker="AAPL", seconds=120):
+        price_cache.staleness_limit = 10.0
+        price_cache._received[ticker] -= seconds
+
+    def test_refuses_a_buy_against_a_frozen_price(self, price_cache, read_cash):
+        self._wedge(price_cache)
+
+        with pytest.raises(TradeError, match="stopped updating"):
+            execute_trade(price_cache, "AAPL", "buy", 1)
+
+        assert read_cash() == 10_000.0
+
+    def test_refuses_a_sell_too(self, price_cache):
+        """Selling out of a position at a frozen price is the same lie, and
+        it is the direction a panicking user reaches for first."""
+        execute_trade(price_cache, "AAPL", "buy", 2)
+        self._wedge(price_cache)
+
+        with pytest.raises(TradeError, match="stopped updating"):
+            execute_trade(price_cache, "AAPL", "sell", 1)
+
+        assert position("AAPL").quantity == 2
+
+    def test_writes_nothing_at_all(self, price_cache):
+        """Not the trade, not the blotter row, not a snapshot."""
+        before = snapshot_count()
+        self._wedge(price_cache)
+
+        with pytest.raises(TradeError):
+            execute_trade(price_cache, "AAPL", "buy", 1)
+
+        assert snapshot_count() == before
+
+    def test_a_fresh_ticker_still_trades_while_another_is_wedged(self, price_cache):
+        """One ticker dropping out of a Massive snapshot must not close the
+        whole desk."""
+        self._wedge(price_cache, "AAPL")
+
+        assert execute_trade(price_cache, "GOOGL", "buy", 1).trade.price == 100.0
+
+    def test_the_refusal_names_what_to_do_about_it(self, price_cache):
+        self._wedge(price_cache)
+
+        with pytest.raises(TradeError, match="market data feed"):
+            execute_trade(price_cache, "AAPL", "buy", 1)
+
+    def test_valuation_still_answers_with_the_last_known_marks(self, price_cache):
+        """Only trading is refused. A blank portfolio would be worse than a
+        stale one, and `/api/portfolio` documents that choice already."""
+        execute_trade(price_cache, "AAPL", "buy", 1)
+        self._wedge(price_cache)
+
+        view = get_portfolio(price_cache)
+
+        assert view.positions[0].current_price == 200.0
+        assert view.unpriced_tickers == []
+
+
+class TestAWedgedSourceIsRefused:
+    """The same rule, driven by a real source rather than by poking bookkeeping.
+
+    `TestStalePrices` compresses the clock by hand. This one starts an actual
+    `SimulatorDataSource`, lets it write real prices, then takes its loop away
+    while leaving the object and the cache exactly where they were — which is
+    the shape of the failure being guarded against. Only the threshold is
+    compressed, because the real one has a five-second floor and no test should
+    sleep for five seconds.
+    """
+
+    async def test_a_simulator_whose_loop_has_died_stops_filling_trades(self, read_cash):
+        import asyncio
+
+        from app.market.simulator import SimulatorDataSource
+
+        cache = PriceCache()
+        source = SimulatorDataSource(cache, update_interval=0.01)
+        await source.start(["AAPL"])
+
+        assert cache.staleness_limit == source.quote_staleness_limit
+        assert execute_trade(cache, "AAPL", "buy", 1).trade.price > 0  # healthy: fills
+
+        await source.stop()  # the loop is gone; the prices it wrote are not
+        cache.staleness_limit = 0.01
+        await asyncio.sleep(0.05)
+
+        cash_before = read_cash()
+        with pytest.raises(TradeError, match="stopped updating"):
+            execute_trade(cache, "AAPL", "buy", 1)
+        assert read_cash() == cash_before

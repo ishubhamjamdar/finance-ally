@@ -239,8 +239,21 @@ class SimulatorDataSource(MarketDataSource):
         self._sim: GBMSimulator | None = None
         self._task: asyncio.Task | None = None
 
+    @property
+    def quote_staleness_limit(self) -> float:
+        """Twenty ticks, and never under five seconds.
+
+        The simulator writes every ticker on every tick, so a quote is normally
+        milliseconds old. Twenty ticks is far outside anything a healthy loop
+        produces and still notices a wedged one within ten seconds at the
+        default rate. The floor keeps a very fast `SIM_UPDATE_INTERVAL` from
+        producing a bound so tight that ordinary scheduling jitter trips it.
+        """
+        return max(self._interval * 20, 5.0)
+
     async def start(self, tickers: list[str]) -> None:
         tickers = [normalize_ticker(t) for t in tickers]
+        self._cache.staleness_limit = self.quote_staleness_limit
         # dt is derived from the actual tick rate, not left at the 500 ms
         # default. Otherwise SIM_UPDATE_INTERVAL=2 keeps 500 ms-sized moves but
         # applies them a quarter as often, halving realised volatility so
