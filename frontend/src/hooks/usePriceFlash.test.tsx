@@ -27,6 +27,23 @@ describe("usePriceFlash", () => {
     expect(result.current.direction).toBeNull();
   });
 
+  it("does not flash when a row receives its first price", () => {
+    // A ticker added to the watchlist arrives unpriced and is priced a moment
+    // later. That is a row learning what it is worth, not a rise — lighting it
+    // green would report a gain that never happened.
+    //
+    // Found by mutation: dropping the `prior == null` guard passed every other
+    // test in this file, because they all start from a price rather than from
+    // nothing.
+    const { result, rerender } = renderHook(({ price }) => usePriceFlash(price), {
+      initialProps: { price: null as number | null },
+    });
+
+    rerender({ price: 190 });
+
+    expect(result.current.direction).toBeNull();
+  });
+
   it("flashes up on a rise and down on a fall", () => {
     const { result, rerender } = renderHook(({ price }) => usePriceFlash(price), {
       initialProps: { price: 100 },

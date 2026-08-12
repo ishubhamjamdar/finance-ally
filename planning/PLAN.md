@@ -135,6 +135,11 @@ LLM_MOCK=false
 DB_PATH=            # SQLite file. Default <repo>/db/finally.db; the container sets /app/db/finally.db
 STATIC_DIR=         # Built frontend. Default backend/static, then frontend/out
 LOG_LEVEL=INFO
+
+# Frontend, build-time only. Empty in production: the export and the API share
+# an origin. Set it for `next dev`, which serves the UI on :3000 while the API
+# is on :8000 — `output: 'export'` ignores rewrites, so there is no dev proxy.
+NEXT_PUBLIC_API_BASE=   # e.g. http://localhost:8000
 ```
 
 ### Behavior
@@ -145,6 +150,8 @@ LOG_LEVEL=INFO
 - The backend reads `.env` from the project root (mounted into the container or read via docker `--env-file`)
 - `DB_PATH`, `STATIC_DIR` and `LOG_LEVEL` are read at call time, not at import, and every one of
   them has a working default — a `.env` with only `OPENROUTER_API_KEY` runs the whole app
+- `NEXT_PUBLIC_API_BASE` is the one variable the *frontend* reads, and it is **inlined into the
+  bundle at build time** rather than read at runtime. Nothing secret may ever go in it
 
 ---
 
@@ -421,6 +428,14 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 - **Trade bar** — simple input area: ticker field, quantity field, buy button, sell button. Market orders, instant fill.
 - **AI chat panel** — docked/collapsible sidebar. Message input, scrolling conversation history, loading indicator while waiting for LLM response. Trade executions and watchlist changes shown inline as confirmations.
 - **Header** — portfolio total value (updating live), connection status indicator, cash balance
+- **Feed panel** — frames received, time of the last update, tickers priced, and the notable moves
+  the SSE `event: shock` frames carry. Added at Checkpoint 5: it is what distinguishes a quiet
+  market from a dead connection, and until then nothing consumed those frames
+
+**One `EventSource` per page.** `usePriceStream` opens a connection per call, so `TerminalProvider`
+is its only caller and every panel reads prices through `useMarket()`. A component that opens its
+own stream costs the backend a second copy of every frame, and nothing looks wrong until the count
+is high.
 
 ### Technical Notes
 
@@ -658,7 +673,7 @@ row to ⛔, write a log entry describing how far it got and what blocked it, and
 | 2 | Backend skeleton + database | 1 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #5) |
 | 3 | Portfolio & watchlist API | 2 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #6) |
 | 4 | LLM chat integration | 3 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #7) |
-| 5 | Frontend scaffold + live prices | 2 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 5 | Frontend scaffold + live prices | 2 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #8) |
 | 6 | Charts, portfolio visualisation, trade bar | 3, 5 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 7 | Chat panel | 4, 6 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 8 | Docker packaging + start/stop scripts | 7 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
@@ -1269,3 +1284,150 @@ finding, divergence and carried-forward item survives; the narrative retellings 
     it** — obedience is established only by a live call, and there is exactly one
   - Coverage 100% is still a floor. One of this checkpoint's tests passed against broken code until
     mutation testing exposed it — four checkpoints, four times
+
+#### Checkpoint 5 — Frontend scaffold + live prices
+
+- **Closed:** 2026-08-12 · branch `checkpoint-5-frontend-scaffold` · PR #8 · all four gates passed
+- **Built:** `frontend/` — Next.js 16 + TypeScript, `output: 'export'`, Tailwind v4
+  - `next.config.ts` — static export, `trailingSlash` so Starlette's `StaticFiles(html=True)`
+    resolves a directory to its `index.html`
+  - `app/globals.css` — the §2 palette and the three brand colours as a Tailwind v4 `@theme`
+    block, plus the `flash-up` / `flash-down` keyframes and a `prefers-reduced-motion` opt-out
+  - `hooks/usePriceStream.ts` — one `EventSource`, four connection states, sparklines accumulated
+    from page load in a 120-point window, and the `event: shock` frames
+  - `hooks/usePriceFlash.ts` — direction plus a sequence used as the element's React `key`
+  - `hooks/useApiResource.ts` — fetch-once with a **derived** `loading`, so a reload or a changed
+    path is right without a flag to remember, and the effect holds no synchronous `setState`
+  - `state/TerminalProvider.tsx` — **the structure pass's finding.** The single stream, the
+    account, and `refresh()`; `useMarket()` / `useAccount()`
+  - `components/` — `WatchlistPanel` (+ `TickerRow`), `Sparkline`, `Header`, `ConnectionDot`,
+    `FeedPanel`
+  - `lib/` — `api.ts` (base URL, `getJson`, `ENDPOINTS`), `types.ts`, `format.ts`, `valuation.ts`
+  - `test/FakeEventSource.ts`, `test/fixtures.ts`; `frontend/CLAUDE.md`; `test/smoke_frontend.sh`
+- **Exit criteria:** all five met. The three visual ones were verified by driving a real browser
+  against a real server, not by reading the code
+  - *`npm run build` produces a static export in `out/` with no errors* — and, after review finding
+    1, **from a clean clone**: `git clone` of the branch, `npm ci`, build, `tsc`, 89 tests, all green
+  - *Prices visibly stream and flash green/red, fading rather than sticking* — over 24 samples at
+    250 ms, 118 up-flashes and 79 down-flashes observed across the grid. The fade is the second
+    half: when the feed was killed, **every flash class cleared** (0 stuck) while the last prices
+    stayed on screen
+  - *Stopping the backend turns the dot yellow then red; restarting reconnects without a page
+    reload* — observed in that order, `bg-accent`/"Reconnecting" → `bg-down`/"Disconnected", with
+    the feed panel reading "No price stream. Prices below are the last received." On restart the
+    server logged `SSE client connected` and the page returned to `bg-up`/"Live" with prices
+    moving, `performance.getEntriesByType('navigation').length === 1` — one navigation, no reload.
+    The accumulated sparklines survived the outage
+  - *Sparklines accumulate progressively from page load* — 13 → 25 points over six seconds after a
+    fresh load, one per 500 ms tick, every row drawing one. Empty at load, never fabricated
+  - *Component tests cover render-with-mock-data and a flash class on price change* — both, plus
+    the fade, plus flash isolation to the row that moved
+- **Tests:** **89 frontend** (new) and 694 backend (+2). Both suites green three consecutive times;
+  backend green a fourth time under coverage at **100%**, holding the floor from Checkpoints 1–4.
+  `npm run lint`, `tsc --noEmit`, `ruff check` and `ruff format --check` all clean
+
+  **17 mutations run, 17 killed** — the single connection, `close()` and listener removal on
+  unmount, the escalation timer's arming and clearing, CLOSED-versus-retrying, the grace period,
+  the sparkline cap and accumulation, quote validation, both flash guards and the restart key,
+  em-dash-not-zero, the unpriced-position rule, stream-beats-fetch in two places, and the provider
+  itself. One survived the first pass and was a genuine gap, the **fifth checkpoint running**
+  where that has been true: dropping the "first price is not a change" guard passed every test in
+  the file, because they all start from a price rather than from nothing. A ticker added to the
+  watchlist would have flashed green on being priced — reporting a gain that never happened.
+  `"does not flash when a row receives its first price"` now covers it
+- **Review:** `/code-review high` returned **5 findings, all 5 fixed**, each fix mutation-verified
+  1. **HIGH — `frontend/src/lib/` was never committed.** The root `.gitignore` carries `lib/` from
+     GitHub's Python template, and an unanchored pattern matches a directory of that name at *any*
+     depth. Six files untracked; a clean clone could not build, typecheck or test, and every local
+     check passed because the files were sitting on disk. The exit criterion was not satisfied by
+     what had been committed. **Fixed**: the pattern is anchored to the repo root, and
+     `test/smoke_frontend.sh` fails if anything under `frontend/src` is ignored or untracked
+  2. **MEDIUM — the header's P&L divided a live numerator by a stale denominator.**
+     `portfolio.cost_basis` covers the positions priced *at fetch time*; `valuePortfolio` marks
+     every position it can price now. Holding MSFT at 4,000 priced and AAPL at 2,000 unpriced, the
+     header read **+55%** where the truth was +3.7%, the instant AAPL's first quote arrived — and
+     `makePortfolio` mirrors the backend, so no fixture could have caught it. **Fixed**:
+     `LiveValuation` carries the cost of exactly the positions it marked
+  3. LOW — a price going from a number to `null` left the flash class set for the session.
+     **Fixed** by deriving it from the current price rather than clearing it in the effect; the
+     obvious fix tripped `react-hooks/set-state-in-effect`, and the derivation is better anyway
+  4. LOW — a frame whose every quote failed validation still advanced `frames` and `lastFrameAt`,
+     so the feed panel reported "Streaming" beside a grid of dashes: the one distinction it exists
+     to make. **Fixed**
+  5. LOW — the error branch replaced a grid that `useApiResource` deliberately keeps through a
+     failed reload, and those rows are still being marked by the stream. **Fixed**: a banner above
+     the rows. Not reachable until Checkpoint 6 calls `reload()`, which is when it would have bitten
+
+  The reviewer also confirmed the wire contract field-by-field against `PriceUpdate.to_dict`,
+  `MarketEvent.to_dict` and `_row`, and cleared the `EventSource` lifecycle — this checkpoint's
+  stated review focus — as sound.
+
+  `/security-review` not run: optional here by the gate definition, and this checkpoint adds no
+  untrusted input, no money movement and no secret handling. The one thing worth noting is that
+  `NEXT_PUBLIC_API_BASE` is inlined into the bundle at build time, so it must never hold anything
+  secret; it holds a localhost URL for `next dev` and is empty in production.
+
+  **Structure pass, done inline.** `usePriceStream` opens a connection per call, so "one
+  `EventSource` per page" was true only because `page.tsx` happened to call it once — a panel
+  reaching for prices in Checkpoint 6 would have silently doubled the streams the backend feeds,
+  and nothing in the hook's signature would have stopped it. `TerminalProvider` is now the only
+  caller. It also answers the account half: a trade from Checkpoint 6's trade bar and an
+  auto-executed trade from Checkpoint 7's chat both need every panel to agree again, and
+  `refresh()` is that one call
+- **Diverged from plan:** four, all deliberate
+  - **`FeedPanel` is not in §10's component list.** Checkpoint 5 fills the header and one panel,
+    which leaves the main column empty until Checkpoint 6, and §10's alternative was placeholder
+    text that Checkpoint 10 forbids. It shows feed health — frames, last update, tickers priced —
+    and consumes the `event: shock` frames the backend has published since Checkpoint 1 with
+    nothing reading them. It also carries the "prices below are the last received" line that makes
+    a dead feed legible
+  - **No webfont.** §10 does not require one and `create-next-app` supplies two; `next/font/google`
+    fetches at build time, which would put a network dependency inside Checkpoint 8's
+    `docker build`. The system stack has no swap flash and already has tabular figures
+  - **`NEXT_PUBLIC_API_BASE` is a new environment variable**, added to §5. It is empty in
+    production — the export and the API share an origin — and exists because `output: 'export'`
+    ignores `rewrites`, so `next dev` on :3000 has no other way to reach :8000
+  - **The backend test fixture now pins `STATIC_DIR`.** Not planned, and not optional: see below
+- **The suite was environment-dependent, and this checkpoint proved it.** Building the frontend
+  made `frontend/out` exist, `_resolve_static_dir()` found it, and the *test* app began mounting
+  `StaticFiles` at "/" — which answers every unmatched `/api/*` path. A watchlist test asserting
+  404-or-422 on an encoded-traversal path started returning 405 from the static handler.
+  `clean_environment` listed `STATIC_DIR` among the variables it cleared, but clearing it is not
+  neutral when the default is a filesystem search. It is now pinned to a path that cannot exist,
+  with `test_the_suite_itself_runs_with_no_static_mount` as the guard and
+  `test_an_unmatched_api_path_reaches_no_handler_behind_the_frontend` recording what production
+  actually does. Both fail with the pin removed. Until today, any developer who had built a
+  frontend was running a different suite from CI
+- **Resolved from Checkpoint 4's carried-forward list:** none of it belonged to this checkpoint.
+  The unreproducible failure, the stalled-source gap, the ticker that stays subscribed, the mock's
+  stop-list, `list_trades()`, the `_unsubscribe` race and the untested prompt behaviour are all
+  unchanged and restated below
+- **Carried forward:**
+  - **There is no watchlist add/remove control, and no checkpoint's scope claims one.** `POST` and
+    `DELETE /api/watchlist` have been live since Checkpoint 3 and §2 promises the user can manage
+    the list by hand, but §Checkpoint 5 lists only the panel's columns and §Checkpoint 6 lists
+    charts, the heatmap and the trade bar. **Checkpoint 6 should take it** — it is the checkpoint
+    with the trade bar, and the two belong side by side
+  - **Nothing renders `unpriced_tickers` except the header.** A position with no price is named
+    there; Checkpoint 6's positions table and heatmap must not quietly show it as zero
+  - **The main column is empty until Checkpoint 6.** Deliberate — an honest gap beats placeholder
+    text — but it is the one thing that makes the page look unfinished, and §2's "every pixel
+    earns its place" is not yet true
+  - **The render path has not been measured under load.** Ten rows at 2 Hz is nothing, but every
+    frame replaces the `prices` and `sparklines` objects and re-renders every consumer.
+    Checkpoint 6's review focus is exactly this, and it arrives with a chart and a treemap
+  - **`RECONNECT_GRACE_MS` is 6 s, chosen not derived.** Long enough that a one-second blip does
+    not read as an outage, short enough that a dead backend does not stay amber. Nothing measures
+    what a real reconnect costs
+  - **The browser verification is manual.** Gate 3's flash, dot and sparkline evidence came from
+    driving Playwright by hand; `test/smoke_frontend.sh` covers everything else and is re-runnable.
+    **Checkpoint 9 owns this** — those three observations are exactly its SSE-resilience and
+    fresh-start scenarios
+  - **`.playwright-mcp/` is written into the repo root** by the MCP browser tooling and was deleted
+    by hand after Gate 3. If Checkpoint 9 drives a browser the same way, that path needs a
+    `.gitignore` entry
+  - Frontend coverage is **not measured** — no coverage provider is installed, and the status
+    table's figure is the backend's by its own definition. Checkpoint 10 should decide whether the
+    frontend needs a floor of its own
+  - Mutation testing found a real gap for the **fifth checkpoint running**. The lesson has now held
+    across two languages and two test frameworks
