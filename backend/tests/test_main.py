@@ -389,6 +389,36 @@ class TestStaticFiles:
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
 
+    def test_the_suite_itself_runs_with_no_static_mount(self):
+        """The `clean_environment` fixture pins `STATIC_DIR` at a path that does
+        not exist, and this is the regression guard for it.
+
+        Merely *clearing* the variable is not neutral: the default is a search
+        ending at `frontend/out`, so once Checkpoint 5 built the frontend, any
+        developer who had run `npm run build` was testing a different app from
+        CI — one with `StaticFiles` at "/" answering every unmatched `/api/*`
+        path. It cost one real test failure before it was pinned.
+        """
+        assert _resolve_static_dir() is None
+
+    def test_an_unmatched_api_path_reaches_no_handler_behind_the_frontend(
+        self, monkeypatch, tmp_path
+    ):
+        """What production actually does, since there the export *is* mounted.
+
+        `StaticFiles` at "/" takes every path the routers did not claim, so an
+        unmatched `/api/*` is refused by it rather than by FastAPI — 405 for a
+        method it does not serve, 404 for a file it does not have. The code
+        differs from the suite's; the property that matters does not, which is
+        that nothing reaches a handler or the database.
+        """
+        (tmp_path / "index.html").write_text("<h1>FinAlly</h1>")
+        monkeypatch.setenv("STATIC_DIR", str(tmp_path))
+        client = TestClient(create_app())
+
+        assert client.delete("/api/watchlist/..%2f..%2fetc").status_code in (404, 405)
+        assert client.get("/api/does-not-exist").status_code == 404
+
     def test_tolerates_an_absent_build(self, monkeypatch, tmp_path):
         monkeypatch.setenv("STATIC_DIR", str(tmp_path / "never-built"))
 
