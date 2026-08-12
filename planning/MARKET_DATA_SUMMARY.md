@@ -37,7 +37,7 @@ MarketDataSource (ABC)
 | `models.py` | `PriceUpdate` (adds `previous_close`, `day_change`, `day_change_percent`), `MarketEvent`, `normalize_ticker()` |
 | `interface.py` | `MarketDataSource` ABC + `PermanentMarketDataError` |
 | `events.py` | `EventLog` — bounded ring buffer of `MarketEvent`s with per-client cursors |
-| `cache.py` | `PriceCache` — thread-safe price store with version counter for SSE change detection |
+| `cache.py` | `PriceCache` — thread-safe price store with a version counter for SSE change detection and receipt-time bookkeeping (`age_of` / `is_stale`) so a wedged feed cannot be traded against |
 | `seed_prices.py` | Realistic seed prices, per-ticker GBM params (drift/volatility), correlation groups |
 | `simulator.py` | `GBMSimulator` (Geometric Brownian Motion with Cholesky-correlated moves) + `SimulatorDataSource` |
 | `massive_client.py` | `MassiveDataSource` — REST polling client for Polygon.io via the `massive` package |
@@ -48,6 +48,10 @@ MarketDataSource (ABC)
 
 - **Strategy pattern** — both data sources implement the same ABC; downstream code is source-agnostic
 - **PriceCache as single point of truth** — producers write, consumers read; no direct coupling
+- **Each source declares its own staleness bound** (`quote_staleness_limit`) and stamps it on the
+  cache when it starts writing. Measured from receipt, never from `PriceUpdate.timestamp` — that
+  is the venue's trade time and is hours old whenever the market is closed. Added after
+  Checkpoint 5; deferred twice before that for want of a threshold nobody could guess
 - **GBM with correlated moves** — Cholesky decomposition of sector-based correlation matrix; tech stocks correlate at 0.6, finance at 0.5, cross-sector at 0.3
 - **Random shock events** — `2e-5` chance per tick per ticker of a 2-5% move, applied in log
   space so up and down are mirror images. Calibrated to ~1 shock per ticker per session; at the

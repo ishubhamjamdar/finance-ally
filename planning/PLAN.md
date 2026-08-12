@@ -185,6 +185,20 @@ Both the simulator and the Massive client implement the same abstract interface.
 - SSE streams read from this cache and push updates to connected clients
 - This architecture supports future multi-user scenarios without changes to the data layer
 
+**The cache also records when each entry arrived, and a quote that has outlived
+its source's cadence cannot be traded on.** A poller that wedges while its
+object is still alive leaves every price frozen at its last value, which no
+"is there a source?" check can detect — and a fill against a frozen price
+records a price the market has moved away from. Each source declares its own
+`quote_staleness_limit` (the simulator writes every 0.5 s, Massive every 15 s,
+so no single constant works) and stamps it on the cache when it starts writing.
+
+The bound is on **receipt** time, not on `PriceUpdate.timestamp`. That field is
+the venue's last trade time, which is hours old the moment the market closes;
+bounding it would refuse every trade out of hours. Only trading is refused —
+valuation still answers with the last known marks, because a blank portfolio is
+worse than a stale one.
+
 ### SSE Streaming
 
 - Endpoint: `GET /api/stream/prices`
@@ -289,9 +303,13 @@ when the list is full, because re-adding a watched ticker adds nothing to poll.
 **400 versus 422.** 422 means the request was malformed — a quantity that is not
 a positive finite number, a ticker that is not a symbol, an unexpected field.
 400 means it was well formed and the account could not support it: no price yet,
-insufficient cash, selling more than is held. The frontend renders them
-differently, and the Checkpoint 4 chat handler has to tell them apart to
-report back usefully.
+a price that has stopped updating, insufficient cash, selling more than is held.
+The frontend renders them differently, and the Checkpoint 4 chat handler has to
+tell them apart to report back usefully.
+
+**A frozen price is a 400, not a 503.** 503 is reserved for a feed that is
+*gone*; a source that is running but no longer producing answers requests, so
+the refusal names the ticker and says what to check. §6 has the reasoning.
 
 **A trade never accepts a price from the client.** The fill price is read from
 the server-side cache; the request schema has no `price` field and forbids
@@ -1433,7 +1451,10 @@ finding, divergence and carried-forward item survives; the narrative retellings 
   - Mutation testing found a real gap for the **fifth checkpoint running**. The lesson has now held
     across two languages and two test frameworks
 
-##### Checkpoint 5 — follow-up pass (2026-08-12, same branch, before merge)
+##### Checkpoint 5 — follow-up pass (2026-08-12 · branch `fix-stale-feed-and-flake` · PR #9)
+
+*Written while PR #8 was still open and merged before it landed, so it went to
+`main` as its own PR rather than as part of Checkpoint 5.*
 
 An audit of everything Checkpoints 1–5 carried forward, run against the live
 app rather than against the list. Two of the carried-forward items were real

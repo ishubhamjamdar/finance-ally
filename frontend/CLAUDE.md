@@ -63,6 +63,16 @@ Two further things the hook does that are easy to undo by accident:
   `error` and usually recovers a second later. The status goes amber
   immediately and red only after `RECONNECT_GRACE_MS`, so a blip does not look
   like an outage and a dead backend does not stay amber forever.
+- **`stalled` is not a connection state at all**, which is why it is a separate
+  field. A wedged market source leaves the socket open and healthy and simply
+  stops producing, so `EventSource` reports nothing wrong while the grid
+  freezes. After `STALL_AFTER_MS` (30 s) without a frame the dot reads amber
+  "Stalled" and the feed panel says the values are frozen. A real
+  disconnection wins over a stall — red is the more urgent of the two.
+
+  The 30 s threshold must clear the longest legitimate gap between frames: the
+  simulator sends one every 500 ms, Massive one per poll. A deployment setting
+  `MASSIVE_POLL_INTERVAL` above 30 would make it fire on a healthy feed.
 
 `refresh()` re-reads the portfolio and the watchlist and leaves the stream
 alone. Reopening the stream would discard every sparkline the page has

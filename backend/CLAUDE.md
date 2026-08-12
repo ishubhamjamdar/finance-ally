@@ -121,6 +121,14 @@ from app.watchlist import WatchlistError, add, remove, reconcile
 re-implement the rule. A trade the LLM asks for must be validated exactly like
 one the user typed.
 
+**A trade is also refused when the price has stopped updating**, via
+`price_cache.is_stale(ticker)` inside `_require_price`. `require_live_market`
+catches a feed that is *gone*; this catches a poller wedged while its object is
+still there, which is invisible to every other check and leaves every price
+frozen at its last value. It lives in the domain layer rather than in a route
+precisely so the chat path cannot bypass it. Valuation is deliberately **not**
+subject to it: `get_portfolio` still answers with the last known marks.
+
 `app/chat.py` is the third module of that kind and the one that proves the
 point: it runs a whole conversational turn — context, prompt, model, parse,
 execute, persist — and **executes nothing itself**. Every trade goes through
@@ -248,6 +256,12 @@ Import from `app.market` only — never from a submodule. `__init__.py` is the s
   - `get_all() -> dict[str, PriceUpdate]`
   - `remove(ticker)`
   - `version` property — monotonic counter, increments on every update (for SSE change detection)
+  - `age_of(ticker) -> float | None` — seconds since **this cache** was written,
+    on the monotonic clock. Not `PriceUpdate.timestamp`, which is the venue's
+    trade time and is hours old whenever the market is closed
+  - `is_stale(ticker) -> bool` — has the entry outlived `staleness_limit`? False
+    when no source has stamped one, and False for a ticker never written
+  - `staleness_limit` — set by whichever source is writing; see below
 
 - **`MarketDataSource`** — Abstract interface implemented by `SimulatorDataSource` and
   `MassiveDataSource`. Lifecycle: `start(tickers)` -> `add_ticker()` / `remove_ticker()` -> `stop()`.
@@ -256,9 +270,18 @@ Import from `app.market` only — never from a submodule. `__init__.py` is the s
     apply (the simulator always trades)
   - `on_permanent_failure` — assign an async callback after construction to be told when a source
     hits a failure retrying cannot fix, so the app can swap in a working one mid-session
+  - `quote_staleness_limit` — how long a quote of this source's may go unrefreshed before it must
+    not be filled against. Only the source knows: the simulator writes every 0.5 s and Massive
+    every 15 s, so a single constant would either refuse valid Massive trades or let the simulator
+    freeze for a minute unnoticed
 
   `start()` does **not** promise any ticker got a price — a transient fetch failure is worth
   retrying, not aborting. Verify by reading the cache; `start_market_data` already does.
+
+  **`start()` also stamps `quote_staleness_limit` onto the cache it is about to write.** A new
+  source must do the same. Doing it there rather than at the call sites is what keeps failover
+  correct — the lifespan's failover handler installs a simulator directly, and it would otherwise
+  inherit a bound meant for a 15-second poller.
 
 - **`EventLog`** — Bounded ring buffer of `MarketEvent`s (simulator shocks). Read by cursor:
   `since(cursor) -> (next_cursor, events)`, so every SSE client sees every event. Pass `cursor=-1`
