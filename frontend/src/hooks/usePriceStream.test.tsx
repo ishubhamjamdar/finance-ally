@@ -103,6 +103,25 @@ describe("usePriceStream", () => {
     expect(result.current.prices.AAPL.price).toBe(100);
   });
 
+  it("does not count a frame that stored nothing", () => {
+    // A climbing frame count beside a grid full of dashes reports "the market
+    // is quiet" for what is actually a broken feed.
+    const { result } = renderHook(() => usePriceStream());
+
+    act(() => {
+      FakeEventSource.only.emitMessage(makeFrame({ AAPL: 100 }));
+    });
+    const { frames, lastFrameAt } = result.current;
+
+    act(() => {
+      FakeEventSource.only.emitMessage({ AAPL: { ticker: "AAPL", price: null } });
+      FakeEventSource.only.emitMessage("{not json");
+    });
+
+    expect(result.current.frames).toBe(frames);
+    expect(result.current.lastFrameAt).toBe(lastFrameAt);
+  });
+
   it("collects shock events newest first, bounded", () => {
     const { result } = renderHook(() => usePriceStream());
 

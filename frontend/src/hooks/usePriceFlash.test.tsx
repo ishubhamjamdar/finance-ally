@@ -95,6 +95,22 @@ describe("usePriceFlash", () => {
     expect(result.current.direction).toBe("up");
   });
 
+  it("clears the flash when the price becomes unknown", () => {
+    // A price that goes away is a dash, not a fall. Left set, the class would
+    // stay on the cell for the rest of the session — invisible today only
+    // because the animation has no fill-mode, and a trap for any style keyed
+    // off it later.
+    const { result, rerender } = renderHook(({ price }) => usePriceFlash(price), {
+      initialProps: { price: 100 as number | null },
+    });
+
+    rerender({ price: 101 });
+    expect(result.current.direction).toBe("up");
+
+    rerender({ price: null });
+    expect(result.current.direction).toBeNull();
+  });
+
   it("clears its timer on unmount", () => {
     const { rerender, unmount } = renderHook(({ price }) => usePriceFlash(price), {
       initialProps: { price: 100 },

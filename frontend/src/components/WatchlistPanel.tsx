@@ -44,9 +44,20 @@ export function WatchlistPanel({
         <span className="font-mono text-[11px] text-faint">{rows.length}</span>
       </header>
 
-      {error !== null ? (
+      {/* An error with rows on screen is a banner, not a replacement.
+          `useApiResource` keeps the last good data through a failed reload
+          precisely so the grid survives one, and those rows are still being
+          marked by the stream — throwing ten live prices away to show one line
+          of red text would lose more than it explains. */}
+      {error !== null && rows.length > 0 && (
+        <p className="border-b border-edge px-3 py-1.5 text-xs text-down" role="alert">
+          {error} — showing the last known list.
+        </p>
+      )}
+
+      {error !== null && rows.length === 0 ? (
         <p className="px-3 py-6 text-center text-xs text-down">{error}</p>
-      ) : loading ? (
+      ) : rows.length === 0 && loading ? (
         <p className="px-3 py-6 text-center text-xs text-faint">Loading watchlist…</p>
       ) : rows.length === 0 ? (
         <p className="px-3 py-6 text-center text-xs text-faint">

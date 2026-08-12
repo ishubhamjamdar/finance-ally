@@ -63,6 +63,25 @@ describe("WatchlistPanel", () => {
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
   });
 
+  it("keeps the rows when a reload fails, and says so above them", () => {
+    // `useApiResource` holds the last good data through a failed request for
+    // exactly this reason, and those rows are still being marked by the
+    // stream. Replacing them with one line of red text loses more than it
+    // explains — and Checkpoint 6's trade bar makes reloads routine.
+    render(
+      <WatchlistPanel
+        rows={ROWS}
+        prices={{ AAPL: makeQuote("AAPL", 190.5) }}
+        sparklines={{}}
+        error="Cannot reach the server"
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Cannot reach the server");
+    expect(screen.getAllByRole("rowheader")).toHaveLength(3);
+    expect(screen.getByTestId("price-AAPL")).toHaveTextContent("190.50");
+  });
+
   it("renders a sparkline whose length follows the accumulated series", () => {
     const { rerender } = render(<WatchlistPanel rows={ROWS} prices={{}} sparklines={{}} />);
 

@@ -48,7 +48,12 @@ export function usePriceFlash(price: number | null | undefined, durationMs = FLA
     return () => clearTimeout(timer);
   }, [price, durationMs]);
 
-  return flash;
+  // A price that goes away is not a fall — it is an unknown, and the row
+  // renders a dash. Derived here rather than cleared inside the effect: the
+  // effect's early return would otherwise leave the last direction set for the
+  // rest of the session, and clearing it there means a second state
+  // transition, scheduled a render late, for something already known now.
+  return price == null ? { direction: null, seq: flash.seq } : flash;
 }
 
 /** The class to put on the flashing element, or "" when it is not flashing. */

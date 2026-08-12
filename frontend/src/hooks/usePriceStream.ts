@@ -104,7 +104,14 @@ export function usePriceStream(path = "/api/stream/prices"): PriceStream {
 
     const onMessage = (event: MessageEvent<string>) => {
       const frame = parseFrame(event.data);
-      if (frame === null) return; // one truncated frame costs one frame
+
+      // A frame that stored nothing must not advance the counters. The server
+      // only sends `data:` when it has prices, so an empty frame here means
+      // every quote in it failed validation — and a climbing frame count
+      // beside a grid full of dashes reports "the market is quiet" for what is
+      // actually a broken feed, which is the one distinction the feed panel
+      // exists to make.
+      if (frame === null || Object.keys(frame).length === 0) return;
 
       const receivedAt = Date.now();
       setState((previous) => {

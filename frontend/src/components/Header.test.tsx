@@ -36,6 +36,27 @@ describe("Header", () => {
     expect(screen.getByTestId("header-total")).toHaveTextContent("$6,900");
   });
 
+  it("measures P&L against what the marked positions cost, not the endpoint's total", () => {
+    // AAPL is unpriced at fetch, so the endpoint's `cost_basis` is MSFT's 4000
+    // alone. The stream then prices AAPL. Dividing the live 6220 by 4000 reads
+    // +55%; the truth is +3.67%.
+    const portfolio = makePortfolio(0, [
+      makePosition("MSFT", 10, 400, 400),
+      makePosition("AAPL", 10, 200, null),
+    ]);
+
+    render(
+      <Header
+        portfolio={portfolio}
+        prices={{ MSFT: makeQuote("MSFT", 412), AAPL: makeQuote("AAPL", 210) }}
+        status="connected"
+      />,
+    );
+
+    expect(screen.getByTestId("header-total")).toHaveTextContent("$6,220");
+    expect(screen.getByTestId("header-total")).toHaveTextContent("+3.67%");
+  });
+
   it("names an unpriced holding instead of counting it as zero", () => {
     const portfolio = makePortfolio(5000, [makePosition("AAPL", 10, 180, null)]);
 

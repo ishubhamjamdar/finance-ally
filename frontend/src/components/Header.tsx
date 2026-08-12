@@ -24,12 +24,14 @@ interface HeaderProps {
 export function Header({ portfolio, prices, status }: HeaderProps) {
   const live = valuePortfolio(portfolio, prices);
 
-  // Against the account's cost basis, not the session — the P&L a user cares
-  // about here is "am I up on what I paid".
+  // Against what was paid for the positions actually marked — `live.costBasis`,
+  // never `portfolio.cost_basis`. The endpoint's figure covers whichever
+  // positions had a price when it was fetched, and dividing a live numerator
+  // by that set's cost gives a number that can be off by tens of percent.
   const investedPnl =
-    live === null || portfolio === null || portfolio.cost_basis === 0
+    live === null || live.costBasis === 0
       ? null
-      : ((live.positionsValue - portfolio.cost_basis) / portfolio.cost_basis) * 100;
+      : ((live.positionsValue - live.costBasis) / live.costBasis) * 100;
 
   return (
     <header className="flex flex-wrap items-center gap-x-8 gap-y-2 border-b border-edge bg-panel px-4 py-2.5">
