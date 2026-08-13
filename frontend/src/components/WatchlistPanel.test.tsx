@@ -253,6 +253,17 @@ describe("WatchlistPanel", () => {
       expect(screen.getByLabelText("Add ticker")).toHaveValue("AAPL");
     });
 
+    it("refuses a symbol the server would reject, without a round trip", async () => {
+      const onAdd = vi.fn(async () => {});
+      render(<WatchlistPanel rows={ROWS} prices={{}} sparklines={{}} onAdd={onAdd} />);
+
+      fireEvent.change(screen.getByLabelText("Add ticker"), { target: { value: "SPY500!!" } });
+      fireEvent.click(screen.getByRole("button", { name: "Add to watchlist" }));
+
+      expect(onAdd).not.toHaveBeenCalled();
+      expect(screen.getByTestId("watchlist-error")).toHaveTextContent("is not a ticker symbol");
+    });
+
     it("does not spend a round trip on an empty field", () => {
       const onAdd = vi.fn(async () => {});
       render(<WatchlistPanel rows={ROWS} prices={{}} sparklines={{}} onAdd={onAdd} />);

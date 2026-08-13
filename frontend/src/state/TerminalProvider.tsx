@@ -60,10 +60,22 @@ export interface Account {
   watchlist: WatchlistRow[];
   /** The `portfolio_snapshots` series, oldest first. */
   history: Snapshot[];
-  loading: boolean;
-  /** The first error any fetch reported, with the backend's own wording. */
-  error: string | null;
-  /** The history fetch's own error, so a failed poll cannot blank the grid. */
+
+  /**
+   * One loading flag and one error per resource, never merged.
+   *
+   * They are read by different panels, and a merged pair puts one panel's
+   * failure over another's perfectly current data: `GET /api/portfolio`
+   * failing while the watchlist succeeds would otherwise paint "cannot reach
+   * the server" across a grid of live, streaming prices — or, on a first load,
+   * replace it entirely. The history poll makes this routine rather than
+   * theoretical: it runs every 30 seconds, unattended.
+   */
+  portfolioLoading: boolean;
+  portfolioError: string | null;
+  watchlistLoading: boolean;
+  watchlistError: string | null;
+  historyLoading: boolean;
   historyError: string | null;
   /** Re-read everything after something changed the account. */
   refresh: () => void;
@@ -137,12 +149,11 @@ export function TerminalProvider({ children }: { children: ReactNode }) {
       portfolio: portfolio.data,
       watchlist: watchlist.data?.tickers ?? [],
       history: history.data?.snapshots ?? [],
-      // History is deliberately absent from both: it re-fetches every 30
-      // seconds on its own, so folding it in would flip `loading` back to true
-      // twice a minute and put "Loading…" over panels that are not, and a
-      // failed poll would put its error over the watchlist.
-      loading: portfolio.loading || watchlist.loading,
-      error: portfolio.error ?? watchlist.error,
+      portfolioLoading: portfolio.loading,
+      portfolioError: portfolio.error,
+      watchlistLoading: watchlist.loading,
+      watchlistError: watchlist.error,
+      historyLoading: history.loading,
       historyError: history.error,
       refresh,
       trade,
@@ -157,6 +168,7 @@ export function TerminalProvider({ children }: { children: ReactNode }) {
       watchlist.loading,
       watchlist.error,
       history.data,
+      history.loading,
       history.error,
       refresh,
       trade,

@@ -159,16 +159,50 @@ describe("TradeBar", () => {
     expect(screen.getByLabelText("Ticker")).toHaveValue("");
   });
 
-  it("goes back to following the chart after a fill", async () => {
-    const onSubmit = vi.fn<Submit>(async () => makeFill());
+  it("clears the quantity after a fill but never the symbol", async () => {
+    // The trap this avoids: the user types NVDA, sells it, then types a new
+    // quantity and clicks Sell again. If the field had reverted to the charted
+    // MSFT, that second order would sell a different holding — with no
+    // confirmation dialog anywhere in this path to catch it.
+    const onSubmit = vi.fn<Submit>(async () => makeFill({ ticker: "NVDA", side: "sell" }));
     render(<TradeBar onSubmit={onSubmit} selected="MSFT" />);
 
-    type("Ticker", "AAPL");
+    type("Ticker", "NVDA");
+    type("Quantity", "1");
+    fireEvent.click(screen.getByRole("button", { name: "Sell" }));
+
+    await waitFor(() => expect(screen.getByLabelText("Quantity")).toHaveValue(null));
+    expect(screen.getByLabelText("Ticker")).toHaveValue("NVDA");
+
+    type("Quantity", "2");
+    fireEvent.click(screen.getByRole("button", { name: "Sell" }));
+    expect(onSubmit).toHaveBeenLastCalledWith({ ticker: "NVDA", side: "sell", quantity: 2 });
+  });
+
+  it("keeps following the chart when the field was never typed in", async () => {
+    const onSubmit = vi.fn<Submit>(async () => makeFill({ ticker: "MSFT" }));
+    const { rerender } = render(<TradeBar onSubmit={onSubmit} selected="MSFT" />);
+
+    type("Quantity", "1");
+    fireEvent.click(screen.getByRole("button", { name: "Buy" }));
+    await waitFor(() => expect(screen.getByLabelText("Quantity")).toHaveValue(null));
+
+    rerender(<TradeBar onSubmit={onSubmit} selected="TSLA" />);
+    expect(screen.getByLabelText("Ticker")).toHaveValue("TSLA");
+  });
+
+  it("refuses a symbol the server would reject, without a round trip", async () => {
+    // FastAPI answers a bad symbol with a field-level 422; catching the shape
+    // here turns that into a sentence the person typing it can act on.
+    const onSubmit = vi.fn<Submit>(async () => makeFill());
+    render(<TradeBar onSubmit={onSubmit} />);
+
+    type("Ticker", "SPY500!!");
     type("Quantity", "1");
     fireEvent.click(screen.getByRole("button", { name: "Buy" }));
 
-    await waitFor(() => expect(screen.getByLabelText("Ticker")).toHaveValue("MSFT"));
-    expect(screen.getByLabelText("Quantity")).toHaveValue(null);
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent("is not a ticker symbol");
   });
 
   it("keeps the order on screen when it was rejected, so it can be corrected", async () => {

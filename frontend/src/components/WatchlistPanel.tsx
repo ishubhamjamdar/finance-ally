@@ -24,6 +24,7 @@ import { Sparkline } from "@/components/Sparkline";
 import { flashClass, usePriceFlash } from "@/hooks/usePriceFlash";
 import { describeError } from "@/lib/api";
 import { EM_DASH, formatMoney, formatPercent, toneClass } from "@/lib/format";
+import { isTicker, normalizeTicker } from "@/lib/ticker";
 import type { Quote, WatchlistRow } from "@/lib/types";
 
 interface WatchlistPanelProps {
@@ -71,9 +72,16 @@ export function WatchlistPanel({
     event.preventDefault();
     if (onAdd === undefined || pending) return;
 
-    const ticker = draft.trim().toUpperCase();
+    const ticker = normalizeTicker(draft);
     if (ticker === "") {
       setMutationError("Enter a ticker to add.");
+      return;
+    }
+    // Shape only. Whether the symbol exists, is already watched, or fits the
+    // 50-ticker cap are all the server's to answer — this is here so a typo
+    // reads as a sentence instead of FastAPI's field-level 422 report.
+    if (!isTicker(ticker)) {
+      setMutationError(`“${ticker}” is not a ticker symbol.`);
       return;
     }
 

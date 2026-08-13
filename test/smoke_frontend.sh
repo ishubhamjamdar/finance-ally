@@ -11,6 +11,11 @@
 # separately by driving a real browser (see the Checkpoint 5 log entry). Every
 # checkable thing is here so the second run costs nothing.
 #
+# Checkpoint 6 added the second half: the panels are in the export, and the
+# endpoints behind them answer with the shapes and the status codes the UI
+# renders differently — a 201 fill, a 400 the account could not support, a 422
+# that was malformed, and a snapshot written at the trade's own timestamp.
+#
 #   test/smoke_frontend.sh              # builds, starts its own server
 #   test/smoke_frontend.sh --no-build   # reuse an existing frontend/out
 #
@@ -114,6 +119,68 @@ contains "EventSource is told when to retry" "retry:" "${TMP}/stream.txt"
 check "a watchlist row for every seeded ticker" 10 \
     "$(curl -s "${BASE}/api/watchlist" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tickers"]))')"
 check "the header has a portfolio to render" 200 "$(code "${BASE}/api/portfolio")"
+
+echo "Every panel is in the export"
+# The page is a client component, but `output: 'export'` still prerenders it,
+# so each panel's static chrome is in the HTML. A panel that failed to mount
+# would be absent here rather than merely empty on screen.
+for PANEL in Watchlist "Market Feed" Positions Allocation "Portfolio value" Trade; do
+    contains "the ${PANEL} panel is rendered" "${PANEL}" "${TMP}/index.html"
+done
+contains "the watchlist has an add control" "Add ticker" "${TMP}/index.html"
+contains "the chart asks for a selection" "Select a ticker" "${TMP}/index.html"
+
+echo "The endpoints the new panels read"
+check "GET /api/portfolio/history" 200 "$(code "${BASE}/api/portfolio/history")"
+check "  it returns a snapshot array" true \
+    "$(curl -s "${BASE}/api/portfolio/history" | python3 -c 'import json,sys; print(isinstance(json.load(sys.stdin)["snapshots"], list))' | tr "A-Z" "a-z")"
+check "  a limit of zero is a 422" 422 "$(code "${BASE}/api/portfolio/history?limit=0")"
+
+echo "The trade bar's round trip"
+POINTS_BEFORE="$(curl -s "${BASE}/api/portfolio/history?limit=5000" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["snapshots"]))')"
+trade() { # trade <json>
+    curl -s -X POST "${BASE}/api/portfolio/trade" -H 'Content-Type: application/json' -d "$1"
+}
+trade_code() { curl -s -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/portfolio/trade" -H 'Content-Type: application/json' -d "$1"; }
+
+check "a buy fills" 201 "$(trade_code '{"ticker":"AAPL","side":"buy","quantity":3}')"
+trade '{"ticker":"AAPL","side":"buy","quantity":2}' >"${TMP}/fill.json"
+check "  the fill carries a server-side price" true \
+    "$(python3 -c 'import json;d=json.load(open("'"${TMP}"'/fill.json"));print(d["trade"]["price"] > 0)' | tr "A-Z" "a-z")"
+check "  and the portfolio it left behind" true \
+    "$(python3 -c 'import json;d=json.load(open("'"${TMP}"'/fill.json"));print(any(p["ticker"]=="AAPL" for p in d["portfolio"]["positions"]))' | tr "A-Z" "a-z")"
+check "  cash fell by the fill value" true \
+    "$(python3 -c 'import json;d=json.load(open("'"${TMP}"'/fill.json"));print(d["portfolio"]["cash_balance"] < 10000)' | tr "A-Z" "a-z")"
+
+# The P&L chart's exit criterion: the trade's own snapshot is there at once,
+# without waiting for the 30-second task.
+POINTS_AFTER="$(curl -s "${BASE}/api/portfolio/history?limit=5000" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["snapshots"]))')"
+check "each trade wrote a snapshot immediately" true \
+    "$([ "${POINTS_AFTER}" -ge "$((POINTS_BEFORE + 2))" ] && echo true || echo false)"
+
+echo "The rejections the trade bar has to show"
+check "insufficient cash is a 400" 400 "$(trade_code '{"ticker":"AAPL","side":"buy","quantity":100000}')"
+contains "  it carries a reason to display" "detail" <(trade '{"ticker":"AAPL","side":"buy","quantity":100000}')
+check "overselling is a 400" 400 "$(trade_code '{"ticker":"AAPL","side":"sell","quantity":99999}')"
+check "a client-named price is a 422" 422 \
+    "$(trade_code '{"ticker":"AAPL","side":"buy","quantity":1,"price":1}')"
+check "a zero quantity is a 422" 422 "$(trade_code '{"ticker":"AAPL","side":"buy","quantity":0}')"
+
+echo "The watchlist controls"
+check "adding a ticker" 201 \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/watchlist" -H 'Content-Type: application/json' -d '{"ticker":"pypl"}')"
+contains "  it joins the list" '"PYPL"' <(curl -s "${BASE}/api/watchlist")
+check "adding it twice is a 409" 409 \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/watchlist" -H 'Content-Type: application/json' -d '{"ticker":"PYPL"}')"
+check "removing a ticker" 200 \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "${BASE}/api/watchlist/PYPL")"
+check "removing it again is a 404" 404 \
+    "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "${BASE}/api/watchlist/PYPL")"
+# The one that matters for the positions table: a held ticker keeps streaming.
+check "removing a held ticker keeps it tracked" true \
+    "$(curl -s -X DELETE "${BASE}/api/watchlist/AAPL" | python3 -c 'import json,sys; print(json.load(sys.stdin)["still_tracked"])' | tr "A-Z" "a-z")"
+check "  and keeps the position" true \
+    "$(curl -s "${BASE}/api/portfolio" | python3 -c 'import json,sys; print(any(p["ticker"]=="AAPL" for p in json.load(sys.stdin)["positions"]))' | tr "A-Z" "a-z")"
 
 echo
 if [ "$FAILURES" = 0 ]; then

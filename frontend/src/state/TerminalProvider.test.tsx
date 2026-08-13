@@ -99,6 +99,44 @@ describe("TerminalProvider", () => {
     expect(fetchMock).toHaveBeenCalledTimes(READS); // portfolio, watchlist, history — once each
   });
 
+  it("keeps each resource's failure to itself", async () => {
+    // A merged error field puts the portfolio's failure over the watchlist's
+    // perfectly current rows — and on a first load, over the whole panel.
+    const fetchMock = vi.fn<Fetch>(async (input) => {
+      const url = String(input);
+      if (url.includes("watchlist")) {
+        return new Response(JSON.stringify({ tickers: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ detail: "No market data source is running" }), {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    function Errors() {
+      const account = useAccount();
+      return (
+        <div data-testid="errors">
+          {account.portfolioError ?? "-"}|{account.watchlistError ?? "-"}|
+          {account.historyError ?? "-"}
+        </div>
+      );
+    }
+
+    render(
+      <TerminalProvider>
+        <Errors />
+      </TerminalProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("errors")).toHaveTextContent(
+        "No market data source is running|-|No market data source is running",
+      ),
+    );
+  });
+
   it("gives every consumer the same state", async () => {
     render(
       <TerminalProvider>

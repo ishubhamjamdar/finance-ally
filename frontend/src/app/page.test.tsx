@@ -20,6 +20,8 @@ import { makeFrame, makePortfolio, makePosition } from "@/test/fixtures";
 let account: ReturnType<typeof makePortfolio>;
 let history: { total_value: number; recorded_at: string }[];
 let tradeStatus: { status: number; detail: string } | null;
+let watchlistTickers: string[];
+let portfolioStatus: number;
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -33,6 +35,8 @@ beforeEach(() => {
   account = makePortfolio(10000);
   history = [{ total_value: 10000, recorded_at: "2026-08-12T09:30:00+00:00" }];
   tradeStatus = null;
+  watchlistTickers = ["AAPL", "MSFT"];
+  portfolioStatus = 200;
 
   vi.stubGlobal(
     "fetch",
@@ -63,13 +67,18 @@ beforeEach(() => {
       }
 
       if (url.includes("/api/portfolio/history")) return json({ snapshots: history });
-      if (url.includes("/api/portfolio")) return json(account);
+      if (url.includes("/api/portfolio")) {
+        return portfolioStatus === 200
+          ? json(account)
+          : json({ detail: "No market data source is running" }, portfolioStatus);
+      }
       if (url.includes("/api/watchlist")) {
         return json({
-          tickers: [
-            { ticker: "AAPL", added_at: "2026-08-12T09:30:00+00:00", quote: null },
-            { ticker: "MSFT", added_at: "2026-08-12T09:30:01+00:00", quote: null },
-          ],
+          tickers: watchlistTickers.map((ticker, index) => ({
+            ticker,
+            added_at: `2026-08-12T09:30:0${index}+00:00`,
+            quote: null,
+          })),
         });
       }
       throw new Error(`unexpected request: ${url}`);
@@ -252,21 +261,72 @@ describe("the workstation", () => {
   it("falls back to another ticker when the charted one leaves the watchlist", async () => {
     render(<Page />);
     await loaded();
-    fireEvent.click(screen.getByTestId("row-MSFT"));
-    expect(screen.getByTestId("chart-ticker")).toHaveTextContent("MSFT");
 
-    // The stream stops carrying it too — the backend unsubscribes a ticker
-    // that is neither watched nor held.
-    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation(async (input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url.includes("/api/portfolio/history")) return json({ snapshots: history });
-      if (url.includes("/api/portfolio")) return json(account);
-      return json({ tickers: [{ ticker: "AAPL", added_at: "2026-08-12T09:30:00+00:00", quote: null }] });
-    });
+    // MSFT has been priced, and `usePriceStream` never forgets a quote. If the
+    // fallback consulted `prices` the chart would stay pinned to MSFT here,
+    // showing a frozen price with no row on screen to explain it — and a test
+    // that emitted no frames would pass against that bug.
+    FakeEventSource.only.emitMessage(makeFrame({ AAPL: 190, MSFT: 400 }));
+    fireEvent.click(screen.getByTestId("row-MSFT"));
+    await waitFor(() => expect(screen.getByTestId("chart-price")).toHaveTextContent("400.00"));
+
+    watchlistTickers = ["AAPL"];
     fireEvent.click(screen.getByRole("button", { name: "Remove MSFT from the watchlist" }));
 
     await waitFor(() => expect(screen.queryByTestId("row-MSFT")).toBeNull());
     expect(screen.getByTestId("chart-ticker")).toHaveTextContent("AAPL");
+  });
+
+  it("keeps charting a removed ticker that is still held", async () => {
+    // The backend keeps streaming a ticker it still has a position in, so the
+    // chart has real data to draw and going flat the instant you stop watching
+    // it would be the wrong answer.
+    render(<Page />);
+    await loaded();
+    FakeEventSource.only.emitMessage(makeFrame({ AAPL: 190, MSFT: 400 }));
+
+    fireEvent.click(screen.getByTestId("row-MSFT"));
+    fireEvent.change(screen.getByLabelText("Quantity"), { target: { value: "1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Buy" }));
+    await screen.findByTestId("position-MSFT");
+
+    watchlistTickers = ["AAPL"];
+    fireEvent.click(screen.getByRole("button", { name: "Remove MSFT from the watchlist" }));
+
+    await waitFor(() => expect(screen.queryByTestId("row-MSFT")).toBeNull());
+    expect(screen.getByTestId("chart-ticker")).toHaveTextContent("MSFT");
+  });
+
+  it("counts the tickers the last frame carried, not every one ever seen", async () => {
+    // `prices` is append-only on purpose, so counting its keys would report
+    // thirteen priced beside a grid of ten after three removals — against the
+    // one distinction the feed panel exists to make.
+    render(<Page />);
+    await loaded();
+
+    FakeEventSource.only.emitMessage(makeFrame({ AAPL: 190, MSFT: 400 }));
+    await waitFor(() => expect(screen.getByText("Tickers priced").parentElement).toHaveTextContent("2"));
+
+    FakeEventSource.only.emitMessage(makeFrame({ AAPL: 191 }));
+
+    await waitFor(() =>
+      expect(screen.getByText("Tickers priced").parentElement).toHaveTextContent("1"),
+    );
+    // …and the row that stopped being priced keeps its last value.
+    expect(screen.getByTestId("price-MSFT")).toHaveTextContent("400.00");
+  });
+
+  it("keeps a failed portfolio read out of the watchlist panel", async () => {
+    // Two resources, two errors. A portfolio that will not load must not paint
+    // "cannot reach the server" over a grid of live, streaming prices.
+    portfolioStatus = 503;
+    render(<Page />);
+    await loaded();
+    FakeEventSource.only.emitMessage(makeFrame({ AAPL: 190 }));
+
+    await waitFor(() => expect(screen.getByTestId("price-AAPL")).toHaveTextContent("190.00"));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getAllByTestId(/^row-/)).toHaveLength(2);
   });
 
   it("names an unpriced holding rather than showing it as worthless", async () => {

@@ -73,6 +73,54 @@ describe("sendJson", () => {
     });
   });
 
+  it("reads a FastAPI 422, which reports its detail as an array", async () => {
+    // The shape that was being dropped. `typeof detail === "string"` is false
+    // for a validation error, and the user was shown "422 Unprocessable
+    // Content" — the one message with nothing in it for whoever typed the
+    // value being complained about.
+    stubResponse(
+      {
+        detail: [
+          {
+            type: "string_pattern_mismatch",
+            loc: ["body", "ticker"],
+            msg: "String should match pattern '^[A-Za-z][A-Za-z0-9.\\-]{0,9}$'",
+          },
+        ],
+      },
+      422,
+    );
+
+    await expect(sendJson("/api/watchlist", "POST", {})).rejects.toMatchObject({
+      status: 422,
+      message: "ticker: String should match pattern '^[A-Za-z][A-Za-z0-9.\\-]{0,9}$'",
+    });
+  });
+
+  it("joins every field a 422 complains about", async () => {
+    stubResponse(
+      {
+        detail: [
+          { loc: ["body", "ticker"], msg: "field required" },
+          { loc: ["body", "quantity"], msg: "Input should be greater than 0" },
+        ],
+      },
+      422,
+    );
+
+    await expect(sendJson("/api/portfolio/trade", "POST", {})).rejects.toMatchObject({
+      message: "ticker: field required; quantity: Input should be greater than 0",
+    });
+  });
+
+  it("falls back to the status line when a detail array carries nothing readable", async () => {
+    stubResponse({ detail: [{ type: "value_error" }, "junk", null] }, 422);
+
+    await expect(sendJson("/api/watchlist", "POST", {})).rejects.toMatchObject({
+      message: expect.stringContaining("422"),
+    });
+  });
+
   it("falls back to the status line when the error body is not JSON", async () => {
     const fetchMock = vi.fn(async () => new Response("<html>502</html>", { status: 502 }));
     vi.stubGlobal("fetch", fetchMock);

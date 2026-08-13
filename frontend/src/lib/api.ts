@@ -66,10 +66,13 @@ export async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
 /**
  * A mutation: `POST` with a JSON body, or `DELETE` without one.
  *
- * The status codes are the point. PLAN.md §8 gives every mutation a 400 the
- * account could not support and a 422 that was malformed, and the frontend
- * renders them differently — so `ApiError.status` travels with the message
- * rather than being flattened into "something went wrong".
+ * PLAN.md §8 gives every mutation a 400 the account could not support and a
+ * 422 that was malformed. Both reach the user as the backend's own words —
+ * `readDetail` understands each shape — and the code travels alongside on
+ * `ApiError.status` for a caller that needs to tell them apart. Nothing in
+ * Checkpoint 6 does: the forms reject a malformed symbol or quantity before
+ * sending, so a 422 arriving here means something the UI did not anticipate,
+ * and its field report is more use than a category would be.
  */
 export async function sendJson<T>(
   path: string,
@@ -105,11 +108,33 @@ export function describeError(cause: unknown): string {
 async function readDetail(response: Response): Promise<string> {
   try {
     const body = await response.json();
-    if (body && typeof body === "object" && typeof body.detail === "string") {
-      return body.detail;
+    if (body && typeof body === "object") {
+      if (typeof body.detail === "string") return body.detail;
+      // FastAPI serialises a 422 as an *array* of field reports, not a string.
+      // Reading only the string form left every validation failure rendering
+      // as "422 Unprocessable Content" — the one message with nothing in it
+      // for the person who typed the value being complained about.
+      if (Array.isArray(body.detail)) {
+        const reported = (body.detail as unknown[])
+          .map(describeValidationError)
+          .filter((line) => line !== "");
+        if (reported.length > 0) return reported.join("; ");
+      }
     }
   } catch {
     // A non-JSON error body is normal for a proxy or a crash. Fall through.
   }
   return `${response.status} ${response.statusText}`.trim();
+}
+
+/** One entry of FastAPI's `detail` array: `{loc: ["body", "ticker"], msg: "..."}`. */
+function describeValidationError(entry: unknown): string {
+  if (entry === null || typeof entry !== "object") return "";
+  const { loc, msg } = entry as { loc?: unknown; msg?: unknown };
+  if (typeof msg !== "string") return "";
+
+  // `loc` opens with the request part — "body", "query", "path" — which names
+  // a place in the protocol rather than a place in the form.
+  const field = Array.isArray(loc) ? loc.slice(1).join(".") : "";
+  return field === "" ? msg : `${field}: ${msg}`;
 }

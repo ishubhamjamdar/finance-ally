@@ -45,19 +45,27 @@ function Workstation() {
   const account = useAccount();
   const [picked, setPicked] = useState<string | null>(null);
 
-  // Null means "whatever is at the top of the watchlist", which is what makes
-  // the chart populated on first paint without a second render to set it. A
-  // ticker the user picked and then removed falls back the same way.
-  const watched = account.watchlist.map((row) => row.ticker);
-  const selected =
-    picked !== null && (watched.includes(picked) || market.prices[picked] !== undefined)
-      ? picked
-      : (watched[0] ?? null);
-
   const positions = useMemo(
     () => markPositions(account.portfolio, market.prices),
     [account.portfolio, market.prices],
   );
+
+  // Null means "whatever is at the top of the watchlist", which is what makes
+  // the chart populated on first paint without a second render to set it.
+  //
+  // What may be charted is what the backend is still streaming: the watchlist
+  // plus anything held, which is `app.watchlist.reconcile`'s "tracked" set. A
+  // removed ticker that is still held keeps its chart, and a removed ticker
+  // that is not falls back to the top of the list.
+  //
+  // The test worth stating: this must *not* be decided from `market.prices`.
+  // That record is append-only by design — a frame omitting a ticker must not
+  // blank its row — so a removed symbol keeps its last quote there forever,
+  // and the chart would sit pinned to a frozen price with no row on screen to
+  // explain where it came from.
+  const watched = account.watchlist.map((row) => row.ticker);
+  const chartable = new Set([...watched, ...positions.map((position) => position.ticker)]);
+  const selected = picked !== null && chartable.has(picked) ? picked : (watched[0] ?? null);
 
   return (
     <div className="flex h-dvh flex-col bg-terminal text-ink">
@@ -75,8 +83,8 @@ function Workstation() {
             rows={account.watchlist}
             prices={market.prices}
             sparklines={market.sparklines}
-            loading={account.loading}
-            error={account.error}
+            loading={account.watchlistLoading}
+            error={account.watchlistError}
             selected={selected}
             onSelect={setPicked}
             onAdd={account.addTicker}
@@ -87,7 +95,7 @@ function Workstation() {
             stalled={market.stalled}
             frames={market.frames}
             lastFrameAt={market.lastFrameAt}
-            tickerCount={Object.keys(market.prices).length}
+            tickerCount={market.pricedTickers}
             shocks={market.shocks}
           />
         </div>
@@ -107,7 +115,7 @@ function Workstation() {
               positions={positions}
               selected={selected}
               onSelect={setPicked}
-              loading={account.loading}
+              loading={account.portfolioLoading}
             />
           </div>
         </div>
@@ -119,13 +127,13 @@ function Workstation() {
               positions={positions}
               selected={selected}
               onSelect={setPicked}
-              loading={account.loading}
+              loading={account.portfolioLoading}
             />
           </div>
           <div className="flex min-h-[12rem] flex-1 flex-col">
             <PnlChart
               snapshots={account.history}
-              loading={account.loading}
+              loading={account.historyLoading}
               error={account.historyError}
             />
           </div>

@@ -84,6 +84,18 @@ export interface PriceStream {
    * it; the sparklines draw the tail.
    */
   sparklines: Record<string, number[]>;
+  /**
+   * How many tickers the *last* frame carried.
+   *
+   * Not `Object.keys(prices).length`, which only ever grows: `prices` keeps a
+   * ticker's last quote after the server stops sending it, deliberately — a
+   * frame that transiently omits a symbol must not blank its row. The
+   * consequence is that it counts every ticker priced since page load, so
+   * after three removals it would report thirteen beside a grid of ten. The
+   * feed panel exists to tell a quiet market from a broken one, and an
+   * inflated count works against exactly that.
+   */
+  pricedTickers: number;
   /** Notable moves, newest first. */
   shocks: MarketShock[];
   status: ConnectionStatus;
@@ -104,6 +116,7 @@ export interface PriceStream {
 const INITIAL: PriceStream = {
   prices: {},
   sparklines: {},
+  pricedTickers: 0,
   shocks: [],
   status: "connecting",
   stalled: false,
@@ -162,7 +175,8 @@ export function usePriceStream(
       // beside a grid full of dashes reports "the market is quiet" for what is
       // actually a broken feed, which is the one distinction the feed panel
       // exists to make.
-      if (frame === null || Object.keys(frame).length === 0) return;
+      const priced = Object.keys(frame ?? {}).length;
+      if (frame === null || priced === 0) return;
 
       const receivedAt = Date.now();
       lastFrame = receivedAt;
@@ -184,6 +198,7 @@ export function usePriceStream(
           ...previous,
           prices,
           sparklines,
+          pricedTickers: priced,
           frames: previous.frames + 1,
           lastFrameAt: receivedAt,
         };

@@ -34,8 +34,13 @@ export function PriceChart({ ticker, quote, points }: PriceChartProps) {
   const low = window.length === 0 ? null : Math.min(...window);
   const high = window.length === 0 ? null : Math.max(...window);
 
-  // Green or red for the whole plot, from where the window started — the same
-  // rule the sparklines use, so the two panels never disagree about the day.
+  // Green or red for the whole plot, measured across exactly what is drawn.
+  //
+  // That is deliberately *not* the same span as the watchlist sparkline, which
+  // slices the last `MAX_SPARKLINE_POINTS` of the same buffer. A ticker down
+  // over five minutes but up over the last one draws a red chart beside a
+  // green sparkline, and both are right: each line's colour describes the line
+  // it is on, and the chart says how long its window is underneath.
   const rising = window.length < 2 || window[window.length - 1] >= window[0];
 
   return (

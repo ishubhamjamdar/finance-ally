@@ -15,7 +15,9 @@
  *
  * **The ticker field follows the chart until it is typed in.** Selecting a row
  * fills the field, so the common case is quantity plus a button. Once the user
- * edits it the field is theirs, and it goes back to following after a fill.
+ * edits it the field is theirs and stays theirs — including across a fill,
+ * because the symbol that just traded is the one the next order is most likely
+ * meant for, and silently swapping it back would send that order elsewhere.
  *
  * **No client-side money rules.** Whether the cash covers it is the server's
  * question — it holds the balance and the fill price, and this component holds
@@ -28,6 +30,7 @@ import type { FormEvent } from "react";
 
 import { describeError } from "@/lib/api";
 import { formatDollars, formatMoney, formatQuantity } from "@/lib/format";
+import { isTicker, normalizeTicker } from "@/lib/ticker";
 import type { TradeFill, TradeOrder, TradeSide } from "@/lib/types";
 
 interface TradeBarProps {
@@ -56,12 +59,20 @@ export function TradeBar({ onSubmit, selected = null }: TradeBarProps) {
     event.preventDefault();
     if (pending) return;
 
-    const symbol = ticker.trim().toUpperCase();
+    const symbol = normalizeTicker(ticker);
     const size = Number(quantity);
 
     if (symbol === "") {
       setFill(null);
       setError("Enter a ticker.");
+      return;
+    }
+    // Shape only — whether the symbol *exists* and whether the account can
+    // support the order are both the server's to answer. This is here so a
+    // typo comes back as a sentence rather than as FastAPI's field report.
+    if (!isTicker(symbol)) {
+      setFill(null);
+      setError(`“${symbol}” is not a ticker symbol.`);
       return;
     }
     if (!Number.isFinite(size) || size <= 0) {
@@ -76,10 +87,12 @@ export function TradeBar({ onSubmit, selected = null }: TradeBarProps) {
     try {
       const executed = await onSubmit({ ticker: symbol, side, quantity: size });
       setFill(executed);
+      // Only the quantity clears. The ticker stays exactly as it was sent:
+      // reverting it to the charted symbol would mean a user who typed NVDA,
+      // sold it, then typed a new quantity and clicked Sell again would sell
+      // *AAPL* — a second order against a different holding, with no
+      // confirmation dialog anywhere in this path to catch it.
       setQuantity("");
-      // Back to following the chart, so the next order starts from wherever
-      // the user is looking rather than from what they last typed.
-      setTypedTicker(null);
     } catch (cause: unknown) {
       setError(describeError(cause));
     } finally {
