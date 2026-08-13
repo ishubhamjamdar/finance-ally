@@ -87,45 +87,57 @@ export function LineChart({
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-testid={testId}>
       <div className="relative min-h-0 flex-1 pr-14">
-        <svg
-          className={`absolute inset-y-0 right-14 left-0 h-full ${tone}`}
-          viewBox={`0 0 ${BOX} ${BOX}`}
-          preserveAspectRatio="none"
-          role="img"
-          aria-label={`${label}: ${series.length} points, ${format(series[series.length - 1])}`}
-        >
-          {TICK_FRACTIONS.map((fraction) => (
-            <line
-              key={fraction}
-              x1={0}
-              x2={BOX}
-              y1={fraction * BOX}
-              y2={fraction * BOX}
-              stroke="var(--color-grid)"
-              strokeWidth={1}
-              vectorEffect="non-scaling-stroke"
-            />
-          ))}
+        {/* The plot area gets its own box, and the `svg` fills it with both
+            dimensions given explicitly.
 
-          {/* The fill is what makes a single-pixel line read as a quantity.
+            Sizing the `svg` off the container's insets alone does not work: an
+            `svg` is a replaced element with an intrinsic aspect ratio taken
+            from its `viewBox` — 1:1 here — so `height: 100%` with no width
+            makes the browser compute a *square*. In a wide panel that draws
+            the series across 45% of the width with the live-end marker, which
+            is positioned in CSS rather than in the viewBox, stranded out to
+            the right of where the line stops. */}
+        <div className="absolute inset-y-0 right-14 left-0">
+          <svg
+            className={`h-full w-full ${tone}`}
+            viewBox={`0 0 ${BOX} ${BOX}`}
+            preserveAspectRatio="none"
+            role="img"
+            aria-label={`${label}: ${series.length} points, ${format(series[series.length - 1])}`}
+          >
+            {TICK_FRACTIONS.map((fraction) => (
+              <line
+                key={fraction}
+                x1={0}
+                x2={BOX}
+                y1={fraction * BOX}
+                y2={fraction * BOX}
+                stroke="var(--color-grid)"
+                strokeWidth={1}
+                vectorEffect="non-scaling-stroke"
+              />
+            ))}
+
+            {/* The fill is what makes a single-pixel line read as a quantity.
               It is closed down to the floor of the box, not to zero: the y
               axis does not start at zero, and pretending it does is how a
               0.4% move gets drawn as a cliff. */}
-          <polygon
-            points={`0,${BOX} ${path} ${round(last.x)},${BOX}`}
-            fill="currentColor"
-            opacity={0.12}
-          />
-          <polyline
-            points={path}
-            fill="none"
-            stroke="currentColor"
-            strokeWidth={1.5}
-            strokeLinejoin="round"
-            strokeLinecap="round"
-            vectorEffect="non-scaling-stroke"
-          />
-        </svg>
+            <polygon
+              points={`0,${BOX} ${path} ${round(last.x)},${BOX}`}
+              fill="currentColor"
+              opacity={0.12}
+            />
+            <polyline
+              points={path}
+              fill="none"
+              stroke="currentColor"
+              strokeWidth={1.5}
+              strokeLinejoin="round"
+              strokeLinecap="round"
+              vectorEffect="non-scaling-stroke"
+            />
+          </svg>
+        </div>
 
         {/* The live end of the series. HTML rather than an SVG circle, which
             the horizontal stretch would draw as an ellipse. */}

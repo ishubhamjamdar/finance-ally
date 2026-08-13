@@ -117,4 +117,23 @@ describe("LineChart", () => {
 
     expect(screen.getByRole("img", { name: /AAPL price: 3 points, 31\.50/ })).toBeInTheDocument();
   });
+
+  it("gives the plot both of its dimensions, so it is not sized by its viewBox", () => {
+    // The defect this is a stand-in for, found by driving a real browser at
+    // Gate 3: an `svg` is a replaced element with an intrinsic aspect ratio
+    // taken from its `viewBox`. With only a height, the browser computed a
+    // *square* — the series drew across 45% of a wide panel, and the live-end
+    // marker, positioned in CSS rather than in the viewBox, sat stranded to
+    // the right of where the line stopped.
+    //
+    // jsdom performs no layout, so it cannot measure that. What it can check
+    // is the thing that caused it: whether the plot declares both dimensions.
+    // The real guard is a browser assertion on the rendered width, and that
+    // belongs to Checkpoint 9.
+    render(<LineChart values={[1, 2, 3]} label="Price" empty="none" testId="c" />);
+
+    const svg = document.querySelector("svg");
+    expect(svg).toHaveClass("h-full");
+    expect(svg).toHaveClass("w-full");
+  });
 });

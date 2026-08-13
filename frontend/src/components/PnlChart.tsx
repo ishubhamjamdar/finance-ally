@@ -39,7 +39,7 @@ export function PnlChart({ snapshots, loading = false, error = null }: PnlChartP
 
   return (
     <section
-      className="flex min-h-0 flex-col rounded border border-edge bg-panel"
+      className="flex h-full min-h-0 flex-col rounded border border-edge bg-panel"
       aria-labelledby="pnl-heading"
     >
       <header className="flex flex-wrap items-baseline gap-x-4 gap-y-1 border-b border-edge px-3 py-2">

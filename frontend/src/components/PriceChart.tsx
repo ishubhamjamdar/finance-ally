@@ -45,7 +45,7 @@ export function PriceChart({ ticker, quote, points }: PriceChartProps) {
 
   return (
     <section
-      className="flex min-h-0 flex-col rounded border border-edge bg-panel"
+      className="flex h-full min-h-0 flex-col rounded border border-edge bg-panel"
       aria-labelledby="chart-heading"
     >
       <header className="flex flex-wrap items-baseline gap-x-6 gap-y-1 border-b border-edge px-3 py-2">

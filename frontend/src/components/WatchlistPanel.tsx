@@ -95,7 +95,7 @@ export function WatchlistPanel({
 
   return (
     <section
-      className="flex min-h-0 flex-col rounded border border-edge bg-panel"
+      className="flex h-full min-h-0 flex-col rounded border border-edge bg-panel"
       aria-labelledby="watchlist-heading"
     >
       <header className="flex flex-wrap items-center justify-between gap-2 border-b border-edge px-3 py-2">

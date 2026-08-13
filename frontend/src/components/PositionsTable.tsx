@@ -42,7 +42,7 @@ export function PositionsTable({
 }: PositionsTableProps) {
   return (
     <section
-      className="flex min-h-0 flex-col rounded border border-edge bg-panel"
+      className="flex h-full min-h-0 flex-col rounded border border-edge bg-panel"
       aria-labelledby="positions-heading"
     >
       <header className="flex items-baseline justify-between border-b border-edge px-3 py-2">

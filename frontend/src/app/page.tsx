@@ -79,17 +79,19 @@ function Workstation() {
       <main className="grid min-h-0 flex-1 grid-cols-1 gap-2 overflow-y-auto p-2 lg:grid-cols-[minmax(300px,340px)_1fr_minmax(300px,360px)] lg:overflow-hidden">
         {/* Left rail: what to watch. */}
         <div className="flex min-h-0 flex-col gap-2 lg:overflow-hidden">
-          <WatchlistPanel
-            rows={account.watchlist}
-            prices={market.prices}
-            sparklines={market.sparklines}
-            loading={account.watchlistLoading}
-            error={account.watchlistError}
-            selected={selected}
-            onSelect={setPicked}
-            onAdd={account.addTicker}
-            onRemove={account.removeTicker}
-          />
+          <div className="flex min-h-[14rem] flex-1 flex-col">
+            <WatchlistPanel
+              rows={account.watchlist}
+              prices={market.prices}
+              sparklines={market.sparklines}
+              loading={account.watchlistLoading}
+              error={account.watchlistError}
+              selected={selected}
+              onSelect={setPicked}
+              onAdd={account.addTicker}
+              onRemove={account.removeTicker}
+            />
+          </div>
           <FeedPanel
             status={market.status}
             stalled={market.stalled}
@@ -102,7 +104,7 @@ function Workstation() {
 
         {/* Centre: the chart, then the order ticket under it. */}
         <div className="flex min-h-0 flex-col gap-2 lg:overflow-hidden">
-          <div className="flex min-h-[16rem] flex-1 flex-col">
+          <div className="flex min-h-[16rem] flex-[3] flex-col">
             <PriceChart
               ticker={selected}
               quote={selected === null ? null : (market.prices[selected] ?? null)}
@@ -110,7 +112,7 @@ function Workstation() {
             />
           </div>
           <TradeBar onSubmit={account.trade} selected={selected} />
-          <div className="flex min-h-[12rem] flex-1 flex-col">
+          <div className="flex min-h-[12rem] flex-[2] flex-col">
             <PositionsTable
               positions={positions}
               selected={selected}
