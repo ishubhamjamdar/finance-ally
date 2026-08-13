@@ -156,20 +156,22 @@ describe("useApiResource", () => {
       expect(fetchMock).toHaveBeenCalledTimes(3);
     });
 
-    it("stops polling when the component unmounts", async () => {
-      // An interval that outlives its mount keeps a dead component fetching
-      // for the life of the page.
-      const fetchMock = stubFetch(async () => jsonResponse({ snapshots: [] }));
+    it("clears the poll interval when the component unmounts", async () => {
+      // Asserted on the *timer*, not on the fetch count. Mutation testing
+      // found the obvious version vacuous: a leaked interval keeps firing, but
+      // `reload()` on an unmounted component sets state that React discards,
+      // so the effect never re-runs and no request is ever made. The fetch
+      // count stays at 1 whether the interval was cleared or not — while the
+      // timer runs for the life of the page.
+      stubFetch(async () => jsonResponse({ snapshots: [] }));
 
       const { unmount } = renderHook(() => useApiResource("/api/portfolio/history", 1000));
       await settle();
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
 
       unmount();
-      await act(async () => {
-        vi.advanceTimersByTime(10_000);
-      });
 
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
     });
 
     it("keeps the last series through a failed poll rather than blanking it", async () => {

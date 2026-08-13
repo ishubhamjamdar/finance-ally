@@ -224,7 +224,7 @@ describe("TradeBar", () => {
     expect(screen.getByLabelText("Quantity")).toHaveValue(100);
   });
 
-  it("will not send a second order while one is in flight", async () => {
+  it("disables both buttons while an order is in flight", async () => {
     let release: ((fill: TradeFill) => void) | null = null;
     const onSubmit = vi.fn<Submit>(
       () =>
@@ -239,6 +239,37 @@ describe("TradeBar", () => {
     expect(screen.getByTestId("trade-status")).toHaveTextContent("Sending order…");
 
     fireEvent.click(screen.getByRole("button", { name: "Sell" }));
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+
+    release!(makeFill());
+    await waitFor(() => expect(screen.getByTestId("trade-status")).toHaveTextContent("Bought"));
+  });
+
+  it("refuses a second order even when the buttons are bypassed", async () => {
+    // Mutation testing found the test above proves nothing about the `pending`
+    // guard: the *disabled attribute* was stopping the second click, so
+    // deleting the guard changed nothing and no test noticed.
+    //
+    // Submitting the form directly is the path the attribute does not cover —
+    // and it is a real one, since a form with inputs submits on Enter. Without
+    // the guard this sends a duplicate order against live money.
+    let release: ((fill: TradeFill) => void) | null = null;
+    const onSubmit = vi.fn<Submit>(
+      () =>
+        new Promise<TradeFill>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const { container } = render(<TradeBar onSubmit={onSubmit} selected="AAPL" />);
+    const form = container.querySelector("form");
+    if (form === null) throw new Error("the trade bar has no form");
+
+    type("Quantity", "1");
+    fireEvent.submit(form);
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+
+    fireEvent.submit(form);
+    fireEvent.submit(form);
     expect(onSubmit).toHaveBeenCalledTimes(1);
 
     release!(makeFill());
