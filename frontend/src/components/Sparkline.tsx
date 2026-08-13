@@ -10,17 +10,37 @@
  * column keeps its width and the grid does not jump on the first tick.
  */
 
+/**
+ * How many of the most recent points a sparkline draws — the last minute at
+ * the simulator's 500 ms tick.
+ *
+ * `usePriceStream` keeps a deeper series than a 72-pixel line can show,
+ * because the main chart draws the same buffer. Squeezing five minutes into
+ * this box turns the line into a smudge; the tail is what a glance at a
+ * watchlist row is asking about.
+ */
+export const MAX_SPARKLINE_POINTS = 120;
+
 interface SparklineProps {
   points: number[];
   width?: number;
   height?: number;
+  /** How many of the most recent points to draw. */
+  maxPoints?: number;
   /** Overrides the up/down colour derived from first-to-last. */
   className?: string;
   label?: string;
 }
 
-export function Sparkline({ points, width = 72, height = 22, className, label }: SparklineProps) {
-  const usable = points.filter((point) => Number.isFinite(point));
+export function Sparkline({
+  points,
+  width = 72,
+  height = 22,
+  maxPoints = MAX_SPARKLINE_POINTS,
+  className,
+  label,
+}: SparklineProps) {
+  const usable = points.filter((point) => Number.isFinite(point)).slice(-maxPoints);
 
   const tone =
     className ??

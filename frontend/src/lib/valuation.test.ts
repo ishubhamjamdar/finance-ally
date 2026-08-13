@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { markPrice, valuePortfolio } from "@/lib/valuation";
+import { markPositions, markPrice, valuePortfolio } from "@/lib/valuation";
 import { makePortfolio, makePosition, makeQuote } from "@/test/fixtures";
 
 describe("valuePortfolio", () => {
@@ -120,5 +120,89 @@ describe("markPrice", () => {
     const poisoned = { AAPL: makeQuote("AAPL", Number.NaN) };
 
     expect(markPrice(position, poisoned)).toBe(190);
+  });
+});
+
+describe("markPositions", () => {
+  it("marks every figure against the stream, not the fetched price", () => {
+    const portfolio = makePortfolio(0, [makePosition("AAPL", 10, 180, 190)]);
+
+    const [position] = markPositions(portfolio, { AAPL: makeQuote("AAPL", 200) });
+
+    expect(position.price).toBe(200);
+    expect(position.marketValue).toBe(2000);
+    expect(position.costBasis).toBe(1800);
+    expect(position.unrealizedPnl).toBe(200);
+    expect(position.unrealizedPnlPercent).toBeCloseTo(11.111, 3);
+  });
+
+  it("weights each position by its share of the marked value", () => {
+    const portfolio = makePortfolio(0, [
+      makePosition("AAPL", 10, 100, 100),
+      makePosition("MSFT", 10, 100, 100),
+      makePosition("NVDA", 20, 100, 100),
+    ]);
+
+    const weights = Object.fromEntries(
+      markPositions(portfolio, {
+        AAPL: makeQuote("AAPL", 100),
+        MSFT: makeQuote("MSFT", 100),
+        NVDA: makeQuote("NVDA", 100),
+      }).map((position) => [position.ticker, position.weight]),
+    );
+
+    expect(weights.AAPL).toBeCloseTo(0.25, 9);
+    expect(weights.MSFT).toBeCloseTo(0.25, 9);
+    expect(weights.NVDA).toBeCloseTo(0.5, 9);
+  });
+
+  it("leaves an unpriced holding null throughout rather than zeroing it", () => {
+    // The rule the heatmap depends on: a null weight gets no tile, and a zero
+    // weight would get a tile of nothing sitting in the corner claiming the
+    // position is worthless.
+    const portfolio = makePortfolio(0, [
+      makePosition("MSFT", 10, 400, 400),
+      makePosition("AAPL", 10, 200, null),
+    ]);
+
+    const marked = markPositions(portfolio, { MSFT: makeQuote("MSFT", 400) });
+    const aapl = marked.find((position) => position.ticker === "AAPL");
+
+    expect(aapl?.price).toBeNull();
+    expect(aapl?.marketValue).toBeNull();
+    expect(aapl?.unrealizedPnl).toBeNull();
+    expect(aapl?.unrealizedPnlPercent).toBeNull();
+    expect(aapl?.weight).toBeNull();
+    // The priced one still gets the whole weight — the map fills the box.
+    expect(marked.find((position) => position.ticker === "MSFT")?.weight).toBeCloseTo(1, 9);
+  });
+
+  it("keeps the quantity and cost of an unpriced holding, so the row survives", () => {
+    const portfolio = makePortfolio(0, [makePosition("AAPL", 3, 200, null)]);
+
+    const [position] = markPositions(portfolio, {});
+
+    expect(position.quantity).toBe(3);
+    expect(position.avgCost).toBe(200);
+    expect(position.costBasis).toBe(600);
+  });
+
+  it("has no weights at all when nothing can be marked", () => {
+    const portfolio = makePortfolio(0, [makePosition("AAPL", 3, 200, null)]);
+
+    expect(markPositions(portfolio, {})[0].weight).toBeNull();
+  });
+
+  it("preserves the order the endpoint returned", () => {
+    const portfolio = makePortfolio(0, [
+      makePosition("ZZZ", 1, 10, 10),
+      makePosition("AAA", 1, 10, 10),
+    ]);
+
+    expect(markPositions(portfolio, {}).map((position) => position.ticker)).toEqual(["ZZZ", "AAA"]);
+  });
+
+  it("is empty before the portfolio has loaded", () => {
+    expect(markPositions(null, {})).toEqual([]);
   });
 });

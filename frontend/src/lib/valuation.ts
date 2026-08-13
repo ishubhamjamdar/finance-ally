@@ -50,6 +50,72 @@ export function markPrice(position: Position, prices: Record<string, Quote>): nu
   return null;
 }
 
+/**
+ * One position, marked to the stream.
+ *
+ * Every derived figure is `null` when the position could not be marked, and
+ * the positions table and the heatmap both read them straight out — so there
+ * is one implementation of "what is this holding worth right now" rather than
+ * one per panel, drifting apart the first time a rounding rule changes.
+ */
+export interface LivePosition {
+  ticker: string;
+  quantity: number;
+  avgCost: number;
+  costBasis: number;
+  /** The stream's price, else the fetched mark, else null. */
+  price: number | null;
+  marketValue: number | null;
+  unrealizedPnl: number | null;
+  unrealizedPnlPercent: number | null;
+  /**
+   * Share of the *marked* positions' value, 0–1 — what the heatmap sizes by.
+   *
+   * Null for an unpriced holding, which therefore gets no tile. Sizing it by
+   * cost instead would put a rectangle of one unit beside rectangles of
+   * another and call the picture a portfolio.
+   */
+  weight: number | null;
+}
+
+/** Positions marked to the live stream, in the order the endpoint returned them. */
+export function markPositions(
+  portfolio: Portfolio | null,
+  prices: Record<string, Quote>,
+): LivePosition[] {
+  if (portfolio === null) return [];
+
+  const marked = portfolio.positions.map((position) => {
+    const price = markPrice(position, prices);
+    const marketValue = price === null ? null : price * position.quantity;
+    const unrealizedPnl = marketValue === null ? null : marketValue - position.cost_basis;
+
+    return {
+      ticker: position.ticker,
+      quantity: position.quantity,
+      avgCost: position.avg_cost,
+      costBasis: position.cost_basis,
+      price,
+      marketValue,
+      unrealizedPnl,
+      unrealizedPnlPercent:
+        unrealizedPnl === null || position.cost_basis === 0
+          ? null
+          : (unrealizedPnl / position.cost_basis) * 100,
+      weight: null as number | null,
+    };
+  });
+
+  const total = marked.reduce((sum, position) => sum + (position.marketValue ?? 0), 0);
+  if (total > 0) {
+    for (const position of marked) {
+      position.weight = position.marketValue === null ? null : position.marketValue / total;
+    }
+  }
+
+  return marked;
+}
+
 export function valuePortfolio(
   portfolio: Portfolio | null,
   prices: Record<string, Quote>,
@@ -60,14 +126,13 @@ export function valuePortfolio(
   let costBasis = 0;
   const unpricedTickers: string[] = [];
 
-  for (const position of portfolio.positions) {
-    const price = markPrice(position, prices);
-    if (price === null) {
+  for (const position of markPositions(portfolio, prices)) {
+    if (position.marketValue === null) {
       unpricedTickers.push(position.ticker);
       continue;
     }
-    positionsValue += price * position.quantity;
-    costBasis += position.cost_basis;
+    positionsValue += position.marketValue;
+    costBasis += position.costBasis;
   }
 
   return {

@@ -49,6 +49,28 @@ export function formatPercent(value: number | null | undefined, digits = 2): str
   return `${number >= 0 ? "+" : ""}${number.toFixed(digits)}%`;
 }
 
+/**
+ * `-123.4` → `"-$123.40"`, `123.4` → `"+$123.40"`.
+ *
+ * The sign goes outside the symbol. `$-123.40` is what `formatDollars` of a
+ * negative produces, and it reads as a price rather than a loss.
+ */
+export function formatSignedDollars(value: number | null | undefined): string {
+  if (!Number.isFinite(value ?? NaN)) return EM_DASH;
+  const number = value as number;
+  return `${number < 0 ? "-" : "+"}$${MONEY.format(Math.abs(number))}`;
+}
+
+/**
+ * Shares, which are fractional in this system. Trailing zeros are dropped so a
+ * whole share reads `10` rather than `10.0000`, and four places survive
+ * because that is the precision `positions.quantity` is stored at.
+ */
+export function formatQuantity(value: number | null | undefined): string {
+  if (!Number.isFinite(value ?? NaN)) return EM_DASH;
+  return String(Number((value as number).toFixed(4)));
+}
+
 /** `-1.234` → `"-1.23"`, `1.234` → `"+1.23"`. */
 export function formatSigned(value: number | null | undefined, digits = 2): string {
   if (!Number.isFinite(value ?? NaN)) return EM_DASH;

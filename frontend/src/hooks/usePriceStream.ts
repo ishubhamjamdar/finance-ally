@@ -36,8 +36,20 @@ import type { MarketShock, PriceFrame, Quote } from "@/lib/types";
 
 export type ConnectionStatus = "connecting" | "connected" | "reconnecting" | "disconnected";
 
-/** Sparkline depth. At the 500 ms tick this is the last minute of price action. */
-export const MAX_SPARKLINE_POINTS = 120;
+/**
+ * How many prices per ticker are kept.
+ *
+ * At the simulator's 500 ms tick this is five minutes of price action, which
+ * is what Checkpoint 6's main chart draws. The sparklines show the tail of the
+ * same buffer (`Sparkline`'s `maxPoints`), so a ticker's line and its chart
+ * cannot disagree about what happened, and the page holds one series per
+ * ticker rather than two at different depths.
+ *
+ * Ten tickers at this depth is 6,000 numbers — nothing. The cost that matters
+ * is the per-frame copy, and that is bounded by the number of tickers, not by
+ * this.
+ */
+export const MAX_SERIES_POINTS = 600;
 
 /** How long the browser may keep failing before the dot turns red. */
 export const RECONNECT_GRACE_MS = 6000;
@@ -65,8 +77,11 @@ export interface PriceStream {
   prices: Record<string, Quote>;
   /**
    * Price series per ticker, accumulated **from page load** — PLAN.md §2. There
-   * is no history endpoint behind this and none is faked: a sparkline starts
+   * is no history endpoint behind this and none is faked: a series starts
    * empty and fills in, which is the honest picture of what the client knows.
+   *
+   * Capped at `MAX_SERIES_POINTS`. Both the sparklines and the main chart read
+   * it; the sparklines draw the tail.
    */
   sparklines: Record<string, number[]>;
   /** Notable moves, newest first. */
@@ -238,7 +253,7 @@ export function usePriceStream(
 function append(series: number[] | undefined, price: number): number[] {
   if (series === undefined) return [price];
   const next = [...series, price];
-  return next.length > MAX_SPARKLINE_POINTS ? next.slice(next.length - MAX_SPARKLINE_POINTS) : next;
+  return next.length > MAX_SERIES_POINTS ? next.slice(next.length - MAX_SERIES_POINTS) : next;
 }
 
 /**
