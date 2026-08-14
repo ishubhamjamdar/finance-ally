@@ -21,7 +21,7 @@
  * user from either the watchlist, the positions table, or the heatmap.
  */
 
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 
 import { FeedPanel } from "@/components/FeedPanel";
 import { Header } from "@/components/Header";
@@ -48,6 +48,9 @@ function Workstation() {
   const account = useAccount();
   const [picked, setPicked] = useState<string | null>(null);
   const [chatCollapsed, setChatCollapsed] = useState(false);
+  // Stable, so `ChatPanel`'s memo actually holds across the 2 Hz re-render this
+  // component takes from `useMarket()`.
+  const toggleChat = useCallback(() => setChatCollapsed((current) => !current), []);
 
   const positions = useMemo(
     () => markPositions(account.portfolio, market.prices),
@@ -80,12 +83,15 @@ function Workstation() {
         stalled={market.stalled}
       />
 
-      {/* The assistant's track is the only one that changes when it collapses;
-          `1fr` on the centre absorbs it, and no other panel remounts. */}
+      {/* The first three tracks are **identical in both strings**, so collapsing
+          the assistant changes exactly one of them and the centre's `1fr`
+          absorbs the difference. Nothing else remounts — and now nothing else
+          is re-laid-out either, so the chart and the treemap keep their
+          geometry rather than re-measuring on a toggle. */}
       <main
         className={`grid min-h-0 flex-1 grid-cols-1 gap-2 overflow-y-auto p-2 lg:overflow-hidden ${
           chatCollapsed
-            ? "lg:grid-cols-[minmax(300px,340px)_1fr_minmax(300px,360px)_2.5rem]"
+            ? "lg:grid-cols-[minmax(280px,320px)_1fr_minmax(280px,320px)_2.5rem]"
             : "lg:grid-cols-[minmax(280px,320px)_1fr_minmax(280px,320px)_minmax(300px,360px)]"
         }`}
       >
@@ -157,8 +163,9 @@ function Workstation() {
         <ChatPanel
           messages={account.chat}
           onSend={account.sendChat}
+          onRefresh={account.refresh}
           collapsed={chatCollapsed}
-          onToggle={() => setChatCollapsed((current) => !current)}
+          onToggle={toggleChat}
           loading={account.chatLoading}
           error={account.chatError}
         />

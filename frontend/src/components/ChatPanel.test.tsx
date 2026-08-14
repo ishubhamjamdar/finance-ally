@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import { ChatPanel } from "@/components/ChatPanel";
+import { ChatPanel, UNKNOWN_OUTCOME } from "@/components/ChatPanel";
 import { ApiError } from "@/lib/api";
 import type { ChatAction, ChatMessage } from "@/lib/types";
 
@@ -147,9 +147,10 @@ describe("ChatPanel", () => {
     expect(onSend).toHaveBeenCalledWith("buy 3 MSFT");
   });
 
-  it("gives the message back when the request failed", async () => {
-    // 503 no feed or no provider: nothing was said and nothing was stored, so
-    // the text is still the user's and resending it is the right thing to do.
+  it("gives the message back when the *server* refused it", async () => {
+    // 503 no feed or no provider: raised before `handle_message` executes
+    // anything, so nothing was said and nothing was stored. The text is still
+    // the user's and resending it is exactly right.
     render(
       <ChatPanel
         messages={[]}
@@ -170,12 +171,41 @@ describe("ChatPanel", () => {
     expect(screen.queryByTestId("chat-loading")).toBeNull();
   });
 
-  it("reports an unreachable server in words", async () => {
+  it("does not invite a resend when the connection dropped", async () => {
+    // The distinction that matters most in this panel. `POST /api/chat`
+    // commits its trades and persists the turn *before* it responds, so a
+    // reply lost in transit leaves real fills on the ledger. Handing the text
+    // back would be inviting the user to buy the same thing twice.
+    const onRefresh = vi.fn();
     render(
       <ChatPanel
         messages={[]}
+        onRefresh={onRefresh}
         onSend={async () => {
           throw new TypeError("Failed to fetch");
+        }}
+      />,
+    );
+
+    type("buy 10 NVDA");
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByTestId("chat-error")).toHaveTextContent(UNKNOWN_OUTCOME);
+    // Not back in the box.
+    expect(screen.getByLabelText("Message the assistant")).toHaveValue("");
+    // And the panels are re-read, because the turn may have moved money.
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not re-read the account when the server refused the turn", async () => {
+    // Nothing changed, so there is nothing to re-read.
+    const onRefresh = vi.fn();
+    render(
+      <ChatPanel
+        messages={[]}
+        onRefresh={onRefresh}
+        onSend={async () => {
+          throw new ApiError("No market data source is running", 503);
         }}
       />,
     );
@@ -183,7 +213,54 @@ describe("ChatPanel", () => {
     type("hello");
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
-    expect(await screen.findByTestId("chat-error")).toHaveTextContent("Cannot reach the server");
+    await screen.findByTestId("chat-error");
+    expect(onRefresh).not.toHaveBeenCalled();
+  });
+
+  it("does not overwrite a follow-up typed while the turn was in flight", async () => {
+    // The composer stays editable during a turn, so the restore has to yield to
+    // whatever the user has since typed — that is their newer intent.
+    let reject: ((cause: unknown) => void) | null = null;
+    render(
+      <ChatPanel
+        messages={[]}
+        onSend={() =>
+          new Promise<unknown>((_resolve, rejectPromise) => {
+            reject = rejectPromise;
+          })
+        }
+      />,
+    );
+
+    type("buy 10 NVDA");
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    type("and sell TSLA");
+
+    reject!(new ApiError("No provider", 503));
+
+    await screen.findByTestId("chat-error");
+    expect(screen.getByLabelText("Message the assistant")).toHaveValue("and sell TSLA");
+  });
+
+  it("will not send into a transcript that has not loaded yet", async () => {
+    // A turn sent first could be *included* in a history response that arrives
+    // afterwards, and would then render twice with different ids — once from
+    // the server, once from this session — so nothing would dedupe it.
+    const onSend = vi.fn(async () => undefined);
+    const { rerender, container } = render(
+      <ChatPanel messages={[]} onSend={onSend} loading={true} />,
+    );
+    const form = container.querySelector("form");
+    if (form === null) throw new Error("the panel has no form");
+
+    type("buy 3 MSFT");
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    fireEvent.submit(form);
+    expect(onSend).not.toHaveBeenCalled();
+
+    rerender(<ChatPanel messages={[]} onSend={onSend} loading={false} />);
+    fireEvent.submit(form);
+    expect(onSend).toHaveBeenCalledWith("buy 3 MSFT");
   });
 
   it("clears the last send error when the next turn succeeds", async () => {
@@ -261,6 +338,15 @@ describe("ChatPanel", () => {
     it("offers no toggle at all when there is nothing to toggle", () => {
       render(<ChatPanel messages={[]} onSend={vi.fn()} />);
 
+      expect(screen.queryByRole("button", { name: /the assistant/ })).toBeNull();
+    });
+
+    it("offers no dead expand button on the collapsed rail either", () => {
+      // A control labelled "Expand the assistant" that does nothing is worse
+      // than no control: it is the only apparent way back to the transcript.
+      render(<ChatPanel messages={[]} onSend={vi.fn()} collapsed />);
+
+      expect(screen.getByTestId("chat-panel-collapsed")).toHaveTextContent("Assistant");
       expect(screen.queryByRole("button", { name: /the assistant/ })).toBeNull();
     });
   });

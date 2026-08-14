@@ -23,28 +23,45 @@
  *
  * A turn can fail in two quite different ways and they read differently:
  *
- * - **The request failed** — 503 no feed or no provider, 422 a message the
- *   schema refused. Nothing was said and nothing was stored, so the composer
- *   keeps the text and the error sits above it: this is worth retrying as is.
+ * - **The server refused it** — 503 no feed or no provider, 422 a message the
+ *   schema refused. Both are raised before `handle_message` executes anything,
+ *   so nothing was said and nothing was stored: the composer keeps the text
+ *   and this is worth resending exactly as it was.
+ * - **The connection dropped.** This is *not* the same thing, and treating it
+ *   as one is how a user is invited to buy twice. `POST /api/chat` commits its
+ *   trades and persists the turn **before** it responds, so a reply lost in
+ *   transit leaves real fills on the ledger. The panel refreshes the account,
+ *   says the outcome is unknown, and does **not** hand the text back — because
+ *   handing it back is an invitation to execute it again.
  * - **The model answered badly, or an action it asked for was refused.** That
  *   is a 200. It belongs *in* the transcript, because from the conversation's
  *   point of view it happened — see `ChatActions`.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent } from "react";
 
 import { ChatActions } from "@/components/ChatActions";
-import { describeError } from "@/lib/api";
+import { ApiError, describeError } from "@/lib/api";
 import type { ChatMessage } from "@/lib/types";
 
 /** Matches `MAX_CHAT_MESSAGE_CHARS` in `backend/app/api/schemas.py`. */
 export const MAX_MESSAGE_CHARS = 2000;
 
+/** What the panel says when it cannot know whether the turn executed. */
+export const UNKNOWN_OUTCOME =
+  "The connection dropped before the reply arrived. The turn may have executed — " +
+  "check the panels, or reload to see the transcript, before sending it again.";
+
 interface ChatPanelProps {
   messages: ChatMessage[];
   /** Resolves when the turn is done; rejects with the backend's reason. */
   onSend: (message: string) => Promise<unknown>;
+  /**
+   * Re-read the account. Called when a turn's outcome is *unknown*, since a
+   * reply lost in transit may still have moved money.
+   */
+  onRefresh?: () => void;
   collapsed?: boolean;
   onToggle?: () => void;
   loading?: boolean;
@@ -52,9 +69,10 @@ interface ChatPanelProps {
   error?: string | null;
 }
 
-export function ChatPanel({
+function ChatPanelImpl({
   messages,
   onSend,
+  onRefresh,
   collapsed = false,
   onToggle,
   loading = false,
@@ -74,7 +92,11 @@ export function ChatPanel({
 
   async function send(event: FormEvent) {
     event.preventDefault();
-    if (pending !== null) return;
+    // Not while a turn is in flight, and not before the stored transcript has
+    // landed: a turn sent first could be *included* in a history response that
+    // arrives afterwards, and would then render twice — once from the server,
+    // once from this session — with different ids, so nothing would dedupe it.
+    if (pending !== null || loading) return;
 
     const text = draft.trim();
     if (text === "") return;
@@ -85,10 +107,19 @@ export function ChatPanel({
     try {
       await onSend(text);
     } catch (cause: unknown) {
-      setSendError(describeError(cause));
-      // Nothing was said and nothing was stored, so the text goes back in the
-      // box rather than being lost to a failed round trip.
-      setDraft(text);
+      // An `ApiError` means the server answered: it refused the request before
+      // executing anything, so the text is still the user's and resending it
+      // is safe. Anything else is a transport failure, where the turn may have
+      // run to completion and only the reply was lost.
+      if (cause instanceof ApiError) {
+        setSendError(describeError(cause));
+        // Only when the box is still empty — a follow-up typed while waiting
+        // is the user's newer intent, and must not be overwritten.
+        setDraft((current) => (current === "" ? text : current));
+      } else {
+        setSendError(UNKNOWN_OUTCOME);
+        onRefresh?.();
+      }
     } finally {
       setPending(null);
     }
@@ -109,15 +140,17 @@ export function ChatPanel({
         className="flex h-full flex-col items-center gap-3 rounded border border-edge bg-panel py-3"
         data-testid="chat-panel-collapsed"
       >
-        <button
-          type="button"
-          onClick={onToggle}
-          aria-label="Expand the assistant"
-          aria-expanded={false}
-          className="cursor-pointer rounded px-1.5 py-1 text-sm text-muted hover:bg-raised hover:text-ink"
-        >
-          ‹
-        </button>
+        {onToggle !== undefined && (
+          <button
+            type="button"
+            onClick={onToggle}
+            aria-label="Expand the assistant"
+            aria-expanded={false}
+            className="cursor-pointer rounded px-1.5 py-1 text-sm text-muted hover:bg-raised hover:text-ink"
+          >
+            ‹
+          </button>
+        )}
         <span
           className="text-[10px] font-semibold tracking-[0.18em] text-muted uppercase"
           // Reads bottom-to-top up the rail, so the collapsed panel is still
@@ -218,7 +251,7 @@ export function ChatPanel({
           />
           <button
             type="submit"
-            disabled={pending !== null || draft.trim() === ""}
+            disabled={pending !== null || loading || draft.trim() === ""}
             className="rounded bg-submit px-3 py-1.5 text-xs font-semibold tracking-wide text-ink uppercase hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Send
@@ -228,6 +261,14 @@ export function ChatPanel({
     </aside>
   );
 }
+
+/**
+ * Memoised, because its parent is not and cannot be: `Workstation` consumes
+ * `useMarket()`, whose value changes on every SSE frame. Without this the whole
+ * transcript — every turn, every action card — rebuilds twice a second for the
+ * life of the session, and it is the part of the page that grows.
+ */
+export const ChatPanel = memo(ChatPanelImpl);
 
 function Turn({ message }: { message: ChatMessage }) {
   return (
