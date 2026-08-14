@@ -80,12 +80,21 @@ test.describe("the portfolio panels", () => {
     const points = async () => Number(/(\d+)/.exec((await count.textContent()) ?? "")?.[1] ?? 0);
     await expect.poll(points, { message: "the series has points" }).toBeGreaterThan(0);
 
-    // The line is drawn, with real geometry — the failure Checkpoint 6 hit
-    // twice was a chart that rendered into a box of the wrong shape.
-    const line = page.getByTestId("pnl-chart").locator("polyline, path").first();
-    await expect(line).toBeVisible();
-    const box = await line.boundingBox();
-    expect(box!.width).toBeGreaterThan(100);
+    // The line is drawn into a box of real geometry — the failure Checkpoint 6
+    // hit twice was a chart rendered into the wrong shape.
+    //
+    // Measured on the svg, not on the polyline: a portfolio that has not moved
+    // draws a horizontal line, whose bounding box is a pixel and a half tall,
+    // and Playwright reports a zero-height element as *hidden*. The first
+    // version of this assertion failed on `toBeVisible()` against a polyline
+    // that was drawn, present and correct.
+    const svg = page.getByTestId("pnl-chart").locator("svg").first();
+    await expect(svg).toBeAttached();
+    await expect(page.getByTestId("pnl-chart").locator("polyline")).toBeAttached();
+
+    const box = (await svg.boundingBox())!;
+    expect(box.width, "the P&L plot has width").toBeGreaterThan(100);
+    expect(box.height, "the P&L plot has height").toBeGreaterThan(40);
   });
 
   test("the main chart follows the watchlist selection", async ({ page }) => {

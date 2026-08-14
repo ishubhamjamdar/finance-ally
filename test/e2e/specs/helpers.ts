@@ -134,6 +134,24 @@ export async function closeAllPositions(page: Page): Promise<void> {
 }
 
 /**
+ * How many points a row's sparkline has drawn — one per frame this page has
+ * received for that ticker.
+ *
+ * Scoped to the row, because the main chart's `LineChart` carries an
+ * aria-label that *starts with the same text* ("AAPL price since page load:
+ * 12 points, 189.97"), and a bare `getByLabel` matches both. Playwright's
+ * strict mode caught it; a looser matcher would have measured whichever
+ * element happened to come first.
+ */
+export async function sparklinePoints(page: Page, ticker: string): Promise<number> {
+  const points = await page
+    .getByTestId(`row-${ticker}`)
+    .locator("polyline")
+    .getAttribute("points");
+  return points === null ? 0 : points.trim().split(/\s+/).length;
+}
+
+/**
  * How many navigations this page has performed.
  *
  * Every "without a reload" assertion in PLAN.md's exit criteria comes down to

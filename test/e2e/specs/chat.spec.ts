@@ -1,6 +1,13 @@
 import { expect, test } from "@playwright/test";
 
-import { EM_DASH, closeAllPositions, navigationCount, readCash, waitForPrice } from "./helpers";
+import {
+  EM_DASH,
+  closeAllPositions,
+  navigationCount,
+  readCash,
+  sparklinePoints,
+  waitForPrice,
+} from "./helpers";
 
 /**
  * PLAN.md §12: "AI chat (mocked): send a message, receive a response, trade
@@ -116,19 +123,17 @@ test.describe("the assistant", () => {
     await expect(page.getByTestId("chat-turn-assistant").last()).toContainText("Mock assistant");
   });
 
-  test("collapsing and expanding leaves the rest of the layout alone", async ({ page }) => {
+  test("collapsing and expanding is reversible, and costs no state", async ({ page }) => {
+    // Where the space *goes* is `layout.spec.ts`'s question, measured at a
+    // pinned viewport. What matters here is that the assistant's own control
+    // works both ways and that nothing else is disturbed by using it: the
+    // transcript, the accumulated series and the page itself all survive.
     const chartWidthBefore = (await page.getByTestId("price-chart").boundingBox())!.width;
-    const watchlistBefore = (await page.getByTestId("row-AAPL").boundingBox())!.width;
+    const pointsBefore = await sparklinePoints(page, "AAPL");
 
     await page.getByRole("button", { name: "Collapse the assistant" }).click();
     await expect(page.getByTestId("chat-panel")).toHaveCount(0);
     await expect(page.getByTestId("chat-panel-collapsed")).toBeVisible();
-
-    // The centre grows into the freed track; the rails do not move.
-    expect((await page.getByTestId("row-AAPL").boundingBox())!.width).toBeCloseTo(
-      watchlistBefore,
-      0,
-    );
     expect((await page.getByTestId("price-chart").boundingBox())!.width).toBeGreaterThan(
       chartWidthBefore,
     );
@@ -139,6 +144,10 @@ test.describe("the assistant", () => {
       chartWidthBefore,
       0,
     );
+
+    // The stream ran throughout — the series only ever grows — and none of it
+    // involved reloading.
+    expect(await sparklinePoints(page, "AAPL")).toBeGreaterThanOrEqual(pointsBefore);
     expect(await navigationCount(page)).toBe(1);
   });
 });

@@ -47,6 +47,13 @@ export default defineConfig({
 
   use: {
     baseURL: BASE_URL,
+
+    // The app is http by design — one container, one port, no TLS (PLAN.md §3)
+    // — so nothing here may quietly upgrade a navigation. The service is named
+    // `app-shared` rather than `app` for that reason; see the compose file.
+    launchOptions: {
+      args: ["--disable-features=HttpsUpgrades,HttpsFirstBalancedMode"],
+    },
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
     video: "off",

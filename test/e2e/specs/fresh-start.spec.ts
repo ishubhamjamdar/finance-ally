@@ -1,6 +1,13 @@
 import { expect, test } from "@playwright/test";
 
-import { DEFAULT_WATCHLIST, EM_DASH, PRISTINE_URL, parseMoney, waitForPrice } from "./helpers";
+import {
+  DEFAULT_WATCHLIST,
+  EM_DASH,
+  PRISTINE_URL,
+  parseMoney,
+  sparklinePoints,
+  waitForPrice,
+} from "./helpers";
 
 /**
  * PLAN.md §12: "Fresh start: default watchlist appears, $10k balance shown,
@@ -82,35 +89,38 @@ test.describe("a fresh start", () => {
       })
       .toBeGreaterThan(0);
 
-    // ...and it fades. The class is removed once the animation window passes,
-    // which is what "fading rather than sticking" means in the DOM.
+    // ...and it fades rather than sticking. Sampled per cell, not across the
+    // grid: with ten tickers moving every 500 ms and a 500 ms animation,
+    // *something* is nearly always flashing, so "no cell is flashing" is a
+    // condition a live feed never reaches — the first version of this
+    // assertion waited 20 seconds for it and failed with eleven cells lit.
+    // What must be true of each cell is that it is seen both ways.
+    const seen = new Set<string>();
     await expect
-      .poll(async () => page.locator("[class*='flash-']").count(), {
-        message: "flash classes clear again",
-        timeout: 20_000,
-      })
-      .toBe(0);
+      .poll(
+        async () => {
+          const classes = (await cell.getAttribute("class")) ?? "";
+          seen.add(/flash-/.test(classes) ? "flashing" : "quiet");
+          return seen.size;
+        },
+        { message: "one cell seen both flashing and quiet", timeout: 20_000, intervals: [100] },
+      )
+      .toBe(2);
   });
 
   test("sparklines accumulate from page load rather than arriving full", async ({ page }) => {
-    const sparkline = page.getByLabel("AAPL price since page load");
-    await expect(sparkline).toBeVisible();
-
-    // Counted from the drawn polyline, because the row passes its own
-    // aria-label and the point count is not in it. One coordinate pair per
-    // frame this page has received.
-    const drawnPoints = async () => {
-      const points = await sparkline.locator("polyline").getAttribute("points");
-      return points === null ? 0 : points.trim().split(/\s+/).length;
-    };
+    await expect(page.getByTestId("row-AAPL").locator("polyline")).toBeAttached();
 
     // The series is what *this* page has seen since load, not a history the
     // client was handed: it starts small and grows one point per tick.
-    const early = await drawnPoints();
-    expect(early).toBeLessThan(60);
+    const early = await sparklinePoints(page, "AAPL");
+    expect(early, "a fresh page has not accumulated a full window").toBeLessThan(60);
 
     await expect
-      .poll(drawnPoints, { message: "sparkline points accumulate", timeout: 20_000 })
+      .poll(() => sparklinePoints(page, "AAPL"), {
+        message: "sparkline points accumulate",
+        timeout: 20_000,
+      })
       .toBeGreaterThan(early);
   });
 });

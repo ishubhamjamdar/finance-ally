@@ -162,9 +162,20 @@ class TestEachRunStartsClean:
         assertion survived exactly that mutation.
         """
         services = re.findall(r"^  ([a-z-]+):$", code("test/docker-compose.test.yml"), re.MULTILINE)
-        assert "app" in services
+        assert "app-shared" in services, f"no shared app service; found {services}"
         assert "app-pristine" in services, f"no pristine app service; found {services}"
         assert re.search(r'PRISTINE_URL:\s*"http://app-pristine:8000"', compose)
+
+    def test_no_service_is_named_after_an_hsts_preloaded_gtld(self, compose):
+        """`.app`, `.dev` and `.new` are HSTS-preloaded, and Chromium matches a
+        single-label hostname against those entries: `http://app:8000` is
+        force-upgraded to https and fails before any assertion runs. The
+        preload list is compiled in, so no flag disables it."""
+        services = re.findall(r"^  ([a-z-]+):$", code("test/docker-compose.test.yml"), re.MULTILINE)
+        preloaded = {"app", "dev", "new", "page", "search", "foo", "zip"}
+        assert not (set(services) & preloaded), (
+            f"{sorted(set(services) & preloaded)} would be force-upgraded to https by Chromium"
+        )
 
 
 class TestTheSuiteCannotHideIntermittency:
