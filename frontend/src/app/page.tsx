@@ -8,7 +8,9 @@
  * through `useMarket()` and `useAccount()`, so there is one price stream on
  * the page and one place that re-reads the account after a trade.
  *
- * The chat sidebar is Checkpoint 7 and docks to the right of this grid.
+ * The chat sidebar docks to the right of the grid, and collapses to a rail.
+ * Collapsing changes one grid track: nothing else unmounts, so the sparklines
+ * the page has accumulated and the chart's window survive it.
  *
  * ## Selection
  *
@@ -19,13 +21,14 @@
  * user from either the watchlist, the positions table, or the heatmap.
  */
 
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 
 import { FeedPanel } from "@/components/FeedPanel";
 import { Header } from "@/components/Header";
 import { PnlChart } from "@/components/PnlChart";
 import { PortfolioHeatmap } from "@/components/PortfolioHeatmap";
 import { PositionsTable } from "@/components/PositionsTable";
+import { ChatPanel } from "@/components/ChatPanel";
 import { PriceChart } from "@/components/PriceChart";
 import { TradeBar } from "@/components/TradeBar";
 import { WatchlistPanel } from "@/components/WatchlistPanel";
@@ -44,6 +47,10 @@ function Workstation() {
   const market = useMarket();
   const account = useAccount();
   const [picked, setPicked] = useState<string | null>(null);
+  const [chatCollapsed, setChatCollapsed] = useState(false);
+  // Stable, so `ChatPanel`'s memo actually holds across the 2 Hz re-render this
+  // component takes from `useMarket()`.
+  const toggleChat = useCallback(() => setChatCollapsed((current) => !current), []);
 
   const positions = useMemo(
     () => markPositions(account.portfolio, market.prices),
@@ -76,7 +83,25 @@ function Workstation() {
         stalled={market.stalled}
       />
 
-      <main className="grid min-h-0 flex-1 grid-cols-1 gap-2 overflow-y-auto p-2 lg:grid-cols-[minmax(300px,340px)_1fr_minmax(300px,360px)] lg:overflow-hidden">
+      {/* Four columns, and the centre gets a floor.
+          
+          The trap this avoids: `1fr` distributes what is *left*, so three
+          rails growing toward their maxima can squeeze the centre to nothing.
+          At 1200px that put the price chart in 160 pixels with the positions
+          table cut off — the panels §2 calls the workstation, unusable on an
+          ordinary laptop. `minmax(…, 1fr)` makes the centre take its share
+          first and the rails give way.
+
+          The first three tracks are **identical in each pair**, so collapsing
+          the assistant changes exactly one of them. Nothing else remounts, and
+          nothing else is re-laid-out. */}
+      <main
+        className={`grid min-h-0 flex-1 grid-cols-1 gap-2 overflow-y-auto p-2 lg:overflow-hidden ${
+          chatCollapsed
+            ? "lg:grid-cols-[minmax(190px,240px)_minmax(340px,1fr)_minmax(190px,240px)_2.5rem] xl:grid-cols-[minmax(260px,320px)_minmax(420px,1fr)_minmax(260px,320px)_2.5rem]"
+            : "lg:grid-cols-[minmax(190px,240px)_minmax(340px,1fr)_minmax(190px,240px)_minmax(240px,300px)] xl:grid-cols-[minmax(260px,320px)_minmax(420px,1fr)_minmax(260px,320px)_minmax(300px,380px)]"
+        }`}
+      >
         {/* Left rail: what to watch. */}
         <div className="flex min-h-0 flex-col gap-2 lg:overflow-hidden">
           <div className="flex min-h-[14rem] flex-1 flex-col">
@@ -140,6 +165,17 @@ function Workstation() {
             />
           </div>
         </div>
+
+        {/* Right dock: the copilot. */}
+        <ChatPanel
+          messages={account.chat}
+          onSend={account.sendChat}
+          onRefresh={account.refresh}
+          collapsed={chatCollapsed}
+          onToggle={toggleChat}
+          loading={account.chatLoading}
+          error={account.chatError}
+        />
       </main>
     </div>
   );

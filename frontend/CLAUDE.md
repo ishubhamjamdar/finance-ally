@@ -187,9 +187,39 @@ apart from the component: "do the tile areas match the weights" and "do the
 tiles tile the box" are assertable about numbers and not about a DOM tree of
 percentage-positioned divs.
 
+## The assistant
+
+`ChatPanel` docks to the right of the grid and collapses to a rail. The first
+three grid tracks in `page.tsx` are **identical in both strings**, so collapsing
+changes exactly one track: nothing else remounts *or* re-lays-out, and the
+accumulated sparklines and the chart's window survive a toggle.
+
+Three things about it are load-bearing:
+
+- **`ChatActions` renders every action, successful or not, in the backend's own
+  wording.** The model composes its message before it knows whether anything
+  cleared, so a real reply reads "Buying 100000 AAPL" beside an action refused
+  for insufficient cash. The sentence stands; the outcome goes directly under
+  it. A panel that showed the message alone would be a transcript that lies.
+- **A refused *request* and a dropped *connection* are different failures.**
+  `POST /api/chat` commits its trades and persists the turn before it responds.
+  A 503 or 422 is raised before anything executes, so the text goes back in the
+  composer to resend. A transport failure may have run to completion with only
+  the reply lost, so the panel refreshes the account, says the outcome is
+  unknown, and does **not** hand the text back — handing it back invites the
+  user to buy the same thing twice.
+- **`refresh()` must never reload the chat history.** `sendChat` appends the
+  turn the backend just persisted rather than re-fetching it, so a refresh that
+  also re-read the transcript would show every appended turn twice. For the same
+  reason nothing may be sent before the history has settled, or a turn could
+  appear in a response that arrives after it.
+
+`ChatPanel` is `memo`-wrapped and takes a stable `onToggle`, because its parent
+consumes `useMarket()` and therefore re-renders twice a second. Without it the
+whole transcript rebuilds on every SSE frame, and the transcript is the part of
+the page that grows.
+
 ## What is not here yet
 
-The chat sidebar is Checkpoint 7. It docks to the right of the grid in
-`page.tsx`, reads prices from `useMarket()`, and adds its `sendChat` to
-`TerminalProvider` so an auto-executed trade refreshes every panel exactly as a
-manual one does.
+Checkpoint 8 packages this into the Docker image; Checkpoint 9 is the
+end-to-end suite. Neither adds a component.
