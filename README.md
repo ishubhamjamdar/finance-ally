@@ -28,14 +28,27 @@ Single Docker container serving everything on port 8000:
 ```bash
 # Clone and configure
 cp .env.example .env
-# Add your OPENROUTER_API_KEY to .env
+# Add your OPENROUTER_API_KEY to .env — everything else has a working default,
+# and the app runs without it (simulated prices, no AI chat)
 
-# Run with Docker
+# Build and run: one command, and it opens the browser for you
+scripts/start_mac.sh              # macOS/Linux  (.\scripts\start_windows.ps1 on Windows)
+scripts/stop_mac.sh               # stops the container; your portfolio persists
+
+# Or drive Docker yourself
 docker build -t finally .
-docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
+docker run -v finally-data:/app/db -p 127.0.0.1:8000:8000 --stop-timeout 15 \
+    --env-file .env finally
+
+# Or with Compose
+docker compose up --build
 
 # Open http://localhost:8000
 ```
+
+The app is published on **loopback only** — it has no login, so binding every interface would put
+your portfolio and your OpenRouter credits on the local network. Set `FINALLY_BIND=0.0.0.0` if you
+genuinely want to reach it from another machine. `FINALLY_PORT` moves it off 8000.
 
 ## Environment Variables
 

@@ -365,8 +365,14 @@ Gate 3's two harnesses live in `test/`:
 ```bash
 test/smoke.sh                # every exit criterion against a real server
 LIVE_LLM=1 test/smoke.sh     # ...including one live OpenRouter call
+test/smoke_docker.sh         # the container: clean-clone build, scripts, volume, shutdown
 python3 test/mutate.py       # mutation testing, in a throwaway git worktree
 ```
+
+`tests/test_packaging.py` asserts the Dockerfile, compose file and scripts against each other —
+that `.env` cannot enter the build context, that `DB_PATH` stays inside the volume mount, and that
+both front doors name the same volume. Those failures are silent: the image still builds and the
+app still runs. Change any of those files and run it.
 
 ## Demo
 
