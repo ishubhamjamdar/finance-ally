@@ -1,0 +1,12 @@
+{
+  "name": "finally-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Playwright end-to-end suite (PLAN.md §12). Runs against a container, never a dev server.",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1"
+  }
+}

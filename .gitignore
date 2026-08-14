@@ -230,3 +230,7 @@ frontend/out/
 
 # screenshots and traces from browser-driven verification
 .playwright-mcp/
+
+# Playwright output from test/docker-compose.test.yml
+test/e2e/report/
+test/e2e/test-results/

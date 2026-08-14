@@ -9,7 +9,7 @@ why the step survives being scoped down but must not be skipped.
     test/mutate.py                    # run every mutation for this checkpoint
     test/mutate.py --list             # show them without running anything
     test/mutate.py -k watchlist       # only mutations whose name matches
-    test/mutate.py --project frontend # one side: backend, frontend or packaging
+    test/mutate.py --project e2e      # one side: backend, frontend, packaging, e2e
 
 **It runs in a throwaway `git worktree`, never your working tree.** An earlier
 harness edited files in place and restored them in a `finally` — which a
@@ -460,6 +460,68 @@ PACKAGING_MUTATIONS: list[tuple[str, str, str, str]] = [
 #: the suite would only add ten seconds per mutation.
 PACKAGING_TESTS = "tests/test_packaging.py"
 
+#: (name, file relative to the *repo root*, snippet, replacement) — Checkpoint 9.
+#:
+#: The end-to-end suite takes minutes per run, so mutating the application and
+#: re-running it is not a mutation *suite* — it is an afternoon. What is
+#: mutated here is the harness's own contract, killed by
+#: `tests/test_e2e_harness.py` in milliseconds: the settings that would let the
+#: suite pass without testing anything (a retry, a stray `.only`), the ones
+#: that would make it depend on a key, and the ones that would make a fresh
+#: start mean "whatever the last run left behind".
+#:
+#: The complementary question — does the suite fail when the *app* breaks? —
+#: cannot be answered this way and was answered by hand at Gate 3; the log
+#: records which mutation was used and what failed.
+E2E_MUTATIONS: list[tuple[str, str, str, str]] = [
+    # --- the suite must not be able to hide intermittency ----------------
+    ("e2e: retry a failing spec until it passes",
+     "test/e2e/playwright.config.ts", "retries: 0", "retries: 2"),
+    ("e2e: run specs in parallel against one shared account",
+     "test/e2e/playwright.config.ts", "workers: 1", "workers: 4"),
+    ("e2e: allow a stray .only to shrink the suite to one test",
+     "test/e2e/Dockerfile", '"playwright", "test", "--forbid-only"',
+     '"playwright", "test"'),
+
+    # --- the suite must need no secrets ----------------------------------
+    ("e2e: let the real model answer the chat specs",
+     "test/docker-compose.test.yml", 'LLM_MOCK: "true"', 'LLM_MOCK: "false"'),
+    ("e2e: inherit the developer's OpenRouter key instead of pinning it empty",
+     "test/docker-compose.test.yml", '    OPENROUTER_API_KEY: ""\n', ""),
+    ("e2e: inherit a Massive key, so the suite polls a paid API",
+     "test/docker-compose.test.yml", '    MASSIVE_API_KEY: ""\n', ""),
+    ("e2e: read the developer's .env into the test container",
+     "test/docker-compose.test.yml", "  environment:\n    LLM_MOCK:",
+     "  env_file:\n    - ../.env\n  environment:\n    LLM_MOCK:"),
+
+    # --- each run must start clean ---------------------------------------
+    ("e2e: persist the database between runs",
+     "test/docker-compose.test.yml", "  stop_grace_period: 15s",
+     "  volumes:\n    - finally-e2e-data:/app/db\n  stop_grace_period: 15s"),
+    ("e2e: drop the pristine app, so a fresh start means 'ran first'",
+     "test/docker-compose.test.yml", "  app-pristine:\n    <<: *app\n", ""),
+    ("e2e: point the fresh-start specs at the shared app",
+     "test/docker-compose.test.yml", 'PRISTINE_URL: "http://app-pristine:8000"',
+     'BASE_URL_AGAIN: "http://app:8000"'),
+
+    # --- the runner must match its browsers ------------------------------
+    ("e2e: float the Playwright dependency off its image tag",
+     "test/e2e/package.json", '"@playwright/test": "1.62.1"',
+     '"@playwright/test": "^1.62.1"'),
+    ("e2e: pull a browser image the library does not match",
+     "test/e2e/Dockerfile", "playwright:v1.62.1-noble", "playwright:v1.55.0-noble"),
+
+    # --- and the scenarios must still be there ---------------------------
+    ("e2e: lose the SSE reconnection scenario",
+     "test/e2e/specs/sse-resilience.spec.ts", "test.describe(", "test.describe.skip("),
+    ("e2e: sleep instead of waiting for a condition",
+     "test/e2e/specs/trading.spec.ts", "    const cashBefore = await readCash(page);",
+     "    await page.waitForTimeout(2000);\n    const cashBefore = await readCash(page);"),
+]
+
+#: Same reasoning as PACKAGING_TESTS.
+E2E_TESTS = "tests/test_e2e_harness.py"
+
 
 def build_worktree() -> pathlib.Path:
     """A clean checkout of HEAD, isolated from the working tree.
@@ -519,7 +581,9 @@ def main() -> int:
     parser.add_argument("--list", action="store_true", help="show mutations without running them")
     parser.add_argument("-k", metavar="SUBSTRING", default="", help="only matching mutations")
     parser.add_argument(
-        "--project", choices=("backend", "frontend", "packaging"), help="only one side"
+        "--project",
+        choices=("backend", "frontend", "packaging", "e2e"),
+        help="only one side",
     )
     args = parser.parse_args()
 
@@ -535,6 +599,9 @@ def main() -> int:
         # from backend/, and read the worktree through app.paths.REPO_ROOT.
         ("packaging", name, path, old, new, PACKAGING_TESTS)
         for name, path, old, new in PACKAGING_MUTATIONS
+    ] + [
+        ("e2e", name, path, old, new, E2E_TESTS)
+        for name, path, old, new in E2E_MUTATIONS
     ]
 
     selected = [
@@ -554,7 +621,7 @@ def main() -> int:
     python = VENV_PYTHON if VENV_PYTHON.exists() else pathlib.Path(sys.executable)
 
     wanted = {project for project, *_ in selected}
-    if wanted & {"backend", "packaging"} and not VENV_PYTHON.exists():
+    if wanted & {"backend", "packaging", "e2e"} and not VENV_PYTHON.exists():
         print("No backend/.venv — run `uv sync --extra dev` in backend/ first.")
         return 1
     if "frontend" in wanted:
@@ -567,13 +634,16 @@ def main() -> int:
     if "packaging" in wanted and not backend_passes(backend, PACKAGING_TESTS, python):
         print("  FAILED — the packaging tests are red in the worktree. Fix that first.")
         return 1
+    if "e2e" in wanted and not backend_passes(backend, E2E_TESTS, python):
+        print("  FAILED — the e2e harness tests are red in the worktree. Fix that first.")
+        return 1
     if "frontend" in wanted and not frontend_passes(frontend):
         print("  FAILED — the frontend suite is red before any mutation. Fix that first.")
         return 1
     print("  ok\n")
 
     survivors: list[str] = []
-    roots = {"backend": backend, "frontend": frontend, "packaging": root}
+    roots = {"backend": backend, "frontend": frontend, "packaging": root, "e2e": root}
     for project, name, relpath, old, new, tests in selected:
         path = roots[project] / relpath
         original = path.read_text()
