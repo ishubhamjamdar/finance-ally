@@ -83,16 +83,23 @@ function Workstation() {
         stalled={market.stalled}
       />
 
-      {/* The first three tracks are **identical in both strings**, so collapsing
-          the assistant changes exactly one of them and the centre's `1fr`
-          absorbs the difference. Nothing else remounts — and now nothing else
-          is re-laid-out either, so the chart and the treemap keep their
-          geometry rather than re-measuring on a toggle. */}
+      {/* Four columns, and the centre gets a floor.
+          
+          The trap this avoids: `1fr` distributes what is *left*, so three
+          rails growing toward their maxima can squeeze the centre to nothing.
+          At 1200px that put the price chart in 160 pixels with the positions
+          table cut off — the panels §2 calls the workstation, unusable on an
+          ordinary laptop. `minmax(…, 1fr)` makes the centre take its share
+          first and the rails give way.
+
+          The first three tracks are **identical in each pair**, so collapsing
+          the assistant changes exactly one of them. Nothing else remounts, and
+          nothing else is re-laid-out. */}
       <main
         className={`grid min-h-0 flex-1 grid-cols-1 gap-2 overflow-y-auto p-2 lg:overflow-hidden ${
           chatCollapsed
-            ? "lg:grid-cols-[minmax(280px,320px)_1fr_minmax(280px,320px)_2.5rem]"
-            : "lg:grid-cols-[minmax(280px,320px)_1fr_minmax(280px,320px)_minmax(300px,360px)]"
+            ? "lg:grid-cols-[minmax(190px,240px)_minmax(340px,1fr)_minmax(190px,240px)_2.5rem] xl:grid-cols-[minmax(260px,320px)_minmax(420px,1fr)_minmax(260px,320px)_2.5rem]"
+            : "lg:grid-cols-[minmax(190px,240px)_minmax(340px,1fr)_minmax(190px,240px)_minmax(240px,300px)] xl:grid-cols-[minmax(260px,320px)_minmax(420px,1fr)_minmax(260px,320px)_minmax(300px,380px)]"
         }`}
       >
         {/* Left rail: what to watch. */}
