@@ -96,6 +96,35 @@ def run_instruction(dockerfile: str, contains: str) -> str:
     return "\n".join(collected)
 
 
+def run_arguments(relative: str) -> str:
+    """The arguments the file actually passes when it starts a container.
+
+    Not the whole file. `--stop-timeout` deleted from `docker run` left
+    `STOP_TIMEOUT=15` sitting two screens above it, and a test that searched the
+    file found the number and passed — the mutation survived. What a script
+    declares and what it passes are different questions.
+    """
+    body = strip_comments(relative, read(relative))
+    if relative.endswith(".ps1"):
+        # The argument array, from `$runArgs = @(` to its closing paren, plus
+        # the conditional appends that follow it.
+        block = re.search(r"\$runArgs = @\((.*?)\$runArgs \+= \$Image", body, flags=re.DOTALL)
+        assert block, f"{relative} has no recognisable docker run argument list"
+        return block.group(1)
+    if relative.endswith(".yml"):
+        return body  # a compose service is its own argument list
+
+    lines = body.splitlines()
+    starts = [i for i, line in enumerate(lines) if "docker run" in line]
+    assert len(starts) == 1, f"{relative} runs docker {len(starts)} times, expected 1"
+    collected = []
+    for line in lines[starts[0] :]:
+        collected.append(line)
+        if not line.rstrip().endswith("\\"):
+            break
+    return "\n".join(collected)
+
+
 def graceful_timeout(dockerfile: str) -> int | None:
     """Seconds uvicorn is allowed to close in-flight responses, from the CMD."""
     match = re.search(r'"--timeout-graceful-shutdown",\s*"(\d+)"', dockerfile)
@@ -291,13 +320,19 @@ class TestShutdownReachesTheLifespan:
         seconds, against the 10 usually quoted, which is short enough to SIGKILL
         the lifespan mid-shutdown.
         """
-        body = strip_comments(relative, read(relative))
-        match = re.search(
-            r"(?:stop[-_ ]?timeout|stop[-_ ]?grace[-_ ]?period)\D{0,4}(\d+)", body, re.IGNORECASE
+        passed = run_arguments(relative)
+        assert re.search(r"stop[-_ ]?(?:timeout|grace[-_ ]?period)", passed, re.IGNORECASE), (
+            f"{relative} starts the container without a stop timeout — Docker's own "
+            "default was measured at 1.1s, which SIGKILLs the lifespan mid-shutdown"
         )
-        assert match, f"{relative} does not declare a stop timeout"
-        assert int(match.group(1)) >= graceful_timeout(dockerfile), (
-            f"{relative} allows {match.group(1)}s, less than uvicorn's graceful shutdown"
+        declared = re.search(
+            r"stop[-_ ]?(?:timeout|grace[-_ ]?period)\D{0,4}(\d+)",
+            strip_comments(relative, read(relative)),
+            re.IGNORECASE,
+        )
+        assert declared, f"{relative} passes a stop timeout it never sets"
+        assert int(declared.group(1)) >= graceful_timeout(dockerfile), (
+            f"{relative} allows {declared.group(1)}s, less than uvicorn's graceful shutdown"
         )
 
 
@@ -359,8 +394,13 @@ class TestTheFrontDoorsAgree:
 
     def test_compose_tolerates_a_missing_env_file(self, compose):
         """PLAN.md §11 and Checkpoint 8's last exit criterion: the app runs with
-        no `.env` at all. A hard `env_file` entry makes Compose refuse to start."""
-        assert "required: false" in compose
+        no `.env` at all. A hard `env_file` entry makes Compose refuse to start.
+
+        Read with the comments stripped: the comment above that line explains
+        `required: false`, so a mutation flipping it to `true` left the phrase
+        in the file and survived.
+        """
+        assert "required: false" in strip_comments("docker-compose.yml", compose)
 
     @pytest.mark.parametrize("script", ["scripts/start_mac.sh", "scripts/stop_mac.sh"])
     def test_the_shell_scripts_are_executable_with_a_shebang(self, script):
