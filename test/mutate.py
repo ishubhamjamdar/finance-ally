@@ -515,8 +515,8 @@ E2E_MUTATIONS: list[tuple[str, str, str, str]] = [
     ("e2e: lose the SSE reconnection scenario",
      "test/e2e/specs/sse-resilience.spec.ts", "test.describe(", "test.describe.skip("),
     ("e2e: sleep instead of waiting for a condition",
-     "test/e2e/specs/trading.spec.ts", "    const cashBefore = await readCash(page);",
-     "    await page.waitForTimeout(2000);\n    const cashBefore = await readCash(page);"),
+     "test/e2e/specs/trading.spec.ts", "    await tradeFromBar(page, \"buy\", \"NVDA\", 3);",
+     "    await page.waitForTimeout(2000);\n    await tradeFromBar(page, \"buy\", \"NVDA\", 3);"),
 ]
 
 #: Same reasoning as PACKAGING_TESTS.

@@ -64,6 +64,22 @@ def read(relative: str) -> str:
     return (REPO_ROOT / relative).read_text()
 
 
+def code(relative: str) -> str:
+    """`relative` with its comment lines removed.
+
+    Every file here — YAML, Dockerfile, TypeScript config — documents *why* it
+    is written the way it is, which means the words these tests look for are
+    all present in prose as well as in code. Mutation testing found three
+    assertions that a comment alone satisfied, on top of the two the code
+    review found in Checkpoint 8. Assert on the code.
+    """
+    body = read(relative)
+    if relative.endswith((".ts", ".tsx")):
+        body = re.sub(r"/\*.*?\*/", "", body, flags=re.DOTALL)
+        return "\n".join(line for line in body.splitlines() if not line.strip().startswith("//"))
+    return "\n".join(line for line in body.splitlines() if not line.strip().startswith("#"))
+
+
 @pytest.fixture(scope="module")
 def compose() -> str:
     return read("test/docker-compose.test.yml")
@@ -137,10 +153,18 @@ class TestEachRunStartsClean:
         assert app_volumes == [], "the test app has a volume mounted at /app/db"
 
     def test_there_is_a_pristine_app_for_the_fresh_start_assertions(self, compose):
-        """Two app services, so "a fresh start shows $10,000" is a fact about a
-        clean database rather than about this file running first."""
-        assert "app-pristine:" in compose
-        assert "PRISTINE_URL:" in compose
+        """Two app *services*, so "a fresh start shows $10,000" is a fact about
+        a clean database rather than about this file running first.
+
+        Matched as a service key at its own indentation, not as a substring:
+        deleting the service leaves the name behind in `PRISTINE_URL`, in
+        `depends_on` and in two comments, and the substring version of this
+        assertion survived exactly that mutation.
+        """
+        services = re.findall(r"^  ([a-z-]+):$", code("test/docker-compose.test.yml"), re.MULTILINE)
+        assert "app" in services
+        assert "app-pristine" in services, f"no pristine app service; found {services}"
+        assert re.search(r'PRISTINE_URL:\s*"http://app-pristine:8000"', compose)
 
 
 class TestTheSuiteCannotHideIntermittency:
@@ -165,8 +189,22 @@ class TestTheSuiteCannotHideIntermittency:
 
     def test_the_runner_forbids_a_stray_only(self):
         """`test.only` left in a spec reduces the suite to one test and still
-        exits zero — the quietest possible way to stop testing anything."""
-        assert "--forbid-only" in read(f"{E2E}/Dockerfile")
+        exits zero — the quietest possible way to stop testing anything.
+
+        Read from the CMD, not from the file: the comment above it explains the
+        flag, and the substring version of this assertion survived deleting the
+        flag itself."""
+        cmd = re.search(r"^CMD \[(.*)\]$", code(f"{E2E}/Dockerfile"), re.MULTILINE)
+        assert cmd, "the runner has no exec-form CMD"
+        assert "--forbid-only" in cmd.group(1)
+
+    @pytest.mark.parametrize("spec", sorted(set(SCENARIOS.values())))
+    def test_no_scenario_is_skipped(self, spec):
+        """A `.skip` is how a scenario stops being covered while the file that
+        owns it still exists — and the suite still reports success."""
+        body = code(f"{E2E}/specs/{spec}")
+        assert ".skip(" not in body, f"{spec} contains a skipped test or describe block"
+        assert ".fixme(" not in body, f"{spec} contains a fixme"
 
     def test_no_spec_sleeps_for_a_fixed_duration(self):
         """Checkpoint 5's follow-up pass hunted one flake for two checkpoints
