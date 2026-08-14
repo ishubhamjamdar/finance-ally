@@ -122,3 +122,57 @@ export interface WatchlistRemoval {
   removed: boolean;
   still_tracked: boolean;
 }
+
+// --- chat (PLAN.md §8, §9) -------------------------------------------------
+
+export type ChatRole = "user" | "assistant";
+
+/**
+ * One action the assistant attempted, and what came of it.
+ *
+ * **Both outcomes are reported, and both must be rendered.** The model writes
+ * its message *before* knowing whether the trade cleared, so a reply can say
+ * "Buying 100000 AAPL" beside an action that was refused for insufficient
+ * cash. `app/chat.py` says the same thing from the other side. Showing the
+ * message without the actions is how a transcript comes to claim a fill that
+ * never happened.
+ *
+ * `summary` is what was attempted ("buy 10 AAPL"); `detail` is the outcome, or
+ * the reason there wasn't one. Both are composed by the backend and rendered
+ * verbatim — deriving our own wording would be a second implementation of what
+ * the trade actually did.
+ */
+export interface ChatAction {
+  kind: "trade" | "watchlist";
+  ok: boolean;
+  summary: string;
+  detail: string;
+  /** Null only for an item that failed the schema before either could be read. */
+  ticker: string | null;
+  /** buy | sell | add | remove. */
+  action: string | null;
+  /** The fill for a trade, the entry for a watchlist change, null for a refusal. */
+  result: Record<string, unknown> | null;
+}
+
+/** A stored turn — `GET /api/chat/history`. `actions` is null for a user message. */
+export interface ChatMessage {
+  id: string;
+  role: ChatRole;
+  content: string;
+  actions: ChatAction[] | null;
+  created_at: string;
+}
+
+export interface ChatHistoryResponse {
+  /** Oldest first, as the endpoint documents. */
+  messages: ChatMessage[];
+}
+
+/** `POST /api/chat` — what was said, what was done, and where that left the account. */
+export interface ChatReply {
+  message: string;
+  actions: ChatAction[];
+  /** Read *after* the actions, so a reply that bought something carries the resulting balance. */
+  portfolio: Portfolio;
+}

@@ -26,6 +26,8 @@ export const ENDPOINTS = {
   portfolioHistory: "/api/portfolio/history",
   trade: "/api/portfolio/trade",
   watchlist: "/api/watchlist",
+  chat: "/api/chat",
+  chatHistory: "/api/chat/history",
   priceStream: "/api/stream/prices",
 } as const;
 

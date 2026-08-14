@@ -8,7 +8,9 @@
  * through `useMarket()` and `useAccount()`, so there is one price stream on
  * the page and one place that re-reads the account after a trade.
  *
- * The chat sidebar is Checkpoint 7 and docks to the right of this grid.
+ * The chat sidebar docks to the right of the grid, and collapses to a rail.
+ * Collapsing changes one grid track: nothing else unmounts, so the sparklines
+ * the page has accumulated and the chart's window survive it.
  *
  * ## Selection
  *
@@ -26,6 +28,7 @@ import { Header } from "@/components/Header";
 import { PnlChart } from "@/components/PnlChart";
 import { PortfolioHeatmap } from "@/components/PortfolioHeatmap";
 import { PositionsTable } from "@/components/PositionsTable";
+import { ChatPanel } from "@/components/ChatPanel";
 import { PriceChart } from "@/components/PriceChart";
 import { TradeBar } from "@/components/TradeBar";
 import { WatchlistPanel } from "@/components/WatchlistPanel";
@@ -44,6 +47,7 @@ function Workstation() {
   const market = useMarket();
   const account = useAccount();
   const [picked, setPicked] = useState<string | null>(null);
+  const [chatCollapsed, setChatCollapsed] = useState(false);
 
   const positions = useMemo(
     () => markPositions(account.portfolio, market.prices),
@@ -76,7 +80,15 @@ function Workstation() {
         stalled={market.stalled}
       />
 
-      <main className="grid min-h-0 flex-1 grid-cols-1 gap-2 overflow-y-auto p-2 lg:grid-cols-[minmax(300px,340px)_1fr_minmax(300px,360px)] lg:overflow-hidden">
+      {/* The assistant's track is the only one that changes when it collapses;
+          `1fr` on the centre absorbs it, and no other panel remounts. */}
+      <main
+        className={`grid min-h-0 flex-1 grid-cols-1 gap-2 overflow-y-auto p-2 lg:overflow-hidden ${
+          chatCollapsed
+            ? "lg:grid-cols-[minmax(300px,340px)_1fr_minmax(300px,360px)_2.5rem]"
+            : "lg:grid-cols-[minmax(280px,320px)_1fr_minmax(280px,320px)_minmax(300px,360px)]"
+        }`}
+      >
         {/* Left rail: what to watch. */}
         <div className="flex min-h-0 flex-col gap-2 lg:overflow-hidden">
           <div className="flex min-h-[14rem] flex-1 flex-col">
@@ -140,6 +152,16 @@ function Workstation() {
             />
           </div>
         </div>
+
+        {/* Right dock: the copilot. */}
+        <ChatPanel
+          messages={account.chat}
+          onSend={account.sendChat}
+          collapsed={chatCollapsed}
+          onToggle={() => setChatCollapsed((current) => !current)}
+          loading={account.chatLoading}
+          error={account.chatError}
+        />
       </main>
     </div>
   );

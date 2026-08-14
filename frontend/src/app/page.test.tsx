@@ -22,6 +22,8 @@ let history: { total_value: number; recorded_at: string }[];
 let tradeStatus: { status: number; detail: string } | null;
 let watchlistTickers: string[];
 let portfolioStatus: number;
+let chatHistory: unknown[];
+let chatReply: (message: string) => Response;
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -37,6 +39,9 @@ beforeEach(() => {
   tradeStatus = null;
   watchlistTickers = ["AAPL", "MSFT"];
   portfolioStatus = 200;
+  chatHistory = [];
+  chatReply = (message: string) =>
+    json({ message: `Mock assistant: ${message}`, actions: [], portfolio: account });
 
   vi.stubGlobal(
     "fetch",
@@ -66,6 +71,11 @@ beforeEach(() => {
         });
       }
 
+      if (url.includes("/api/chat/history")) return json({ messages: chatHistory });
+      if (url.includes("/api/chat")) {
+        const sent = JSON.parse(init?.body as string) as { message: string };
+        return chatReply(sent.message);
+      }
       if (url.includes("/api/portfolio/history")) return json({ snapshots: history });
       if (url.includes("/api/portfolio")) {
         return portfolioStatus === 200
@@ -338,5 +348,229 @@ describe("the workstation", () => {
     expect(screen.getByTestId("heatmap-unpriced")).toHaveTextContent("AAPL");
     // The row survives with its cost intact.
     expect(within(screen.getByTestId("position-AAPL")).getByText("200.00")).toBeInTheDocument();
+  });
+
+  describe("the assistant", () => {
+    /** Reply with an executed buy, exactly as the mock backend does. */
+    function replyExecutingABuy(quantity: number) {
+      return (message: string) => {
+        account = makePortfolio(10000 - quantity * 190, [
+          makePosition("AAPL", quantity, 190, 190),
+        ]);
+        watchlistTickers = ["AAPL", "MSFT"];
+        return json({
+          message: `Mock assistant: ${message}`,
+          actions: [
+            {
+              kind: "trade",
+              ok: true,
+              summary: `buy ${quantity} AAPL`,
+              detail: `Filled ${quantity} AAPL at $190.00.`,
+              ticker: "AAPL",
+              action: "buy",
+              result: null,
+            },
+          ],
+          portfolio: account,
+        });
+      };
+    }
+
+    function ask(text: string) {
+      fireEvent.change(screen.getByLabelText("Message the assistant"), {
+        target: { value: text },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    }
+
+    it("shows a loading indicator, then the reply", async () => {
+      let release: ((value: Response) => void) | null = null;
+      chatReply = () => {
+        throw new Error("unused");
+      };
+      const original = globalThis.fetch as (
+        input: RequestInfo | URL,
+        init?: RequestInit,
+      ) => Promise<Response>;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input).includes("/api/chat") && !String(input).includes("history")) {
+            return new Promise<Response>((resolve) => {
+              release = resolve;
+            });
+          }
+          return original(input, init);
+        }),
+      );
+
+      render(<Page />);
+      await loaded();
+      ask("buy 5 AAPL");
+
+      expect(screen.getByTestId("chat-loading")).toBeInTheDocument();
+
+      release!(
+        json({ message: "Mock assistant: bought.", actions: [], portfolio: account }),
+      );
+      await waitFor(() => expect(screen.queryByTestId("chat-loading")).toBeNull());
+      expect(screen.getByTestId("chat-transcript")).toHaveTextContent("Mock assistant: bought.");
+    });
+
+    it("reflects an LLM-executed trade inline AND in every portfolio panel", async () => {
+      // The exit criterion, and the reason `sendChat` calls `refresh()`.
+      chatReply = replyExecutingABuy(5);
+      render(<Page />);
+      await loaded();
+      FakeEventSource.only.emitMessage(makeFrame({ AAPL: 190, MSFT: 400 }));
+
+      ask("buy 5 AAPL");
+
+      // Inline, as a confirmation.
+      await waitFor(() =>
+        expect(screen.getByTestId("chat-action-ok")).toHaveTextContent("Filled 5 AAPL at $190.00."),
+      );
+      // And in the panels — which arrive on `refresh()`'s own round trip, so
+      // this waits rather than assuming it has already landed.
+      await waitFor(() =>
+        expect(screen.getByTestId("header-cash")).toHaveTextContent("$9,050.00"),
+      );
+      expect(screen.getByTestId("position-AAPL")).toHaveTextContent("AAPL");
+      expect(screen.getByTestId("tile-AAPL")).toBeInTheDocument();
+    });
+
+    it("puts a refused action under the message that claimed it", async () => {
+      chatReply = (message: string) =>
+        json({
+          message: `Mock assistant: ${message}`,
+          actions: [
+            {
+              kind: "trade",
+              ok: false,
+              summary: "buy 100000 AAPL",
+              detail: "Insufficient cash: only $10,000.00 is available.",
+              ticker: "AAPL",
+              action: "buy",
+              result: null,
+            },
+          ],
+          portfolio: account,
+        });
+      render(<Page />);
+      await loaded();
+
+      ask("buy 100000 AAPL");
+
+      await waitFor(() =>
+        expect(screen.getByTestId("chat-action-failed")).toHaveTextContent("Insufficient cash"),
+      );
+      // The prose still claims it, which is exactly why the outcome is beside it.
+      expect(screen.getByTestId("chat-transcript")).toHaveTextContent("buy 100000 AAPL");
+      expect(screen.getByTestId("header-cash")).toHaveTextContent("$10,000.00");
+    });
+
+    it("shows an LLM watchlist addition in the watchlist", async () => {
+      chatReply = (message: string) => {
+        watchlistTickers = ["AAPL", "MSFT", "PYPL"];
+        return json({
+          message: `Mock assistant: ${message}`,
+          actions: [
+            {
+              kind: "watchlist",
+              ok: true,
+              summary: "add PYPL",
+              detail: "PYPL added to the watchlist.",
+              ticker: "PYPL",
+              action: "add",
+              result: { ticker: "PYPL", added_at: "2026-08-14T03:22:17+00:00" },
+            },
+          ],
+          portfolio: account,
+        });
+      };
+      render(<Page />);
+      await loaded();
+
+      ask("watch PYPL");
+
+      await waitFor(() => expect(screen.getByTestId("row-PYPL")).toBeInTheDocument());
+      expect(screen.getByTestId("chat-action-ok")).toHaveTextContent("PYPL added to the watchlist.");
+    });
+
+    it("replays the stored transcript on a reload", async () => {
+      chatHistory = [
+        {
+          id: "stored-1",
+          role: "user",
+          content: "buy 100000 AAPL",
+          actions: null,
+          created_at: "2026-08-14T03:00:00+00:00",
+        },
+        {
+          id: "stored-2",
+          role: "assistant",
+          content: "Mock assistant: Buying 100000 AAPL.",
+          actions: [
+            {
+              kind: "trade",
+              ok: false,
+              summary: "buy 100000 AAPL",
+              detail: "Insufficient cash: only $10,000.00 is available.",
+              ticker: "AAPL",
+              action: "buy",
+              result: null,
+            },
+          ],
+          created_at: "2026-08-14T03:00:01+00:00",
+        },
+      ];
+
+      render(<Page />);
+      await loaded();
+
+      // A fresh mount is what a reload is, and the refusal comes back with it —
+      // so the transcript does not read as a fill after the page is reopened.
+      await waitFor(() =>
+        expect(screen.getByTestId("chat-transcript")).toHaveTextContent("Buying 100000 AAPL."),
+      );
+      expect(screen.getByTestId("chat-action-failed")).toHaveTextContent("Insufficient cash");
+    });
+
+    it("collapses and expands without disturbing the rest of the layout", async () => {
+      render(<Page />);
+      await loaded();
+      FakeEventSource.only.emitMessage(makeFrame({ AAPL: 190, MSFT: 400 }));
+      FakeEventSource.only.emitMessage(makeFrame({ AAPL: 191, MSFT: 402 }));
+      await waitFor(() => expect(screen.getByTestId("chart-price")).toHaveTextContent("191.00"));
+
+      fireEvent.click(screen.getByRole("button", { name: "Collapse the assistant" }));
+
+      expect(screen.getByTestId("chat-panel-collapsed")).toBeInTheDocument();
+      expect(screen.queryByTestId("chat-transcript")).toBeNull();
+      // Nothing else remounted: the accumulated series and the stream survive.
+      expect(screen.getByTestId("chart-price")).toHaveTextContent("191.00");
+      expect(screen.getAllByTestId(/^row-/)).toHaveLength(2);
+      expect(FakeEventSource.instances).toHaveLength(1);
+
+      fireEvent.click(screen.getByRole("button", { name: "Expand the assistant" }));
+
+      expect(screen.getByTestId("chat-transcript")).toBeInTheDocument();
+      expect(screen.getByTestId("chart-price")).toHaveTextContent("191.00");
+      expect(FakeEventSource.instances).toHaveLength(1);
+    });
+
+    it("keeps the message when the assistant could not be reached", async () => {
+      chatReply = () => json({ detail: "No market data source is running" }, 503);
+      render(<Page />);
+      await loaded();
+
+      ask("buy 5 AAPL");
+
+      expect(await screen.findByTestId("chat-error")).toHaveTextContent(
+        "No market data source is running",
+      );
+      expect(screen.getByLabelText("Message the assistant")).toHaveValue("buy 5 AAPL");
+      expect(screen.getByTestId("chat-transcript")).not.toHaveTextContent("buy 5 AAPL");
+    });
   });
 });
