@@ -120,8 +120,17 @@ if [ -z "$(docker ps --quiet --filter "name=^/${CONTAINER}$")" ]; then
         exit 1
     fi
 
+    # `${env_args[@]+"${env_args[@]}"}` below, not the obvious
+    # `"${env_args[@]}"`: macOS ships **bash 3.2**, where expanding an empty
+    # array under `set -u` is an "unbound variable" error. So on a Mac with no
+    # .env — a new user's very first run, and this checkpoint's last exit
+    # criterion — the script aborted before starting anything. Found by
+    # test/smoke_docker.sh, which runs from a clone that has no .env; every
+    # hand-run until then happened to have one.
     env_args=()
-    [ -f "${REPO}/.env" ] && env_args=(--env-file "${REPO}/.env")
+    if [ -f "${REPO}/.env" ]; then
+        env_args=(--env-file "${REPO}/.env")
+    fi
 
     echo "Starting ${CONTAINER} on port ${PORT}..."
     docker run --detach \
@@ -130,7 +139,7 @@ if [ -z "$(docker ps --quiet --filter "name=^/${CONTAINER}$")" ]; then
         --volume "${VOLUME}:/app/db" \
         --restart unless-stopped \
         --stop-timeout "$STOP_TIMEOUT" \
-        "${env_args[@]}" \
+        ${env_args[@]+"${env_args[@]}"} \
         "$IMAGE" >/dev/null
 fi
 

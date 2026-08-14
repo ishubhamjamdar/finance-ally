@@ -372,6 +372,22 @@ class TestTheFrontDoorsAgree:
     def test_the_shell_scripts_fail_loudly(self, script):
         assert "set -euo pipefail" in read(script)
 
+    def test_no_array_is_expanded_in_a_way_bash_3_2_refuses(self):
+        """macOS ships bash 3.2, where `"${a[@]}"` on an *empty* array under
+        `set -u` is an "unbound variable" error rather than nothing.
+
+        This is not hypothetical: `start_mac.sh` builds an empty `env_args`
+        when there is no `.env`, and every Mac without one — a new user's first
+        run — aborted before starting a container. The `${a[@]+"${a[@]}"}`
+        form is what 3.2 accepts. Found by `test/smoke_docker.sh`, which runs
+        from a clone that has no `.env`.
+        """
+        body = strip_comments("scripts/start_mac.sh", read("scripts/start_mac.sh"))
+        bare = re.findall(r'(?<!\+)"\$\{(\w+)\[@\]\}"', body)
+        assert not bare, (
+            f'{bare} expanded without the bash 3.2 guard — use ${{name[@]+"${{name[@]}}"}}'
+        )
+
 
 class TestTheExampleEnvDocumentsSectionFive:
     """PLAN.md §5 lists seven variables. A `.env.example` missing one is how a

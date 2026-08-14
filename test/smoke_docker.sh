@@ -44,7 +44,14 @@ cleanup() {
 trap cleanup EXIT
 
 check() { # check <label> <expected> <actual>
-    if [ "$2" = "$3" ]; then
+    # An empty "actual" is a failure even when the expectation is also empty.
+    # Without this, "cash survived the restart" passed against a server that
+    # never started: both sides were the empty string, and the one check that
+    # proves the volume works reported ok inside a run of nineteen failures.
+    if [ -z "$3" ] && [ -z "$2" ]; then
+        printf '  FAIL  %-56s both sides empty — nothing was measured\n' "$1"
+        FAILURES=$((FAILURES + 1))
+    elif [ "$2" = "$3" ]; then
         printf '  ok    %-56s %s\n' "$1" "$3"
     else
         printf '  FAIL  %-56s expected %s, got %s\n' "$1" "$2" "$3"
@@ -176,7 +183,11 @@ contains "stop keeps the volume" "preserved" "$(cat "${TMP}/stop1.log")"
 check "second stop exits 0" 0 $?
 contains "second stop is a no-op" "not running" "$(cat "${TMP}/stop2.log")"
 
-check "the container is gone" "" "$(docker ps -aq --filter "name=^/${FINALLY_CONTAINER}$")"
+# Counted, not compared to the empty string: `check` now treats two empty
+# sides as nothing measured, and a count says the same thing without relying on
+# emptiness to mean success.
+check "the container is gone" 0 \
+    "$(docker ps -aq --filter "name=^/${FINALLY_CONTAINER}$" | wc -l | tr -d ' ')"
 
 "${CLONE}/scripts/start_mac.sh" --no-open >"${TMP}/start3.log" 2>&1
 check "restart exits 0" 0 $?
