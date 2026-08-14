@@ -344,12 +344,23 @@ FRONTEND_MUTATIONS: list[tuple[str, str, str, str]] = [
      "src/state/TerminalProvider.tsx",
      "      refresh();\n      return reply;",
      "      return reply;"),
-    ("provider: append the turn before the reply has landed",
+    # Records the user's half even when the turn failed — a transcript
+    # claiming a message was sent that the server never saw.
+    ("provider: append a turn the server never answered",
      "src/state/TerminalProvider.tsx",
      "      const reply = await sendJson<ChatReply>(ENDPOINTS.chat, \"POST\", { message });",
      "      const reply = await sendJson<ChatReply>(ENDPOINTS.chat, \"POST\", { message }).catch(\n"
      "        (cause: unknown) => {\n"
-     "          setTurns((previous) => previous);\n"
+     "          setTurns((previous) => [\n"
+     "            ...previous,\n"
+     "            {\n"
+     '              id: "local-failed",\n'
+     '              role: "user" as const,\n'
+     "              content: message,\n"
+     "              actions: null,\n"
+     "              created_at: new Date().toISOString(),\n"
+     "            },\n"
+     "          ]);\n"
      "          throw cause;\n"
      "        },\n"
      "      );"),
