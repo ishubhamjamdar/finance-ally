@@ -1,0 +1,34 @@
+# Convenience wrapper (PLAN.md §11). The scripts in scripts/ are the supported
+# path; this exists for anyone who would rather type `docker compose up`.
+#
+# It deliberately shares the image name, container name, port and volume with
+# scripts/start_mac.sh, so the two are two front doors to one deployment rather
+# than two parallel ones — a trade made through compose is still there after a
+# start_mac.sh, and neither leaves a second copy of the app behind.
+
+services:
+  finally:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: finally:latest
+    container_name: finally
+    ports:
+      # FINALLY_PORT matches the scripts' override, for a host that already has
+      # something on 8000. The container port is always 8000.
+      - "${FINALLY_PORT:-8000}:8000"
+    env_file:
+      # required: false — the app runs without a .env (simulator prices, chat
+      # answering 503 until a key arrives). A missing file is a degraded
+      # feature, not a reason to refuse to start.
+      - path: .env
+        required: false
+    volumes:
+      - finally-data:/app/db
+    restart: unless-stopped
+
+volumes:
+  finally-data:
+    # Without an explicit name Compose would prefix the project name and create
+    # `finally_finally-data` — a second, empty database beside the scripts' one.
+    name: finally-data
