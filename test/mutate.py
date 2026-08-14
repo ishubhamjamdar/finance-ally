@@ -271,6 +271,92 @@ FRONTEND_MUTATIONS: list[tuple[str, str, str, str]] = [
      "src/lib/api.ts",
      "      if (Array.isArray(body.detail)) {",
      "      if (false) {"),
+
+    # --- Checkpoint 7: the transcript must not lie -----------------------
+    # The model writes its message before it knows whether anything cleared,
+    # so every one of these is a way for the panel to claim a fill that never
+    # happened — or to hide one that did.
+    ("chat: hide the actions that failed",
+     "src/components/ChatActions.tsx",
+     "      {actions.map((action, index) => (",
+     "      {actions.filter((action) => action.ok).map((action, index) => ("),
+    ("chat: render nothing when every action failed",
+     "src/components/ChatActions.tsx",
+     "  if (actions.length === 0) return null;",
+     "  if (actions.length === 0 || actions.every((action) => !action.ok)) return null;"),
+    ("chat: swallow the outcome, showing only what was attempted",
+     "src/components/ChatActions.tsx",
+     "            {action.detail}",
+     "            {action.summary}"),
+    ("chat: never say a reply only partly executed",
+     "src/components/ChatActions.tsx",
+     "  const mixed = failed > 0 && failed < actions.length;",
+     "  const mixed = false;"),
+    ("chat: drop the actions from the turn entirely",
+     "src/components/ChatPanel.tsx",
+     "      {message.actions !== null && message.actions.length > 0 && (\n"
+     "        <ChatActions actions={message.actions} />\n"
+     "      )}",
+     "      {false && <ChatActions actions={message.actions ?? []} />}"),
+
+    # --- Checkpoint 7: a dropped connection is not a refusal -------------
+    ("chat: treat a dropped connection as proof nothing happened",
+     "src/components/ChatPanel.tsx",
+     "      if (cause instanceof ApiError) {",
+     "      if (true) {"),
+    ("chat: skip the refresh when the outcome is unknown",
+     "src/components/ChatPanel.tsx",
+     "        setSendError(UNKNOWN_OUTCOME);\n        onRefresh?.();",
+     "        setSendError(UNKNOWN_OUTCOME);"),
+    ("chat: overwrite a follow-up typed while the turn was in flight",
+     "src/components/ChatPanel.tsx",
+     "        setDraft((current) => (current === \"\" ? text : current));",
+     "        setDraft(text);"),
+
+    # --- Checkpoint 7: the transcript's identity -------------------------
+    ("chat: send before the stored transcript has landed",
+     "src/components/ChatPanel.tsx",
+     "    if (pending !== null || loading) return;",
+     "    if (pending !== null) return;"),
+    ("chat: let a second turn go while one is in flight",
+     "src/components/ChatPanel.tsx",
+     "    if (pending !== null || loading) return;\n\n    const text = draft.trim();",
+     "    if (loading) return;\n\n    const text = draft.trim();"),
+    ("chat: send the message untrimmed",
+     "src/components/ChatPanel.tsx",
+     "    const text = draft.trim();",
+     "    const text = draft;"),
+    ("chat: send on Shift+Enter too, losing the line break",
+     "src/components/ChatPanel.tsx",
+     '    if (event.key === "Enter" && !event.shiftKey) {',
+     '    if (event.key === "Enter") {'),
+    ("chat: ignore the collapsed state",
+     "src/components/ChatPanel.tsx",
+     "  if (collapsed) {",
+     "  if (false) {"),
+
+    # --- Checkpoint 7: what a turn does to the rest of the page ----------
+    ("provider: refresh the chat history too, doubling every appended turn",
+     "src/state/TerminalProvider.tsx",
+     "    reloadPortfolio();\n    reloadWatchlist();\n    reloadHistory();",
+     "    reloadPortfolio();\n    reloadWatchlist();\n    reloadHistory();\n    reloadChat();"),
+    ("provider: do not re-read the account after a turn",
+     "src/state/TerminalProvider.tsx",
+     "      refresh();\n      return reply;",
+     "      return reply;"),
+    ("provider: append the turn before the reply has landed",
+     "src/state/TerminalProvider.tsx",
+     "      const reply = await sendJson<ChatReply>(ENDPOINTS.chat, \"POST\", { message });",
+     "      const reply = await sendJson<ChatReply>(ENDPOINTS.chat, \"POST\", { message }).catch(\n"
+     "        (cause: unknown) => {\n"
+     "          setTurns((previous) => previous);\n"
+     "          throw cause;\n"
+     "        },\n"
+     "      );"),
+    ("provider: drop the stored transcript, keeping only this session",
+     "src/state/TerminalProvider.tsx",
+     "    () => [...(chatHistory.data?.messages ?? []), ...turns],",
+     "    () => [...turns],"),
 ]
 
 
