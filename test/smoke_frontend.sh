@@ -90,7 +90,9 @@ check "npm test" 0 $?
 echo "Served by the backend"
 # STATIC_DIR is set explicitly rather than left to the search path, so this
 # checks the export that was just built and not whatever else is on disk.
-DB_PATH="${TMP}/finally.db" MASSIVE_API_KEY= STATIC_DIR="${FRONTEND}/out" \
+# LLM_MOCK, so the chat checks below are deterministic and free and need no
+# API key — PLAN.md §9's stated purpose for it.
+DB_PATH="${TMP}/finally.db" MASSIVE_API_KEY= LLM_MOCK=true STATIC_DIR="${FRONTEND}/out" \
     uv run --directory "${REPO}/backend" uvicorn app.main:app --port "${PORT}" \
     >"${TMP}/server.log" 2>&1 &
 SERVER_PID=$!
@@ -124,7 +126,7 @@ echo "Every panel is in the export"
 # The page is a client component, but `output: 'export'` still prerenders it,
 # so each panel's static chrome is in the HTML. A panel that failed to mount
 # would be absent here rather than merely empty on screen.
-for PANEL in Watchlist "Market Feed" Positions Allocation "Portfolio value" Trade; do
+for PANEL in Watchlist "Market Feed" Positions Allocation "Portfolio value" Trade Assistant; do
     contains "the ${PANEL} panel is rendered" "${PANEL}" "${TMP}/index.html"
 done
 contains "the watchlist has an add control" "Add ticker" "${TMP}/index.html"
@@ -181,6 +183,42 @@ check "removing a held ticker keeps it tracked" true \
     "$(curl -s -X DELETE "${BASE}/api/watchlist/AAPL" | python3 -c 'import json,sys; print(json.load(sys.stdin)["still_tracked"])' | tr "A-Z" "a-z")"
 check "  and keeps the position" true \
     "$(curl -s "${BASE}/api/portfolio" | python3 -c 'import json,sys; print(any(p["ticker"]=="AAPL" for p in json.load(sys.stdin)["positions"]))' | tr "A-Z" "a-z")"
+
+echo "The assistant"
+chat() { curl -s -X POST "${BASE}/api/chat" -H 'Content-Type: application/json' -d "$1"; }
+chat_code() { curl -s -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/chat" -H 'Content-Type: application/json' -d "$1"; }
+
+check "GET /api/chat/history" 200 "$(code "${BASE}/api/chat/history")"
+check "an empty message is a 422" 422 "$(chat_code '{"message":"   "}')"
+
+chat '{"message":"buy 2 NVDA"}' >"${TMP}/chat.json"
+check "a turn executes and reports the fill" true \
+    "$(python3 -c 'import json;d=json.load(open("'"${TMP}"'/chat.json"));a=d["actions"][0];print(a["kind"]=="trade" and a["ok"] is True and a["ticker"]=="NVDA")' | tr "A-Z" "a-z")"
+check "  and carries the resulting portfolio" true \
+    "$(python3 -c 'import json;d=json.load(open("'"${TMP}"'/chat.json"));print(any(p["ticker"]=="NVDA" for p in d["portfolio"]["positions"]))' | tr "A-Z" "a-z")"
+
+# The panel's whole reason for existing: the model writes its message before it
+# knows whether anything cleared, so the refusal must come back as an action.
+chat '{"message":"buy 100000 AAPL"}' >"${TMP}/refused.json"
+check "a refused action comes back as ok:false" true \
+    "$(python3 -c 'import json;d=json.load(open("'"${TMP}"'/refused.json"));a=d["actions"][0];print(a["ok"] is False and "Insufficient cash" in a["detail"])' | tr "A-Z" "a-z")"
+check "  while the reply is still a 200" 200 "$(chat_code '{"message":"buy 100000 AAPL"}')"
+
+chat '{"message":"watch PYPL"}' >/dev/null
+check "an assistant watchlist add reaches the list" true \
+    "$(curl -s "${BASE}/api/watchlist" | python3 -c 'import json,sys; print(any(t["ticker"]=="PYPL" for t in json.load(sys.stdin)["tickers"]))' | tr "A-Z" "a-z")"
+
+# What a page reload replays.
+curl -s "${BASE}/api/chat/history?limit=500" >"${TMP}/transcript.json"
+check "every turn persists, both halves" true \
+    "$(python3 -c 'import json;m=json.load(open("'"${TMP}"'/transcript.json"))["messages"];print(len(m) >= 8 and m[0]["role"]=="user")' | tr "A-Z" "a-z")"
+check "  and a refusal replays as a refusal" true \
+    "$(python3 -c '
+import json
+m = json.load(open("'"${TMP}"'/transcript.json"))["messages"]
+refused = [a for t in m if t["actions"] for a in t["actions"] if not a["ok"]]
+print(len(refused) > 0 and "Insufficient cash" in refused[0]["detail"])
+' | tr "A-Z" "a-z")"
 
 echo
 if [ "$FAILURES" = 0 ]; then
