@@ -43,8 +43,8 @@ base URL is the mechanism. `lib/api.ts` is the only place that reads it.
 once — by `TerminalProvider`.** Components read prices with `useMarket()`:
 
 ```tsx
-const { prices, sparklines, status, shocks } = useMarket();
-const { portfolio, watchlist, refresh } = useAccount();
+const { prices, sparklines, status, shocks, pricedTickers } = useMarket();
+const { portfolio, watchlist, history, refresh, trade, addTicker, removeTicker } = useAccount();
 ```
 
 A panel that calls `usePriceStream()` for itself gets a second connection to
@@ -74,9 +74,22 @@ Two further things the hook does that are easy to undo by accident:
   simulator sends one every 500 ms, Massive one per poll. A deployment setting
   `MASSIVE_POLL_INTERVAL` above 30 would make it fire on a healthy feed.
 
-`refresh()` re-reads the portfolio and the watchlist and leaves the stream
-alone. Reopening the stream would discard every sparkline the page has
-accumulated, because there is no history endpoint to rebuild them from.
+`refresh()` re-reads the portfolio, the watchlist and the snapshot series, and
+leaves the stream alone. Reopening the stream would discard every sparkline the
+page has accumulated, because there is no history endpoint to rebuild them from.
+
+**The account mutations live on the provider, not in the components that
+trigger them.** `trade`, `addTicker` and `removeTicker` each call `refresh()`
+on success and reject with the backend's own reason on failure — a failed
+mutation refreshes nothing, because nothing changed. What has to happen after a
+trade is not local to the trade bar: the header, the positions table, the
+heatmap and the P&L chart all have to agree again. Checkpoint 7's chat executes
+the same actions through the LLM and needs the same thing to happen, so it adds
+`sendChat` here rather than fetching in the panel.
+
+**One loading flag and one error per resource, never merged.** They are read by
+different panels, and merging them paints a failed portfolio read across a
+watchlist of live streaming prices.
 
 ## Layout of `src/`
 
@@ -86,8 +99,12 @@ accumulated, because there is no history endpoint to rebuild them from.
 | `state/` | `TerminalProvider` — the single stream, the account, and `refresh()` |
 | `hooks/` | `usePriceStream`, `usePriceFlash`, `useApiResource` |
 | `components/` | Presentational. They take data as props and hold no fetching of their own |
-| `lib/` | `api.ts` (base URL, `getJson`, `ENDPOINTS`), `types.ts` (the backend's shapes), `format.ts`, `valuation.ts` |
+| `lib/` | `api.ts` (base URL, `getJson`/`sendJson`, `ENDPOINTS`), `types.ts` (the backend's shapes), `format.ts`, `valuation.ts`, `treemap.ts`, `ticker.ts` |
+
 | `test/` | `FakeEventSource`, fixture builders |
+
+The layering runs one way — `lib` ← `hooks` ← `components` ← `state`/`app` — and
+`npm run lint` will not catch a violation. No component imports the provider.
 
 Components take props rather than reading context directly, so a test can
 render one with fixed data and no provider. `page.tsx` is where context meets
@@ -146,14 +163,33 @@ Fixtures come from `src/test/fixtures.ts` and populate **every** field, so a
 test cannot pass because it happened to touch only the fields the fixture
 bothered to define.
 
-## Checkpoint 5 built this; what is not here yet
+## Charts
 
-The main chart, the portfolio heatmap, the P&L chart, the positions table and
-the trade bar are Checkpoint 6. The chat sidebar is Checkpoint 7. They go in
-the grid in `page.tsx`, they read prices from `useMarket()`, and anything that
-changes the account calls `refresh()` afterwards.
+`components/LineChart` is the one plot both time series use, and it is SVG by
+measurement rather than by preference — see PLAN.md §10. Two things about it
+are easy to undo:
 
-**There is no watchlist add/remove control yet.** `POST` and `DELETE
-/api/watchlist` have been live since Checkpoint 3 and PLAN.md §2 promises the
-user can manage the list by hand, but no checkpoint's scope claims the UI for
-it — see the Checkpoint 5 log entry.
+- **It needs both `h-full` and `w-full`.** An `svg` is a replaced element with
+  an intrinsic aspect ratio taken from its `viewBox`; given only a height, the
+  browser computes a *square*. That shipped, and drew the series across 45% of
+  a wide panel with the live-end marker stranded to the right of it. jsdom
+  performs no layout, so no unit test can see this — the guard in
+  `LineChart.test.tsx` asserts the classes, and the real one is Checkpoint 9's
+- **The y axis spans the series, never zero.** A portfolio moving between
+  10,000 and 10,050 is a flat line on a zero-based axis
+
+The same class of trap applies to the panels: a `section` is a flex *item* of
+its column, and a flex item stretches on the cross axis only. Every panel that
+should fill its column carries `h-full`, and `page.tsx` owns the ratios.
+
+`lib/treemap.ts` holds the heatmap's geometry as pure arithmetic, deliberately
+apart from the component: "do the tile areas match the weights" and "do the
+tiles tile the box" are assertable about numbers and not about a DOM tree of
+percentage-positioned divs.
+
+## What is not here yet
+
+The chat sidebar is Checkpoint 7. It docks to the right of the grid in
+`page.tsx`, reads prices from `useMarket()`, and adds its `sendChat` to
+`TerminalProvider` so an auto-executed trade refreshes every panel exactly as a
+manual one does.

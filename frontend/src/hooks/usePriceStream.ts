@@ -36,8 +36,20 @@ import type { MarketShock, PriceFrame, Quote } from "@/lib/types";
 
 export type ConnectionStatus = "connecting" | "connected" | "reconnecting" | "disconnected";
 
-/** Sparkline depth. At the 500 ms tick this is the last minute of price action. */
-export const MAX_SPARKLINE_POINTS = 120;
+/**
+ * How many prices per ticker are kept.
+ *
+ * At the simulator's 500 ms tick this is five minutes of price action, which
+ * is what Checkpoint 6's main chart draws. The sparklines show the tail of the
+ * same buffer (`Sparkline`'s `maxPoints`), so a ticker's line and its chart
+ * cannot disagree about what happened, and the page holds one series per
+ * ticker rather than two at different depths.
+ *
+ * Ten tickers at this depth is 6,000 numbers — nothing. The cost that matters
+ * is the per-frame copy, and that is bounded by the number of tickers, not by
+ * this.
+ */
+export const MAX_SERIES_POINTS = 600;
 
 /** How long the browser may keep failing before the dot turns red. */
 export const RECONNECT_GRACE_MS = 6000;
@@ -65,10 +77,25 @@ export interface PriceStream {
   prices: Record<string, Quote>;
   /**
    * Price series per ticker, accumulated **from page load** — PLAN.md §2. There
-   * is no history endpoint behind this and none is faked: a sparkline starts
+   * is no history endpoint behind this and none is faked: a series starts
    * empty and fills in, which is the honest picture of what the client knows.
+   *
+   * Capped at `MAX_SERIES_POINTS`. Both the sparklines and the main chart read
+   * it; the sparklines draw the tail.
    */
   sparklines: Record<string, number[]>;
+  /**
+   * How many tickers the *last* frame carried.
+   *
+   * Not `Object.keys(prices).length`, which only ever grows: `prices` keeps a
+   * ticker's last quote after the server stops sending it, deliberately — a
+   * frame that transiently omits a symbol must not blank its row. The
+   * consequence is that it counts every ticker priced since page load, so
+   * after three removals it would report thirteen beside a grid of ten. The
+   * feed panel exists to tell a quiet market from a broken one, and an
+   * inflated count works against exactly that.
+   */
+  pricedTickers: number;
   /** Notable moves, newest first. */
   shocks: MarketShock[];
   status: ConnectionStatus;
@@ -89,6 +116,7 @@ export interface PriceStream {
 const INITIAL: PriceStream = {
   prices: {},
   sparklines: {},
+  pricedTickers: 0,
   shocks: [],
   status: "connecting",
   stalled: false,
@@ -147,7 +175,8 @@ export function usePriceStream(
       // beside a grid full of dashes reports "the market is quiet" for what is
       // actually a broken feed, which is the one distinction the feed panel
       // exists to make.
-      if (frame === null || Object.keys(frame).length === 0) return;
+      const priced = Object.keys(frame ?? {}).length;
+      if (frame === null || priced === 0) return;
 
       const receivedAt = Date.now();
       lastFrame = receivedAt;
@@ -169,6 +198,7 @@ export function usePriceStream(
           ...previous,
           prices,
           sparklines,
+          pricedTickers: priced,
           frames: previous.frames + 1,
           lastFrameAt: receivedAt,
         };
@@ -238,7 +268,7 @@ export function usePriceStream(
 function append(series: number[] | undefined, price: number): number[] {
   if (series === undefined) return [price];
   const next = [...series, price];
-  return next.length > MAX_SPARKLINE_POINTS ? next.slice(next.length - MAX_SPARKLINE_POINTS) : next;
+  return next.length > MAX_SERIES_POINTS ? next.slice(next.length - MAX_SERIES_POINTS) : next;
 }
 
 /**

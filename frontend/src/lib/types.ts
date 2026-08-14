@@ -76,3 +76,49 @@ export interface Portfolio {
   /** Held tickers with no cached price. Excluded from the totals, not zeroed. */
   unpriced_tickers: string[];
 }
+
+/** One row of `GET /api/portfolio/history` — a `portfolio_snapshots` row. */
+export interface Snapshot {
+  total_value: number;
+  /** ISO timestamp, as the database stored it. */
+  recorded_at: string;
+}
+
+export interface HistoryResponse {
+  /** Oldest first, as the endpoint documents. */
+  snapshots: Snapshot[];
+}
+
+export type TradeSide = "buy" | "sell";
+
+/** The body of `POST /api/portfolio/trade`. There is no `price` field: the
+ *  fill price is read from the server's cache, and naming one is a 422. */
+export interface TradeOrder {
+  ticker: string;
+  side: TradeSide;
+  quantity: number;
+}
+
+/** The fill the backend recorded. */
+export interface TradeFill {
+  id: string;
+  ticker: string;
+  side: TradeSide;
+  quantity: number;
+  price: number;
+  value: number;
+  executed_at: string;
+}
+
+/** `POST /api/portfolio/trade` returns the fill and the account it left behind. */
+export interface TradeResponse {
+  trade: TradeFill;
+  portfolio: Portfolio;
+}
+
+/** `DELETE /api/watchlist/{ticker}`. `still_tracked` when a position keeps it streaming. */
+export interface WatchlistRemoval {
+  ticker: string;
+  removed: boolean;
+  still_tracked: boolean;
+}

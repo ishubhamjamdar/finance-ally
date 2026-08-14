@@ -29,19 +29,73 @@ import type { ReactNode } from "react";
 import { useApiResource } from "@/hooks/useApiResource";
 import { usePriceStream } from "@/hooks/usePriceStream";
 import type { PriceStream } from "@/hooks/usePriceStream";
-import { ENDPOINTS } from "@/lib/api";
-import type { Portfolio, WatchlistResponse, WatchlistRow } from "@/lib/types";
+import { ENDPOINTS, sendJson, watchlistEntryPath } from "@/lib/api";
+import type {
+  HistoryResponse,
+  Portfolio,
+  Snapshot,
+  TradeFill,
+  TradeOrder,
+  TradeResponse,
+  WatchlistResponse,
+  WatchlistRemoval,
+  WatchlistRow,
+} from "@/lib/types";
+
+/**
+ * How often the snapshot series is re-read.
+ *
+ * It matches `SNAPSHOT_INTERVAL_SECONDS` in `backend/app/main.py`, because
+ * that task is the only thing that grows the series without the user doing
+ * anything. Polling faster would mostly re-fetch an identical list; slower and
+ * the P&L chart would visibly lag the value in the header. A trade does not
+ * wait for this — it writes a snapshot immediately and calls `refresh()`.
+ */
+export const HISTORY_REFRESH_MS = 30_000;
 
 export interface Account {
   /** Null until the first fetch lands, and after a failure. Never a fake zero. */
   portfolio: Portfolio | null;
   /** In add order, as the endpoint returned it. */
   watchlist: WatchlistRow[];
-  loading: boolean;
-  /** The first error either fetch reported, with the backend's own wording. */
-  error: string | null;
-  /** Re-read both after something changed the account. */
+  /** The `portfolio_snapshots` series, oldest first. */
+  history: Snapshot[];
+
+  /**
+   * One loading flag and one error per resource, never merged.
+   *
+   * They are read by different panels, and a merged pair puts one panel's
+   * failure over another's perfectly current data: `GET /api/portfolio`
+   * failing while the watchlist succeeds would otherwise paint "cannot reach
+   * the server" across a grid of live, streaming prices — or, on a first load,
+   * replace it entirely. The history poll makes this routine rather than
+   * theoretical: it runs every 30 seconds, unattended.
+   */
+  portfolioLoading: boolean;
+  portfolioError: string | null;
+  watchlistLoading: boolean;
+  watchlistError: string | null;
+  historyLoading: boolean;
+  historyError: string | null;
+  /** Re-read everything after something changed the account. */
   refresh: () => void;
+
+  /**
+   * The account mutations, each one re-reading afterwards.
+   *
+   * They live here rather than in the components that trigger them because
+   * what has to happen after a trade is not local to the trade bar: the
+   * header, the positions table, the heatmap and the P&L chart all have to
+   * agree again, and `refresh()` is the one call that makes them. Checkpoint
+   * 7's chat executes the same actions through the LLM and needs the same
+   * thing to happen afterwards.
+   *
+   * Each rejects with the backend's own reason rather than swallowing it — the
+   * caller renders it. A failed mutation does not refresh: nothing changed.
+   */
+  trade: (order: TradeOrder) => Promise<TradeFill>;
+  addTicker: (ticker: string) => Promise<void>;
+  removeTicker: (ticker: string) => Promise<void>;
 }
 
 const MarketContext = createContext<PriceStream | null>(null);
@@ -51,21 +105,60 @@ export function TerminalProvider({ children }: { children: ReactNode }) {
   const market = usePriceStream(ENDPOINTS.priceStream);
   const portfolio = useApiResource<Portfolio>(ENDPOINTS.portfolio);
   const watchlist = useApiResource<WatchlistResponse>(ENDPOINTS.watchlist);
+  const history = useApiResource<HistoryResponse>(ENDPOINTS.portfolioHistory, HISTORY_REFRESH_MS);
 
   const { reload: reloadPortfolio } = portfolio;
   const { reload: reloadWatchlist } = watchlist;
+  const { reload: reloadHistory } = history;
   const refresh = useCallback(() => {
     reloadPortfolio();
     reloadWatchlist();
-  }, [reloadPortfolio, reloadWatchlist]);
+    reloadHistory();
+  }, [reloadPortfolio, reloadWatchlist, reloadHistory]);
+
+  const trade = useCallback(
+    async (order: TradeOrder): Promise<TradeFill> => {
+      const result = await sendJson<TradeResponse>(ENDPOINTS.trade, "POST", order);
+      refresh();
+      return result.trade;
+    },
+    [refresh],
+  );
+
+  const addTicker = useCallback(
+    async (ticker: string): Promise<void> => {
+      await sendJson(ENDPOINTS.watchlist, "POST", { ticker });
+      refresh();
+    },
+    [refresh],
+  );
+
+  const removeTicker = useCallback(
+    async (ticker: string): Promise<void> => {
+      // The portfolio is re-read too, not just the list: removing a ticker
+      // held as a position leaves the position in place, and the panels must
+      // keep showing it.
+      await sendJson<WatchlistRemoval>(watchlistEntryPath(ticker), "DELETE");
+      refresh();
+    },
+    [refresh],
+  );
 
   const account = useMemo<Account>(
     () => ({
       portfolio: portfolio.data,
       watchlist: watchlist.data?.tickers ?? [],
-      loading: portfolio.loading || watchlist.loading,
-      error: portfolio.error ?? watchlist.error,
+      history: history.data?.snapshots ?? [],
+      portfolioLoading: portfolio.loading,
+      portfolioError: portfolio.error,
+      watchlistLoading: watchlist.loading,
+      watchlistError: watchlist.error,
+      historyLoading: history.loading,
+      historyError: history.error,
       refresh,
+      trade,
+      addTicker,
+      removeTicker,
     }),
     [
       portfolio.data,
@@ -74,7 +167,13 @@ export function TerminalProvider({ children }: { children: ReactNode }) {
       watchlist.data,
       watchlist.loading,
       watchlist.error,
+      history.data,
+      history.loading,
+      history.error,
       refresh,
+      trade,
+      addTicker,
+      removeTicker,
     ],
   );
 

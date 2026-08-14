@@ -9,6 +9,7 @@ why the step survives being scoped down but must not be skipped.
     test/mutate.py                    # run every mutation for this checkpoint
     test/mutate.py --list             # show them without running anything
     test/mutate.py -k watchlist       # only mutations whose name matches
+    test/mutate.py --project frontend # only one side of the app
 
 **It runs in a throwaway `git worktree`, never your working tree.** An earlier
 harness edited files in place and restored them in a `finally` — which a
@@ -50,7 +51,7 @@ CHAT = "tests/test_chat.py tests/api/test_chat_api.py"
 LLM = "tests/llm tests/test_chat.py tests/api/test_chat_api.py"
 
 #: (name, file relative to backend/, snippet to replace, replacement, tests)
-MUTATIONS: list[tuple[str, str, str, str, str]] = [
+BACKEND_MUTATIONS: list[tuple[str, str, str, str, str]] = [
     # --- Checkpoint 3: money -------------------------------------------
     ("buy: drop the insufficient-cash check", "app/portfolio.py",
      "    if cost > cash:\n        raise TradeError(",
@@ -176,9 +177,108 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
      "        await run_in_threadpool(_insert_row, ticker, user_id)", WATCHLIST),
 ]
 
+#: (name, file relative to frontend/, snippet, replacement) — Checkpoint 6.
+#:
+#: No per-mutation test selection here: the whole vitest suite runs in about two
+#: seconds, and a wrongly narrowed selection is a way for a mutation to look
+#: killed by a file that never loaded the mutated module.
+FRONTEND_MUTATIONS: list[tuple[str, str, str, str]] = [
+    # --- the treemap's geometry ----------------------------------------
+    ("treemap: do not normalise weights to the box",
+     "src/lib/treemap.ts",
+     "  const scale = (width * height) / total;",
+     "  const scale = 1;"),
+    ("treemap: give a null or zero weight a tile of nothing",
+     "src/lib/treemap.ts",
+     "Number.isFinite(entry.value) && entry.value > 0",
+     "Number.isFinite(entry.value) && entry.value >= 0"),
+    ("treemap: slice-and-dice instead of squarifying",
+     "src/lib/treemap.ts",
+     "    if (free.width >= free.height) {",
+     "    if (true) {"),
+    # --- what a holding is worth ---------------------------------------
+    ("valuation: value an unpriced holding at zero",
+     "src/lib/valuation.ts",
+     "    const marketValue = price === null ? null : price * position.quantity;",
+     "    const marketValue = price === null ? 0 : price * position.quantity;"),
+    ("valuation: weight positions by cost rather than market value",
+     "src/lib/valuation.ts",
+     "  const total = marked.reduce((sum, position) => sum + (position.marketValue ?? 0), 0);",
+     "  const total = marked.reduce((sum, position) => sum + position.costBasis, 0);"),
+    ("heatmap: size an unpriced holding by its cost",
+     "src/components/PortfolioHeatmap.tsx",
+     "  const tiles = squarify(positions, (position) => position.weight);",
+     "  const tiles = squarify(positions, (position) => position.weight ?? position.costBasis);"),
+    # --- the plot ------------------------------------------------------
+    ("chart: drop the flat-series guard, so a still line vanishes",
+     "src/components/LineChart.tsx",
+     "  const padding = range === 0 ? Math.max(Math.abs(high) * 0.01, 0.01) : range * 0.08;",
+     "  const padding = range * 0.08;"),
+    ("chart: start the y axis at zero, flattening every real move",
+     "src/components/LineChart.tsx",
+     "  const min = low - padding;",
+     "  const min = 0;"),
+    ("chart: draw a non-finite value instead of dropping it",
+     "src/components/LineChart.tsx",
+     "  const series = values.filter((value) => Number.isFinite(value));",
+     "  const series = [...values];"),
+    # --- the order ticket ----------------------------------------------
+    ("trade bar: send a quantity of zero or less",
+     "src/components/TradeBar.tsx",
+     "    if (!Number.isFinite(size) || size <= 0) {",
+     "    if (false) {"),
+    ("trade bar: swallow the rejection instead of showing it",
+     "src/components/TradeBar.tsx",
+     "      setError(describeError(cause));",
+     "      setError(null);"),
+    ("trade bar: revert the symbol to the chart after a fill",
+     "src/components/TradeBar.tsx",
+     "      setQuantity(\"\");\n    } catch (cause: unknown) {",
+     "      setQuantity(\"\");\n      setTypedTicker(null);\n    } catch (cause: unknown) {"),
+    ("trade bar: let a second order go while one is in flight",
+     "src/components/TradeBar.tsx",
+     "    if (pending) return;",
+     "    if (false) return;"),
+    ("trade bar: skip the symbol shape check",
+     "src/components/TradeBar.tsx",
+     "    if (!isTicker(symbol)) {",
+     "    if (false) {"),
+    # --- what happens after an account change --------------------------
+    ("provider: refresh before the trade has landed",
+     "src/state/TerminalProvider.tsx",
+     "      const result = await sendJson<TradeResponse>(ENDPOINTS.trade, \"POST\", order);\n      refresh();",
+     "      refresh();\n      const result = await sendJson<TradeResponse>(ENDPOINTS.trade, \"POST\", order);"),
+    ("provider: a removal re-reads the list but not the portfolio",
+     "src/state/TerminalProvider.tsx",
+     "      await sendJson<WatchlistRemoval>(watchlistEntryPath(ticker), \"DELETE\");\n      refresh();",
+     "      await sendJson<WatchlistRemoval>(watchlistEntryPath(ticker), \"DELETE\");\n      reloadWatchlist();"),
+    ("resource: leak the poll interval past unmount",
+     "src/hooks/useApiResource.ts",
+     "    return () => clearInterval(timer);",
+     "    return;"),
+    # --- what the feed panel counts ------------------------------------
+    ("stream: count every ticker ever priced, not the last frame's",
+     "src/hooks/usePriceStream.ts",
+     "          pricedTickers: priced,",
+     "          pricedTickers: Object.keys(prices).length,"),
+    # --- what may be charted -------------------------------------------
+    ("page: decide the charted ticker from the append-only price record",
+     "src/app/page.tsx",
+     "  const selected = picked !== null && chartable.has(picked) ? picked : (watched[0] ?? null);",
+     "  const selected =\n    picked !== null && (chartable.has(picked) || market.prices[picked] !== undefined)\n      ? picked\n      : (watched[0] ?? null);"),
+    # --- what a rejection says -----------------------------------------
+    ("api: drop the FastAPI 422 detail array",
+     "src/lib/api.ts",
+     "      if (Array.isArray(body.detail)) {",
+     "      if (false) {"),
+]
+
 
 def build_worktree() -> pathlib.Path:
-    """A clean checkout of HEAD, isolated from the working tree."""
+    """A clean checkout of HEAD, isolated from the working tree.
+
+    Returns the backend directory; `.parent` is the checkout root.
+    """
     if WORKTREE.exists():
         subprocess.run(["git", "worktree", "remove", "--force", str(WORKTREE)],
                        cwd=REPO, capture_output=True)
@@ -188,7 +288,7 @@ def build_worktree() -> pathlib.Path:
     return WORKTREE / "backend"
 
 
-def suite_passes(backend: pathlib.Path, tests: str, python: pathlib.Path) -> bool:
+def backend_passes(backend: pathlib.Path, tests: str, python: pathlib.Path) -> bool:
     """True if the suite passed — i.e. the mutation went unnoticed."""
     try:
         result = subprocess.run(
@@ -201,36 +301,83 @@ def suite_passes(backend: pathlib.Path, tests: str, python: pathlib.Path) -> boo
     return result.returncode == 0
 
 
+def frontend_passes(frontend: pathlib.Path) -> bool:
+    """True if vitest passed — i.e. the mutation went unnoticed."""
+    try:
+        result = subprocess.run(
+            ["npx", "vitest", "run", "--silent"],
+            cwd=frontend, capture_output=True, text=True, timeout=TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    return result.returncode == 0
+
+
+def link_node_modules(frontend: pathlib.Path) -> None:
+    """Point the worktree at the installed dependencies rather than reinstalling.
+
+    `npm ci` into a throwaway checkout costs a minute per run for a tree that is
+    byte-identical to the one already on disk. The mutations never touch it.
+    """
+    installed = REPO / "frontend" / "node_modules"
+    target = frontend / "node_modules"
+    if not installed.exists():
+        raise SystemExit("No frontend/node_modules — run `npm install` in frontend/ first.")
+    if not target.exists():
+        target.symlink_to(installed)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="show mutations without running them")
     parser.add_argument("-k", metavar="SUBSTRING", default="", help="only matching mutations")
+    parser.add_argument("--project", choices=("backend", "frontend"), help="only one side")
     args = parser.parse_args()
 
-    selected = [m for m in MUTATIONS if args.k.lower() in m[0].lower()]
+    # (project, name, path relative to that project, old, new, tests)
+    every: list[tuple[str, str, str, str, str, str]] = [
+        ("backend", name, path, old, new, tests)
+        for name, path, old, new, tests in BACKEND_MUTATIONS
+    ] + [
+        ("frontend", name, path, old, new, "")
+        for name, path, old, new in FRONTEND_MUTATIONS
+    ]
+
+    selected = [
+        m for m in every
+        if args.k.lower() in m[1].lower() and args.project in (None, m[0])
+    ]
     if args.list:
-        for name, path, *_ in selected:
-            print(f"{path:28} {name}")
+        for project, name, path, *_ in selected:
+            print(f"{project:9} {path:36} {name}")
         return 0
     if not selected:
         print(f"No mutation matches {args.k!r}.")
         return 1
 
-    backend = build_worktree()
+    root = build_worktree().parent
+    backend, frontend = root / "backend", root / "frontend"
     python = VENV_PYTHON if VENV_PYTHON.exists() else pathlib.Path(sys.executable)
-    if not VENV_PYTHON.exists():
+
+    wanted = {project for project, *_ in selected}
+    if "backend" in wanted and not VENV_PYTHON.exists():
         print("No backend/.venv — run `uv sync --extra dev` in backend/ first.")
         return 1
+    if "frontend" in wanted:
+        link_node_modules(frontend)
 
-    print(f"Baseline: the unmutated suite must pass in {backend}")
-    if not suite_passes(backend, "tests/", python):
-        print("  FAILED — the suite is red before any mutation. Fix that first.")
+    print("Baseline: the unmutated suites must pass in the worktree")
+    if "backend" in wanted and not backend_passes(backend, "tests/", python):
+        print("  FAILED — the backend suite is red before any mutation. Fix that first.")
+        return 1
+    if "frontend" in wanted and not frontend_passes(frontend):
+        print("  FAILED — the frontend suite is red before any mutation. Fix that first.")
         return 1
     print("  ok\n")
 
     survivors: list[str] = []
-    for name, relpath, old, new, tests in selected:
-        path = backend / relpath
+    for project, name, relpath, old, new, tests in selected:
+        path = (backend if project == "backend" else frontend) / relpath
         original = path.read_text()
         if original.count(old) != 1:
             print(f"STALE     {name}: snippet appears {original.count(old)}x in {relpath}")
@@ -238,7 +385,11 @@ def main() -> int:
             continue
         path.write_text(original.replace(old, new))
         try:
-            unnoticed = suite_passes(backend, tests, python)
+            unnoticed = (
+                backend_passes(backend, tests, python)
+                if project == "backend"
+                else frontend_passes(frontend)
+            )
         finally:
             path.write_text(original)
         print(f"{'SURVIVED ' if unnoticed else 'killed   '} {name}", flush=True)

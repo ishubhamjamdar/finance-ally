@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   MAX_SHOCKS,
-  MAX_SPARKLINE_POINTS,
+  MAX_SERIES_POINTS,
   RECONNECT_GRACE_MS,
   usePriceStream,
 } from "@/hooks/usePriceStream";
@@ -57,19 +57,19 @@ describe("usePriceStream", () => {
     expect(result.current.sparklines.AAPL).toEqual([100, 101, 99]);
   });
 
-  it("caps the sparkline window, dropping the oldest points", () => {
+  it("caps the stored series, dropping the oldest points", () => {
     const { result } = renderHook(() => usePriceStream());
 
     act(() => {
-      for (let index = 0; index < MAX_SPARKLINE_POINTS + 10; index += 1) {
+      for (let index = 0; index < MAX_SERIES_POINTS + 10; index += 1) {
         FakeEventSource.only.emitMessage(makeFrame({ AAPL: index }));
       }
     });
 
     const series = result.current.sparklines.AAPL;
-    expect(series).toHaveLength(MAX_SPARKLINE_POINTS);
+    expect(series).toHaveLength(MAX_SERIES_POINTS);
     expect(series[0]).toBe(10);
-    expect(series[series.length - 1]).toBe(MAX_SPARKLINE_POINTS + 9);
+    expect(series[series.length - 1]).toBe(MAX_SERIES_POINTS + 9);
   });
 
   it("keeps a ticker's series when a later frame omits it", () => {
@@ -421,5 +421,47 @@ describe("stall detection", () => {
     });
 
     expect(vi.getTimerCount()).toBe(timers);
+  });
+
+  describe("pricedTickers", () => {
+    it("counts what the last frame carried, not what has ever been priced", () => {
+      // `prices` is append-only on purpose — a frame omitting a ticker must
+      // not blank its row — so counting its keys reports every symbol seen
+      // since page load. Three removals later that is thirteen priced beside a
+      // grid of ten, which is the opposite of what the feed panel is for.
+      const { result } = renderHook(() => usePriceStream());
+
+      act(() => {
+        FakeEventSource.only.emitMessage(makeFrame({ AAPL: 190, MSFT: 400, NVDA: 900 }));
+      });
+      expect(result.current.pricedTickers).toBe(3);
+
+      act(() => {
+        FakeEventSource.only.emitMessage(makeFrame({ AAPL: 191 }));
+      });
+
+      expect(result.current.pricedTickers).toBe(1);
+      // …while the rows that stopped being priced keep their last quote.
+      expect(result.current.prices.MSFT.price).toBe(400);
+    });
+
+    it("is zero before the first frame", () => {
+      const { result } = renderHook(() => usePriceStream());
+
+      expect(result.current.pricedTickers).toBe(0);
+    });
+
+    it("does not count a quote the frame could not be trusted with", () => {
+      const { result } = renderHook(() => usePriceStream());
+
+      act(() => {
+        FakeEventSource.only.emitMessage({
+          AAPL: makeQuote("AAPL", 190),
+          BROKEN: { ticker: "BROKEN", price: null },
+        });
+      });
+
+      expect(result.current.pricedTickers).toBe(1);
+    });
   });
 });

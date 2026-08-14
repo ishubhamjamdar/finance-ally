@@ -438,7 +438,7 @@ When `LLM_MOCK=true`, the backend returns deterministic mock responses instead o
 
 The frontend is a single-page application with a dense, terminal-inspired layout. The specific component architecture and layout system is up to the Frontend Engineer, but the UI should include these elements:
 
-- **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), daily change %, and a sparkline mini-chart (accumulated from SSE since page load)
+- **Watchlist panel** — grid/table of watched tickers with: ticker symbol, current price (flashing green/red on change), daily change %, and a sparkline mini-chart (accumulated from SSE since page load). It also carries the manual add/remove control §2 promises: a symbol field in the header and a remove button per row, both reporting the backend's own refusal — 409 duplicate, 400 list full, 503 no feed. Added at Checkpoint 6, beside the trade bar, because no earlier checkpoint's scope claimed it
 - **Main chart area** — larger chart for the currently selected ticker, with at minimum price over time. Clicking a ticker in the watchlist selects it here.
 - **Portfolio heatmap** — treemap visualization where each rectangle is a position, sized by portfolio weight, colored by P&L (green = profit, red = loss)
 - **P&L chart** — line chart showing total portfolio value over time, using data from `portfolio_snapshots`
@@ -458,7 +458,24 @@ is high.
 ### Technical Notes
 
 - Use `EventSource` for SSE connection to `/api/stream/prices`
-- Canvas-based charting library preferred (Lightweight Charts or Recharts) for performance
+- **Charts are hand-rolled SVG, not a charting library.** This section preferred a
+  canvas library "for performance", and the measurement is what overruled it: what
+  arrives at 2 Hz is one new point on one polyline, so a render is a coordinate
+  string and a path substitution, not a scene graph. A library would have added a
+  dependency, an imperative instance to dispose of on unmount — this checkpoint's
+  stated review focus — and a jsdom shim, to replace a `<path>` React already
+  reconciles. `components/LineChart` is the one plot both time series use
+  - The plot is drawn in a fixed 0–100 box and stretched with
+    `preserveAspectRatio="none"`, so it fills a panel of any shape with nothing
+    to measure and no `ResizeObserver`. **It must be given both `h-full` and
+    `w-full`**: an `svg` is a replaced element with an intrinsic aspect ratio
+    taken from its `viewBox`, so a height alone makes the browser compute a
+    square. Strokes carry `vector-effect="non-scaling-stroke"`, and every label
+    is HTML positioned over the box rather than `<text>` inside it, so the
+    distortion reaches neither line widths nor type
+  - The y axis spans the series' own range, never zero. A portfolio moving
+    between 10,000 and 10,050 is a flat line on a zero-based axis, and the shape
+    of that move is the whole point of the panel
 - Price flash effect: on receiving a new price, briefly apply a CSS class with background color transition, then remove it
 - All API calls go to the same origin (`/api/*`) — no CORS configuration needed
 - Tailwind CSS for styling with a custom dark theme
@@ -692,7 +709,7 @@ row to ⛔, write a log entry describing how far it got and what blocked it, and
 | 3 | Portfolio & watchlist API | 2 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #6) |
 | 4 | LLM chat integration | 3 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #7) |
 | 5 | Frontend scaffold + live prices | 2 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #8) |
-| 6 | Charts, portfolio visualisation, trade bar | 3, 5 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 6 | Charts, portfolio visualisation, trade bar | 3, 5 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #10) |
 | 7 | Chat panel | 4, 6 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 8 | Docker packaging + start/stop scripts | 7 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 9 | End-to-end test suite | 8 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
@@ -852,7 +869,9 @@ Every later checkpoint reads prices from this layer, so its defects would propag
 **Goal:** the data-dense workstation of §10.
 
 **Scope:** main chart for the selected ticker, portfolio treemap heatmap, P&L line chart from
-`/api/portfolio/history`, positions table, and the trade bar.
+`/api/portfolio/history`, positions table, the trade bar, and the manual watchlist add/remove
+control — carried forward from Checkpoint 5, which found that §2 promises it and no checkpoint's
+scope had claimed it. It belongs beside the trade bar.
 
 **Exit criteria:**
 
@@ -861,6 +880,8 @@ Every later checkpoint reads prices from this layer, so its defects would propag
 - The heatmap sizes by portfolio weight and colours by P&L sign, and survives an empty portfolio
 - The P&L chart renders the snapshot series and extends as new snapshots arrive
 - A rejected trade surfaces a visible error instead of failing silently
+- Adding a ticker from the watchlist panel starts it streaming; removing one drops the row without
+  disturbing a position held in it
 
 ---
 
@@ -1533,3 +1554,162 @@ defects and are now closed; the rest are restated below with what changed.
     away — but wedging a live process from outside is exactly what Checkpoint 9
     should automate
   - Everything else on Checkpoint 4's and Checkpoint 5's lists is unchanged
+
+#### Checkpoint 6 — Charts, portfolio visualisation, trade bar
+
+- **Closed:** 2026-08-14 · branch `checkpoint-6-charts-portfolio-trade` · PR #10 · all four gates
+  passed. Gate 3 failed twice and returned to Gate 2 both times, exactly as the gate rules require
+- **Built:** `frontend/src/` — six new panels, the account mutations behind them, and the treemap
+  - `components/LineChart.tsx` (**new**) — the one plot both time series use. SVG in a fixed 0–100
+    box stretched with `preserveAspectRatio="none"`, labels as HTML over it, y axis on the series'
+    own range. No dependency, nothing to dispose of on unmount
+  - `components/PriceChart.tsx` (**new**) — the main chart, plus the low/high/day the line cannot
+    carry. Drawn from the same client-accumulated series as the sparklines
+  - `components/PositionsTable.tsx` (**new**) — every §10 column, marked to the stream, flashing
+    per row
+  - `components/PortfolioHeatmap.tsx` (**new**) — squarified treemap, sized by weight, coloured by
+    P&L sign with the magnitude in the intensity and clamped at 8%
+  - `components/PnlChart.tsx` (**new**) — the `portfolio_snapshots` series, with `formatStamp`
+  - `components/TradeBar.tsx` (**new**) — market orders, and the rejection made visible
+  - `components/WatchlistPanel.tsx` — gains selection, the add form and a per-row remove
+  - `lib/treemap.ts` (**new**) — `squarify`, Bruls/Huizing/van Wijk. Pure arithmetic, separated
+    from the component precisely so "do the areas match the weights" is assertable
+  - `lib/ticker.ts` (**new**) — `TICKER_PATTERN` mirrored from `app/market/models.py`
+  - `lib/valuation.markPositions` — one implementation of "what is this holding worth right now",
+    read by the table and the map alike; `valuePortfolio` now derives from it
+  - `lib/api.ts` — `sendJson`, `watchlistEntryPath`, `describeError`, and a `readDetail` that
+    understands FastAPI's 422 array; `lib/format.ts` — `formatSignedDollars`, `formatQuantity`
+  - `state/TerminalProvider.tsx` — `trade` / `addTicker` / `removeTicker`, each refreshing every
+    panel afterwards; the history series on a 30 s poll matching the backend's snapshot task; and
+    loading/error split per resource
+  - `hooks/useApiResource.ts` — an optional `refreshMs`, for the one endpoint that grows on the
+    server's own clock; `hooks/usePriceStream.ts` — `MAX_SERIES_POINTS` 600 (the main chart draws
+    the same buffer; `Sparkline` renders the tail) and `pricedTickers`
+  - `app/page.tsx` — the three-column workstation, and selection
+  - `test/mutate.py` — taught about the frontend: 20 new mutations, run by vitest in the same
+    throwaway worktree
+  - **No backend source changed at all.** Every endpoint this checkpoint consumes shipped in
+    Checkpoints 3 and 4
+- **Exit criteria:** all six met, the five visual ones by driving a real browser against a real
+  `uvicorn` on a fresh database — not by reading the code
+  - *Clicking a watchlist row selects that ticker in the main chart* — clicking TSLA moved the
+    chart to TSLA at 249.87 with its own low/high, marked the row, and filled the trade bar
+  - *A buy updates cash, positions, heatmap and header with no reload* — 12 TSLA at 249.80: cash
+    10,000 → 7,002.40, a position row marked live at 250.11, a heatmap tile, the header total, and
+    `performance.getEntriesByType('navigation').length === 1`
+  - *The heatmap sizes by weight and colours by P&L sign, and survives an empty portfolio* — three
+    positions tiled 55.41% / 36.84% / 7.75%, summing to exactly 100% of the box against market
+    values of 3,003 / 1,997 / 420; TSLA `--color-up`, NVDA and MSFT `--color-down`. Empty renders
+    "No positions yet. The map fills in as you buy."
+  - *The P&L chart renders the series and extends as new snapshots arrive* — 23 → 24 → 25 points
+    with no trade and no reload, from the backend's 30-second task via the client poll
+  - *A rejected trade surfaces a visible error* — "Insufficient cash: AAPL x100000 at $189.93 costs
+    $18,993,000.00, but only $4,584.44 is available." in `--color-down`, cash unmoved, the order
+    kept on screen for correcting
+  - *Adding a ticker starts it streaming; removing one drops the row* — PYPL added from the panel,
+    priced at 186.86 within seconds with a sparkline accumulating; re-adding AAPL reported "AAPL is
+    already on the watchlist." and kept the symbol; removing PYPL dropped the row with the
+    positions intact and one navigation
+- **Tests:** frontend 98 → **246**, backend 717 unchanged. Both suites green three consecutive
+  times, backend a fourth under coverage at **100%**, holding the floor from Checkpoints 1–5.
+  `npm run lint`, `tsc --noEmit`, `npm run build`, `ruff check` and `ruff format --check` clean.
+  `test/smoke_frontend.sh` gained the Checkpoint 6 half — the panels in the export, the history
+  endpoint, the fill, the four rejections the UI renders differently, and the watchlist round trip
+  — and passes end to end
+
+  **20 frontend mutations run, 20 killed.** Two survived the first pass, both genuinely vacuous —
+  the **sixth checkpoint running** where that has been true:
+  - *The trade bar's in-flight guard was never reached.* The `disabled` attribute was stopping the
+    second click, so deleting `if (pending) return` changed nothing and no test noticed. Submitting
+    the form directly is the path the attribute does not cover, and it is a real one — a form with
+    inputs submits on Enter, and without the guard that is a duplicate order against live money
+  - *The poll-interval cleanup was asserted through the fetch count, which cannot see it.* A leaked
+    interval keeps firing, but `reload()` on an unmounted component sets state React discards, so
+    no request is made either way. It now asserts on `vi.getTimerCount()`
+
+  The backend's 37 mutations were re-run and all still killed
+- **Review:** `/code-review high` — **6 findings (2 MEDIUM, 4 LOW), all 6 fixed**
+  1. **MEDIUM** — the "charted ticker left the watchlist" fallback consulted `market.prices`, which
+     is append-only by design, so a removed ticker kept its last quote forever and the chart stayed
+     pinned to a frozen price with no row on screen to explain it. **The test that covered it was
+     vacuous**: it was the one test in the file that emitted no SSE frames, so `prices` was empty
+     and only the other branch ever ran. Selection now comes from the watchlist plus what is held —
+     `app.watchlist.reconcile`'s tracked set — and the test emits frames first
+  2. **MEDIUM** — `readDetail` only understood a string `detail`, but FastAPI serialises a 422 as an
+     *array* of field reports, so every validation failure rendered as "422 Unprocessable Content".
+     It now reads them as `field: message`, and both forms reject a symbol the pattern would refuse
+     before spending a round trip (`lib/ticker.ts`). The docstring's claim that the frontend renders
+     400 and 422 differently was corrected to what is true
+  3. LOW — the main chart's tone spans 600 points and the sparkline's 120, so the comment claiming
+     the two can never disagree was false. They can, and both are right; the comment says why
+  4. LOW — the ticker field reverted to the charted symbol after a fill, so a user who typed NVDA,
+     sold, then typed a new quantity and clicked Sell would have sold AAPL. Only the quantity clears
+  5. LOW — one merged `error` field put a failed portfolio read over a watchlist of live streaming
+     prices, and on a first load over the whole panel. Loading and error are now per resource
+  6. LOW — "tickers priced" counted every ticker seen since page load, over-reporting after any
+     removal — against the one distinction the feed panel exists to make. `pricedTickers` is the
+     last frame's own count
+
+  `/security-review` **run, though optional here by the gate definition** — this is the first client
+  that initiates money movement. **No HIGH or MEDIUM findings.** Cleared: `watchlistEntryPath` is
+  the only path built from user input and is `encodeURIComponent`-encoded; no `dangerouslySetInnerHTML`
+  anywhere; server-supplied `detail` text and tickers reach the DOM only as JSX text or
+  `aria-label`/`title`, all escaped by React; tile styles interpolate numbers and three literal
+  `var(--color-*)` tokens, with `squarify` filtering non-finite weights; `TradeOrder` has no `price`
+  field. `isTicker` is message quality, not a control — every symbol is re-validated at the FastAPI
+  edge and again in `app.portfolio` / `app.watchlist`
+
+  **Structure pass, inline** — the review had just covered the same diff. It confirmed the layering
+  holds: `lib` ← `hooks` ← `components` ← `state`/`app`, with no component importing the provider
+  and nothing in `lib` importing a component. Checkpoint 7 can add `sendChat` to `TerminalProvider`
+  exactly as `trade` was added and get the refresh for free
+- **Gate 3 failed twice, and both failures were invisible to the test suite.** jsdom performs no
+  layout, and the prerendered export carries no geometry, so only a real browser could see them.
+  Per the gate rules each returned to Gate 2 rather than being patched forward
+  - **Every panel had collapsed to its content height.** A `section` is a flex *item* of its column
+    wrapper, and a flex item stretches on the cross axis, not the main one — so the price chart was
+    83px inside a 924px column and the plot 19px. The panels carry `h-full`, the watchlist gets a
+    growing wrapper, and the centre column weights the chart 3:2 against the positions table
+  - **The plot was sized by its viewBox rather than by its box.** An `svg` is a replaced element
+    with an intrinsic aspect ratio; given only `h-full` and a 1:1 viewBox the browser computed a
+    square, so the series drew across 45% of a wide panel while the live-end marker — positioned in
+    CSS, not in the viewBox — sat stranded to the right of where the line stopped. The plot now has
+    its own container with both dimensions given. Measured after: 866 × 422 in a 922px container,
+    the label gutter exactly 56px, the marker on the line's end to within 2px
+- **Diverged from plan:** three, all now in the spec
+  - **§10's "canvas-based charting library preferred" was not followed.** Hand-rolled SVG instead,
+    for the reason §10 gave for wanting canvas: at 2 Hz a render is one coordinate string, and a
+    library would have added a dependency, an imperative instance to dispose of on unmount — this
+    checkpoint's stated review focus — and a jsdom shim. §10 rewritten to describe what exists,
+    including the `h-full w-full` rule the second Gate 3 failure taught
+  - **The watchlist add/remove control is Checkpoint 6's**, carried forward from Checkpoint 5. §10
+    and this checkpoint's scope and exit criteria now say so
+  - **`test/mutate.py` is no longer backend-only.** It takes `--project`, runs vitest for frontend
+    mutations, and symlinks the installed `node_modules` into the worktree rather than reinstalling
+  - No new environment variables, and no backend change of any kind
+- **Resolved from Checkpoint 5's carried-forward list:** the watchlist add/remove UI is built; the
+  positions table and heatmap name an unpriced holding rather than showing it as zero, and the
+  header still does; the main column is no longer empty, so §2's "every pixel earns its place" is
+  true for the first time. `list_trades()` is still uncalled — Checkpoint 6 was its last named
+  owner before Checkpoint 7, and no §10 component displays a trade blotter
+- **Carried forward:**
+  - **The render path is still not measured under load.** Every frame replaces `prices` and
+    `sparklines` and re-renders every consumer, and there are now six panels rather than two. It is
+    visibly fine at ten tickers and 2 Hz on a laptop, and nothing profiles it. `markPositions` is
+    memoised on `[portfolio, prices]`, which changes every frame by design
+  - **`list_trades()` has now outlived two named owners.** Checkpoint 7 surfaces it or Checkpoint 10
+    deletes it; there is no third checkpoint that would want it
+  - **Layout is verified only by hand.** The two Gate 3 failures were both CSS, both invisible to
+    jsdom, and the guard added for the second is a class assertion rather than a measurement.
+    **Checkpoint 9 owns this** — a browser assertion on the rendered plot width is one line in a
+    Playwright spec and would have caught both
+  - **`HISTORY_REFRESH_MS` is pinned to the backend's `SNAPSHOT_INTERVAL_SECONDS` by hand.** Two
+    constants in two languages with no test tying them together; if the backend's changes, the P&L
+    chart silently lags
+  - **Frontend coverage is still not measured** — no provider is installed, and the status table's
+    figure remains the backend's by definition. Checkpoint 10 should decide whether the frontend
+    needs a floor of its own
+  - The `_unsubscribe` race, a ticker staying subscribed after its position closes, the mock's
+    stop-list heuristic, and the untested prompt behaviour are all unchanged from Checkpoint 5
+  - Mutation testing found a real gap for the **sixth checkpoint running**, and for the second time
+    in TypeScript

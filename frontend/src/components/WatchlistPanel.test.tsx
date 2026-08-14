@@ -1,8 +1,9 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WatchlistPanel } from "@/components/WatchlistPanel";
 import { FLASH_MS } from "@/hooks/usePriceFlash";
+import { ApiError } from "@/lib/api";
 import { EM_DASH } from "@/lib/format";
 import { makeQuote, makeWatchlistRow } from "@/test/fixtures";
 
@@ -174,6 +175,150 @@ describe("WatchlistPanel", () => {
 
       expect(screen.getByTestId("price-AAPL")).toHaveClass("flash-up");
       expect(screen.getByTestId("price-MSFT").className).not.toMatch(/flash/);
+    });
+  });
+
+  describe("selection", () => {
+    it("charts the ticker whose row is clicked", () => {
+      const onSelect = vi.fn();
+      render(<WatchlistPanel rows={ROWS} prices={{}} sparklines={{}} onSelect={onSelect} />);
+
+      fireEvent.click(screen.getByTestId("row-MSFT"));
+
+      expect(onSelect).toHaveBeenCalledWith("MSFT");
+    });
+
+    it("offers the same selection to the keyboard, once", () => {
+      const onSelect = vi.fn();
+      render(<WatchlistPanel rows={ROWS} prices={{}} sparklines={{}} onSelect={onSelect} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "MSFT" }));
+
+      // The row handler must not fire as well, or a keyboard user selects and
+      // instantly re-selects.
+      expect(onSelect).toHaveBeenCalledTimes(1);
+      expect(onSelect).toHaveBeenCalledWith("MSFT");
+    });
+
+    it("marks the charted row", () => {
+      render(<WatchlistPanel rows={ROWS} prices={{}} sparklines={{}} selected="TSLA" />);
+
+      expect(screen.getByTestId("row-TSLA")).toHaveAttribute("data-selected", "true");
+      expect(screen.getByTestId("row-AAPL")).not.toHaveAttribute("data-selected");
+    });
+  });
+
+  describe("add and remove", () => {
+    it("adds the ticker that was typed, normalised", async () => {
+      const onAdd = vi.fn(async () => {});
+      render(<WatchlistPanel rows={ROWS} prices={{}} sparklines={{}} onAdd={onAdd} />);
+
+      fireEvent.change(screen.getByLabelText("Add ticker"), { target: { value: "pypl" } });
+      fireEvent.click(screen.getByRole("button", { name: "Add to watchlist" }));
+
+      await waitFor(() => expect(onAdd).toHaveBeenCalledWith("PYPL"));
+    });
+
+    it("clears the field on success so the next add starts empty", async () => {
+      render(
+        <WatchlistPanel rows={ROWS} prices={{}} sparklines={{}} onAdd={async () => {}} />,
+      );
+
+      fireEvent.change(screen.getByLabelText("Add ticker"), { target: { value: "PYPL" } });
+      fireEvent.click(screen.getByRole("button", { name: "Add to watchlist" }));
+
+      await waitFor(() => expect(screen.getByLabelText("Add ticker")).toHaveValue(""));
+    });
+
+    it("shows why an add was refused, and keeps the symbol for correcting", async () => {
+      // 409 duplicate, 400 list full, 503 no feed — every one of them arrives
+      // with the backend's own wording, and the user can act on all three.
+      render(
+        <WatchlistPanel
+          rows={ROWS}
+          prices={{}}
+          sparklines={{}}
+          onAdd={async () => {
+            throw new ApiError("AAPL is already on the watchlist", 409);
+          }}
+        />,
+      );
+
+      fireEvent.change(screen.getByLabelText("Add ticker"), { target: { value: "AAPL" } });
+      fireEvent.click(screen.getByRole("button", { name: "Add to watchlist" }));
+
+      expect(await screen.findByTestId("watchlist-error")).toHaveTextContent(
+        "AAPL is already on the watchlist",
+      );
+      expect(screen.getByLabelText("Add ticker")).toHaveValue("AAPL");
+    });
+
+    it("refuses a symbol the server would reject, without a round trip", async () => {
+      const onAdd = vi.fn(async () => {});
+      render(<WatchlistPanel rows={ROWS} prices={{}} sparklines={{}} onAdd={onAdd} />);
+
+      fireEvent.change(screen.getByLabelText("Add ticker"), { target: { value: "SPY500!!" } });
+      fireEvent.click(screen.getByRole("button", { name: "Add to watchlist" }));
+
+      expect(onAdd).not.toHaveBeenCalled();
+      expect(screen.getByTestId("watchlist-error")).toHaveTextContent("is not a ticker symbol");
+    });
+
+    it("does not spend a round trip on an empty field", () => {
+      const onAdd = vi.fn(async () => {});
+      render(<WatchlistPanel rows={ROWS} prices={{}} sparklines={{}} onAdd={onAdd} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "Add to watchlist" }));
+
+      expect(onAdd).not.toHaveBeenCalled();
+      expect(screen.getByTestId("watchlist-error")).toHaveTextContent("Enter a ticker to add.");
+    });
+
+    it("removes the ticker whose button is clicked, without selecting it", async () => {
+      const onRemove = vi.fn(async () => {});
+      const onSelect = vi.fn();
+      render(
+        <WatchlistPanel
+          rows={ROWS}
+          prices={{}}
+          sparklines={{}}
+          onRemove={onRemove}
+          onSelect={onSelect}
+        />,
+      );
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Remove MSFT from the watchlist" }),
+      );
+
+      await waitFor(() => expect(onRemove).toHaveBeenCalledWith("MSFT"));
+      expect(onSelect).not.toHaveBeenCalled();
+    });
+
+    it("shows why a removal was refused", async () => {
+      render(
+        <WatchlistPanel
+          rows={ROWS}
+          prices={{}}
+          sparklines={{}}
+          onRemove={async () => {
+            throw new ApiError("No market data source is running", 503);
+          }}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Remove AAPL from the watchlist" }));
+
+      expect(await screen.findByTestId("watchlist-error")).toHaveTextContent(
+        "No market data source is running",
+      );
+    });
+
+    it("offers no controls at all when the handlers are not supplied", () => {
+      render(<WatchlistPanel rows={ROWS} prices={{}} sparklines={{}} />);
+
+      expect(screen.queryByLabelText("Add ticker")).toBeNull();
+      expect(screen.queryByRole("button", { name: /Remove/ })).toBeNull();
     });
   });
 });

@@ -6,6 +6,8 @@ import {
   formatDollars,
   formatDollarsCompact,
   formatMoney,
+  formatQuantity,
+  formatSignedDollars,
   formatPercent,
   formatSigned,
   toneClass,
@@ -72,5 +74,37 @@ describe("format", () => {
     expect(laterMinute).toBe(minute);
     expect(laterSecond).toBe(second);
     expect(formatClock(null)).toBe(EM_DASH);
+  });
+});
+
+describe("formatSignedDollars", () => {
+  it("puts the sign outside the symbol", () => {
+    // `$-123.40` is what formatting a negative as a price produces, and it
+    // reads as a price rather than a loss.
+    expect(formatSignedDollars(-123.4)).toBe("-$123.40");
+    expect(formatSignedDollars(123.4)).toBe("+$123.40");
+    expect(formatSignedDollars(0)).toBe("+$0.00");
+  });
+
+  it("is a dash for an unknown P&L, not a zero", () => {
+    expect(formatSignedDollars(null)).toBe(EM_DASH);
+    expect(formatSignedDollars(undefined)).toBe(EM_DASH);
+    expect(formatSignedDollars(Number.NaN)).toBe(EM_DASH);
+  });
+});
+
+describe("formatQuantity", () => {
+  it("drops the trailing zeros of a whole share", () => {
+    expect(formatQuantity(10)).toBe("10");
+  });
+
+  it("keeps a fractional share to the precision the backend stores", () => {
+    expect(formatQuantity(0.3333)).toBe("0.3333");
+    expect(formatQuantity(1.5)).toBe("1.5");
+  });
+
+  it("is a dash for an unknown quantity", () => {
+    expect(formatQuantity(null)).toBe(EM_DASH);
+    expect(formatQuantity(Number.POSITIVE_INFINITY)).toBe(EM_DASH);
   });
 });
