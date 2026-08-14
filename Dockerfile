@@ -74,10 +74,16 @@ ENV DB_PATH=/app/db/finally.db \
 # image*, which is what makes a fresh named volume mounted over it inherit that
 # ownership — Docker copies the image directory's contents and mode into a new
 # named volume. Without this the volume arrives owned by root and the first
-# write fails with "unable to open database file".
+# write fails with "unable to open database file"; reverting this line and
+# running it is how that was checked, not by reading it.
+#
+# Only /app/db. A recursive chown of /app would rewrite the metadata of every
+# file in .venv, and a changed file is a copied file: the layer would carry a
+# second copy of the whole dependency tree. Nothing else here is written at
+# runtime, and reading a root-owned file needs no ownership.
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin finally \
     && mkdir -p /app/db \
-    && chown -R finally:finally /app
+    && chown finally:finally /app/db
 USER finally
 
 EXPOSE 8000
@@ -91,4 +97,19 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 # Exec form, so uvicorn is PID 1 and receives the SIGTERM `docker stop` sends —
 # which is what runs the lifespan's shutdown and stops the market source
 # cleanly instead of the container being killed ten seconds later.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+#
+# --timeout-graceful-shutdown is load-bearing, not tuning. Without it uvicorn
+# waits *forever* for in-flight responses, and `/api/stream/prices` is a
+# response that never ends: the SSE generator loops until the client
+# disconnects, which server shutdown does not cause. With a browser on the page
+# — the app's normal state — `docker stop` therefore logged "Waiting for
+# connections to close" and ended in SIGKILL (exit 137) with the lifespan never
+# run, the snapshot task never awaited and the market source never stopped.
+#
+# Three seconds, and the *runner* must allow at least that: measured here,
+# `docker stop` waited 1.1 s before SIGKILL, not the 10 s usually quoted. A
+# Dockerfile cannot declare its own stop timeout — there is no instruction for
+# it — so `--stop-timeout` in the scripts and `stop_grace_period` in the
+# compose file are the other half of this line, and a test pins them together.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--timeout-graceful-shutdown", "3"]

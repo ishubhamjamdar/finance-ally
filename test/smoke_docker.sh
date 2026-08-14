@@ -32,10 +32,13 @@ SKIP_BUILD=0
 TMP="$(mktemp -d)"
 CLONE="${TMP}/clone"
 
+# The container and the smoke volume go; the image stays. Removing it made
+# `--no-build` impossible — every normal run deleted the image the flag exists
+# to reuse, and start_mac.sh silently rebuilt it from the clone, which is
+# minutes of the thing that was meant to be skipped, reported as success.
 cleanup() {
-    docker rm --force "$FINALLY_CONTAINER" >/dev/null 2>&1
+    docker rm --force "$FINALLY_CONTAINER" "${FINALLY_CONTAINER}-sse" >/dev/null 2>&1
     docker volume rm "$FINALLY_VOLUME" >/dev/null 2>&1
-    [ "$SKIP_BUILD" = 0 ] && docker rmi "$FINALLY_IMAGE" >/dev/null 2>&1
     rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -137,6 +140,9 @@ echo "Exit criterion 2: the container serves the UI and the API"
 # is already on 8000.
 mapped="$(docker port "$FINALLY_CONTAINER" 8000/tcp | head -1)"
 contains "the container listens on 8000" ":${FINALLY_PORT}" "$mapped"
+# The security review's finding: an app with no login must not be published on
+# every interface. The binding, not just the port, is part of the contract.
+contains "published on loopback only" "127.0.0.1:${FINALLY_PORT}" "$mapped"
 
 check "GET /api/health" 200 "$(code "${API}/health")"
 contains "the feed is running" '"database":"ok"' "$(curl -s "${API}/health")"
@@ -201,16 +207,50 @@ check "starts with MASSIVE_API_KEY empty" 0 $?
 contains "still the simulator" "SimulatorDataSource" "$(curl -s "${API}/health")"
 
 # ---------------------------------------------------------------------------
-echo "Shutdown is graceful"
+echo "Shutdown is graceful with a price stream open"
 # ---------------------------------------------------------------------------
 # uvicorn is PID 1 by the Dockerfile's exec-form CMD, so `docker stop` reaches
-# the lifespan rather than the container being killed after the timeout.
-start_stop="$(date +%s)"
+# the lifespan rather than the container being killed after the grace period.
+#
+# **With an SSE client attached**, which is what the browser does and what the
+# first version of this check missed by testing an idle container. `/api/stream
+# /prices` is a response that never ends, and uvicorn's default is to wait for
+# in-flight responses forever: the container logged "Waiting for connections to
+# close" and died of SIGKILL with the lifespan never run. The container is
+# driven directly here rather than through stop_mac.sh, because the script
+# removes the container and the exit code is the evidence.
 "${CLONE}/scripts/stop_mac.sh" >/dev/null 2>&1
-elapsed=$(( $(date +%s) - start_stop ))
-[ "$elapsed" -lt 10 ]
-check "SIGTERM stops it inside the 10s grace period" 0 $?
+SSE="${FINALLY_CONTAINER}-sse"
+docker rm --force "$SSE" >/dev/null 2>&1
+# --stop-timeout as start_mac.sh passes it: the measured host default is ~1s,
+# which SIGKILLs the shutdown this section is checking.
+docker run --detach --name "$SSE" --publish "127.0.0.1:${FINALLY_PORT}:8000" \
+    --stop-timeout 15 "$FINALLY_IMAGE" >/dev/null
+for _ in $(seq 1 30); do
+    curl -sf --max-time 2 "${API}/health" >/dev/null 2>&1 && break
+    sleep 1
+done
 
+curl -s -N --max-time 30 "${API}/stream/prices" >/dev/null 2>&1 &
+STREAM_PID=$!
+sleep 3
+
+started="$(date +%s)"
+docker stop "$SSE" >/dev/null
+elapsed=$(( $(date +%s) - started ))
+kill "$STREAM_PID" 2>/dev/null
+
+check "the container exits cleanly, not by SIGKILL (137)" 0 \
+    "$(docker inspect --format '{{.State.ExitCode}}' "$SSE")"
+contains "the lifespan ran to completion" "Application shutdown complete" \
+    "$(docker logs "$SSE" 2>&1 | tail -5)"
+[ "$elapsed" -lt 10 ]
+check "stopped inside Docker's 10s grace period" 0 $?
+docker rm --force "$SSE" >/dev/null 2>&1
+
+echo
+echo "The ${FINALLY_IMAGE} image is kept for a --no-build re-run."
+echo "Remove it with: docker rmi ${FINALLY_IMAGE}"
 echo
 if [ "$FAILURES" -eq 0 ]; then
     echo "All checks passed."

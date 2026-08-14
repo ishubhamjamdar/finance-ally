@@ -55,6 +55,63 @@ CONTAINER_NAME = "finally"
 VOLUME_NAME = "finally-data"
 CONTAINER_PORT = "8000"
 DB_DIR = "/app/db"
+LOOPBACK = "127.0.0.1"
+
+#: What each file's publish argument must begin with. Docker reads a two-part
+#: `host:container` spec as "every interface", so the interface has to be there
+#: in the argument — which is why these are asserted against the argument
+#: itself rather than against the file containing the string somewhere.
+BIND_VARIABLE = {
+    "scripts/start_mac.sh": "${BIND}",
+    "scripts/start_windows.ps1": "${Bind}",
+    "docker-compose.yml": "${FINALLY_BIND:-127.0.0.1}",
+}
+
+#: How to find that argument in each of the three syntaxes.
+_PUBLISH_PATTERN = {
+    "scripts/start_mac.sh": r'--publish\s+"([^"]+)"',
+    "scripts/start_windows.ps1": r'"--publish",\s*"([^"]+)"',
+    "docker-compose.yml": r'^\s*-\s*"([^"]*:' + CONTAINER_PORT + r')"\s*$',
+}
+
+
+def run_instruction(dockerfile: str, contains: str) -> str:
+    """The single `RUN` instruction mentioning `contains`, and nothing after it.
+
+    A Dockerfile instruction ends at the first line that does not continue with
+    a backslash. The first version of this helper was a `.*` under `re.DOTALL`,
+    which matched from `RUN useradd` to the end of the file — so "the mkdir and
+    the chown are in this instruction, in this order" was really "they appear
+    somewhere below", and the code review caught it.
+    """
+    lines = dockerfile.splitlines()
+    starts = [i for i, line in enumerate(lines) if line.startswith("RUN") and contains in line]
+    assert len(starts) == 1, f"expected one RUN mentioning {contains!r}, found {len(starts)}"
+
+    collected = []
+    for line in lines[starts[0] :]:
+        collected.append(line)
+        if not line.rstrip().endswith("\\"):
+            break
+    return "\n".join(collected)
+
+
+def graceful_timeout(dockerfile: str) -> int | None:
+    """Seconds uvicorn is allowed to close in-flight responses, from the CMD."""
+    match = re.search(r'"--timeout-graceful-shutdown",\s*"(\d+)"', dockerfile)
+    return int(match.group(1)) if match else None
+
+
+def publish_argument(relative: str) -> str:
+    """The one port-publishing argument in `relative`.
+
+    Raises rather than returning a default if there is not exactly one: a file
+    that publishes twice, or that stopped publishing at all, is a change this
+    test must not silently accept.
+    """
+    found = re.findall(_PUBLISH_PATTERN[relative], read(relative), flags=re.MULTILINE)
+    assert len(found) == 1, f"{relative} has {len(found)} publish arguments, expected 1: {found}"
+    return found[0]
 
 
 def read(relative: str) -> str:
@@ -168,12 +225,18 @@ class TestThePersistencePathIsConsistent:
         """A fresh named volume inherits the ownership of the image directory it
         covers. Created after the chown — or not created at all — it arrives
         owned by root and the first write fails."""
-        setup = re.search(r"RUN useradd.*?\n(?:.*\\\n)*.*", dockerfile, flags=re.DOTALL)
-        assert setup, "no useradd/chown block"
-        block = setup.group(0)
-        assert f"mkdir -p {DB_DIR}" in block
-        assert "chown -R" in block
+        block = run_instruction(dockerfile, "useradd")
+        assert f"mkdir -p {DB_DIR}" in block, f"the useradd instruction does not create {DB_DIR}"
+        assert f"chown finally:finally {DB_DIR}" in block, "it is not given to the runtime user"
         assert block.index("mkdir") < block.index("chown"), "the chown must follow the mkdir"
+
+    def test_the_ownership_change_is_not_recursive_over_the_whole_image(self, dockerfile):
+        """`chown -R /app` rewrites the metadata of every file in .venv, and a
+        changed file is a copied file — the layer would carry a second copy of
+        the dependency tree. Only the database directory is written at runtime."""
+        assert "chown -R" not in dockerfile, (
+            "a recursive chown duplicates every file it touches into a new layer"
+        )
 
     def test_the_container_does_not_run_as_root(self, dockerfile):
         user = re.search(r"^USER\s+(\S+)", dockerfile, flags=re.MULTILINE)
@@ -197,6 +260,47 @@ class TestThePersistencePathIsConsistent:
         assert "volume rm" not in strip_comments(script, read(script))
 
 
+class TestShutdownReachesTheLifespan:
+    """`docker stop` sends SIGTERM and waits ten seconds before SIGKILL. Both
+    halves of getting the lifespan run inside that window are in the CMD."""
+
+    def test_the_command_is_exec_form_so_uvicorn_is_pid_one(self, dockerfile):
+        assert re.search(r"^CMD \[", dockerfile, flags=re.MULTILINE), (
+            "shell-form CMD puts /bin/sh at PID 1, and the signal never reaches uvicorn"
+        )
+
+    def test_the_server_does_not_wait_forever_for_the_price_stream(self, dockerfile):
+        """Uvicorn's default is to wait indefinitely for in-flight responses,
+        and `/api/stream/prices` is a response that never ends. With a browser
+        on the page — the normal state — `docker stop` logged "Waiting for
+        connections to close" and the container died of SIGKILL (exit 137) with
+        the lifespan never run: no snapshot task cancelled, no source stopped."""
+        assert graceful_timeout(dockerfile) is not None, (
+            "an open SSE connection would block shutdown until Docker's SIGKILL"
+        )
+
+    @pytest.mark.parametrize(
+        "relative", ["scripts/start_mac.sh", "scripts/start_windows.ps1", "docker-compose.yml"]
+    )
+    def test_the_runner_waits_longer_than_the_server_takes(self, relative, dockerfile):
+        """The two halves of a clean shutdown, in different files.
+
+        A Dockerfile cannot declare its own stop timeout, so whatever starts the
+        container has to allow at least as long as uvicorn will take. The host
+        default is not a safe assumption: measured on Docker 29 it is 1.1
+        seconds, against the 10 usually quoted, which is short enough to SIGKILL
+        the lifespan mid-shutdown.
+        """
+        body = strip_comments(relative, read(relative))
+        match = re.search(
+            r"(?:stop[-_ ]?timeout|stop[-_ ]?grace[-_ ]?period)\D{0,4}(\d+)", body, re.IGNORECASE
+        )
+        assert match, f"{relative} does not declare a stop timeout"
+        assert int(match.group(1)) >= graceful_timeout(dockerfile), (
+            f"{relative} allows {match.group(1)}s, less than uvicorn's graceful shutdown"
+        )
+
+
 class TestTheFrontDoorsAgree:
     @pytest.mark.parametrize("script", ["scripts/start_mac.sh", "scripts/start_windows.ps1"])
     def test_the_start_scripts_use_the_shared_names(self, script):
@@ -212,7 +316,46 @@ class TestTheFrontDoorsAgree:
         assert f":{CONTAINER_PORT}" in body
 
     def test_compose_publishes_the_container_port(self, compose):
-        assert re.search(rf'"\$\{{FINALLY_PORT:-{CONTAINER_PORT}\}}:{CONTAINER_PORT}"', compose)
+        assert re.search(rf'\$\{{FINALLY_PORT:-{CONTAINER_PORT}\}}:{CONTAINER_PORT}"', compose)
+
+    @pytest.mark.parametrize(
+        "relative", ["scripts/start_mac.sh", "scripts/start_windows.ps1", "docker-compose.yml"]
+    )
+    def test_the_published_port_defaults_to_loopback(self, relative):
+        """The one finding of this checkpoint's security review.
+
+        `-p 8000:8000` and Compose's `"8000:8000"` both publish on every
+        interface. FinAlly has no login by design (PLAN.md §2), so on a shared
+        network that is an open portfolio, an open watchlist, and a
+        `POST /api/chat` that spends the host's OpenRouter credits. Every
+        publish therefore carries an explicit bind address defaulting to
+        127.0.0.1, with FINALLY_BIND for the deliberate exception.
+
+        **The assertion is on the publish argument itself**, not on whether the
+        file mentions 127.0.0.1 somewhere. The first version of this test asked
+        the latter, and the code review demonstrated that reverting the publish
+        left it green: the now-dead `BIND=` line still carried both strings. A
+        test of a file's string bag cannot see which line is wired up.
+        """
+        published = publish_argument(relative)
+        assert published.endswith(f":{CONTAINER_PORT}"), (
+            f"{relative} publishes {published!r}, which does not end at the container port"
+        )
+        assert published.startswith(BIND_VARIABLE[relative]), (
+            f"{relative} publishes {published!r}, which names no interface — "
+            "a `host:container` pair binds 0.0.0.0, and an app with no login "
+            "would then be reachable from the whole network"
+        )
+
+    @pytest.mark.parametrize(
+        "relative", ["scripts/start_mac.sh", "scripts/start_windows.ps1", "docker-compose.yml"]
+    )
+    def test_the_bind_address_defaults_to_loopback_and_can_be_overridden(self, relative):
+        """The publish above names a variable; this is what the variable holds."""
+        lines = strip_comments(relative, read(relative)).splitlines()
+        assert any("FINALLY_BIND" in line and LOOPBACK in line for line in lines), (
+            f"{relative} does not default FINALLY_BIND to {LOOPBACK}"
+        )
 
     def test_compose_tolerates_a_missing_env_file(self, compose):
         """PLAN.md §11 and Checkpoint 8's last exit criterion: the app runs with

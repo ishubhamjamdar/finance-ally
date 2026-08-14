@@ -19,6 +19,20 @@ IMAGE="${FINALLY_IMAGE:-finally:latest}"
 CONTAINER="${FINALLY_CONTAINER:-finally}"
 VOLUME="${FINALLY_VOLUME:-finally-data}"
 PORT="${FINALLY_PORT:-8000}"
+# Loopback, not 0.0.0.0. `docker run -p 8000:8000` publishes on every interface,
+# and FinAlly has no login by design (PLAN.md §2) — so on a shared network that
+# would hand anyone the portfolio, the watchlist, and a POST /api/chat that
+# spends *your* OpenRouter credits. This is a localhost app; bind it there.
+# FINALLY_BIND=0.0.0.0 for the deliberate case of reaching it from elsewhere.
+BIND="${FINALLY_BIND:-127.0.0.1}"
+# How long `docker stop` waits for SIGTERM to be honoured before SIGKILL. The
+# container declares it, because the host default is not what it is usually
+# said to be: measured on Docker 29 here, it is 1.1 seconds, and the app asks
+# uvicorn for up to 3 to close an open price stream. Without this the lifespan
+# is killed mid-shutdown — the snapshot task never awaited, the source never
+# stopped — which is exactly the state the comments in stop_mac.sh describe as
+# impossible.
+STOP_TIMEOUT=15
 # Absolute, and derived from this file rather than the caller's cwd: the build
 # context is the repo root and `docker build .` from anywhere else builds the
 # wrong thing.
@@ -30,7 +44,9 @@ for arg in "$@"; do
     case "$arg" in
         --build) FORCE_BUILD=1 ;;
         --no-open) OPEN_BROWSER=0 ;;
-        -h|--help) sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        # The header down to its first blank line — a fixed line count drifts
+        # the moment a line is added, and printed `set -euo pipefail` as help.
+        -h|--help) sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "Unknown option: $arg" >&2; exit 2 ;;
     esac
 done
@@ -83,7 +99,22 @@ fi
 if [ -z "$(docker ps --quiet --filter "name=^/${CONTAINER}$")" ]; then
     # Only a listener that is not ours is a conflict; our own container was
     # handled above.
-    if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    #
+    # `lsof` is on every macOS but not on every Linux this script claims to
+    # support, and `if lsof ...` reads a missing command (127) as "the port is
+    # free" — so the guard would vanish silently on exactly the hosts that need
+    # it, leaving a raw docker error instead of these two lines. Try the other
+    # probe, and say so when neither is available.
+    port_in_use=""
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 && port_in_use=1
+    elif command -v ss >/dev/null 2>&1; then
+        ss -ltn "sport = :${PORT}" 2>/dev/null | grep -q LISTEN && port_in_use=1
+    else
+        echo "Note: no lsof or ss here, so port ${PORT} was not checked first."
+    fi
+
+    if [ -n "$port_in_use" ]; then
         echo "Port ${PORT} is already in use by another process." >&2
         echo "Free it, or choose another: FINALLY_PORT=8010 scripts/start_mac.sh" >&2
         exit 1
@@ -95,11 +126,23 @@ if [ -z "$(docker ps --quiet --filter "name=^/${CONTAINER}$")" ]; then
     echo "Starting ${CONTAINER} on port ${PORT}..."
     docker run --detach \
         --name "$CONTAINER" \
-        --publish "${PORT}:8000" \
+        --publish "${BIND}:${PORT}:8000" \
         --volume "${VOLUME}:/app/db" \
         --restart unless-stopped \
+        --stop-timeout "$STOP_TIMEOUT" \
         "${env_args[@]}" \
         "$IMAGE" >/dev/null
+fi
+
+# A container that already existed keeps the mapping it was created with, and
+# `docker start` cannot change it. Ask it which port it actually publishes,
+# rather than polling the one we would have chosen and reporting a healthy app
+# as a 60-second timeout.
+published="$(docker port "$CONTAINER" 8000/tcp 2>/dev/null | head -1 | sed 's/.*://')"
+if [ -n "$published" ] && [ "$published" != "$PORT" ]; then
+    echo "Note: the existing container publishes ${published}, not ${PORT}."
+    echo "      To move it: scripts/stop_mac.sh, then start again."
+    PORT="$published"
 fi
 
 URL="http://localhost:${PORT}"

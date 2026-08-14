@@ -39,6 +39,19 @@ $Image     = if ($env:FINALLY_IMAGE)     { $env:FINALLY_IMAGE }     else { "fina
 $Container = if ($env:FINALLY_CONTAINER) { $env:FINALLY_CONTAINER } else { "finally" }
 $Volume    = if ($env:FINALLY_VOLUME)    { $env:FINALLY_VOLUME }    else { "finally-data" }
 $Port      = if ($env:FINALLY_PORT)      { $env:FINALLY_PORT }      else { "8000" }
+# Loopback, not 0.0.0.0. `docker run -p 8000:8000` publishes on every interface,
+# and FinAlly has no login by design (PLAN.md §2) - so on a shared network that
+# would hand anyone the portfolio, the watchlist, and a POST /api/chat that
+# spends *your* OpenRouter credits. This is a localhost app; bind it there.
+# $env:FINALLY_BIND = "0.0.0.0" for the deliberate case of reaching it remotely.
+$Bind      = if ($env:FINALLY_BIND)      { $env:FINALLY_BIND }      else { "127.0.0.1" }
+# How long `docker stop` waits for SIGTERM to be honoured before SIGKILL. The
+# container declares it, because the host default is not what it is usually
+# said to be: measured on Docker 29, it is about a second, and the app asks
+# uvicorn for up to 3 to close an open price stream. Without this the lifespan
+# is killed mid-shutdown - the snapshot task never awaited, the source never
+# stopped.
+$StopTimeout = 15
 # Derived from this script's own location: the build context is the repo root,
 # and `docker build` from anywhere else builds the wrong thing.
 $Repo      = Split-Path -Parent $PSScriptRoot
@@ -112,9 +125,10 @@ if (-not (docker ps --quiet --filter "name=^/$Container$")) {
     $runArgs = @(
         "run", "--detach",
         "--name", $Container,
-        "--publish", "${Port}:8000",
+        "--publish", "${Bind}:${Port}:8000",
         "--volume", "${Volume}:/app/db",
-        "--restart", "unless-stopped"
+        "--restart", "unless-stopped",
+        "--stop-timeout", "$StopTimeout"
     )
     if (Test-Path $EnvFile) { $runArgs += @("--env-file", $EnvFile) }
     $runArgs += $Image
@@ -122,6 +136,20 @@ if (-not (docker ps --quiet --filter "name=^/$Container$")) {
     Write-Host "Starting $Container on port $Port..."
     docker @runArgs | Out-Null
     if ($LASTEXITCODE -ne 0) { Write-Error "docker run failed." }
+}
+
+# A container that already existed keeps the mapping it was created with, and
+# `docker start` cannot change it. Ask it which port it actually publishes,
+# rather than polling the one we would have chosen and reporting a healthy app
+# as a 60-second timeout.
+$publishedLine = docker port $Container 8000/tcp 2>$null | Select-Object -First 1
+if ($publishedLine) {
+    $published = $publishedLine.Split(":")[-1]
+    if ($published -and $published -ne $Port) {
+        Write-Host "Note: the existing container publishes $published, not $Port."
+        Write-Host "      To move it: .\scripts\stop_windows.ps1, then start again."
+        $Port = $published
+    }
 }
 
 $Url = "http://localhost:$Port"
