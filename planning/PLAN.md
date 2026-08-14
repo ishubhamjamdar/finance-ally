@@ -444,7 +444,24 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 - **P&L chart** — line chart showing total portfolio value over time, using data from `portfolio_snapshots`
 - **Positions table** — tabular view of all positions: ticker, quantity, avg cost, current price, unrealized P&L, % change
 - **Trade bar** — simple input area: ticker field, quantity field, buy button, sell button. Market orders, instant fill.
-- **AI chat panel** — docked/collapsible sidebar. Message input, scrolling conversation history, loading indicator while waiting for LLM response. Trade executions and watchlist changes shown inline as confirmations.
+- **AI chat panel** — docked/collapsible sidebar. Message input, scrolling conversation history, loading indicator while waiting for LLM response. Trade executions and watchlist changes shown inline as confirmations
+  - **Every action is rendered, successful or not, in the backend's own wording.**
+    The model composes its message *before* it knows whether anything cleared, so a
+    real reply reads "Buying 100000 AAPL" beside an action refused for insufficient
+    cash. The sentence stands and the outcome goes directly under it; a reply that
+    only partly executed says so with a count. A panel that showed the message
+    alone would be a transcript that lies, and the next question would be built
+    on it
+  - **A refused request and a dropped connection are different failures.**
+    `POST /api/chat` commits its trades and persists the turn *before* it responds.
+    A 503 or 422 is raised before anything executes, so the text goes back in the
+    composer to resend. A transport failure may have run to completion with only
+    the reply lost, so the panel re-reads the account, says the outcome is unknown,
+    and does **not** hand the text back — handing it back invites the user to buy
+    the same thing twice
+  - The transcript is appended from the reply rather than re-fetched, which makes
+    one rule load-bearing: **`refresh()` never reloads the chat history**, and
+    nothing may be sent before that history has settled
 - **Header** — portfolio total value (updating live), connection status indicator, cash balance
 - **Feed panel** — frames received, time of the last update, tickers priced, and the notable moves
   the SSE `event: shock` frames carry. Added at Checkpoint 5: it is what distinguishes a quiet
@@ -710,7 +727,7 @@ row to ⛔, write a log entry describing how far it got and what blocked it, and
 | 4 | LLM chat integration | 3 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #7) |
 | 5 | Frontend scaffold + live prices | 2 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #8) |
 | 6 | Charts, portfolio visualisation, trade bar | 3, 5 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #10) |
-| 7 | Chat panel | 4, 6 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 7 | Chat panel | 4, 6 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #11) |
 | 8 | Docker packaging + start/stop scripts | 7 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 9 | End-to-end test suite | 8 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 10 | Polish, docs, and release readiness | 9 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
@@ -1713,3 +1730,122 @@ defects and are now closed; the rest are restated below with what changed.
     stop-list heuristic, and the untested prompt behaviour are all unchanged from Checkpoint 5
   - Mutation testing found a real gap for the **sixth checkpoint running**, and for the second time
     in TypeScript
+
+#### Checkpoint 7 — Chat panel
+
+- **Closed:** 2026-08-14 · branch `checkpoint-7-chat-panel` · PR #11 · all four gates passed.
+  Gate 3 failed once and returned to Gate 2, as the gate rules require
+- **Built:** `frontend/src/` — the copilot, against the endpoints Checkpoint 4 shipped.
+  **No backend source changed**
+  - `components/ChatPanel.tsx` (**new**) — docked collapsible sidebar: scrolling transcript,
+    composer, loading indicator, Enter to send and Shift+Enter to break a line. Memoised, with a
+    stable `onToggle`, because its parent consumes `useMarket()` and re-renders twice a second
+  - `components/ChatActions.tsx` (**new**) — the honest half, and this checkpoint's review focus
+  - `state/TerminalProvider.tsx` — `sendChat`, the transcript (stored plus this session's turns),
+    `chatLoading` / `chatError`
+  - `lib/types.ts` — `ChatAction`, `ChatMessage`, `ChatHistoryResponse`, `ChatReply`;
+    `lib/api.ts` — the two chat endpoints
+  - `app/page.tsx` — the fourth column and the collapse
+  - `test/mutate.py` — 17 mutations for this checkpoint; `test/smoke_frontend.sh` — the
+    assistant's half, run with `LLM_MOCK=true`
+- **Exit criteria:** all five met, every one by driving a real browser against a real `uvicorn`
+  serving the built export with `LLM_MOCK=true`
+  - *Sending a message shows a loading indicator, then the response* — the mock answers in under
+    25 ms, faster than the DOM could be sampled, so the chat POST was delayed 900 ms **in the page**
+    and the state machine observed against the real bundle: "Thinking…" present throughout, the
+    message visible in the transcript the whole time, the composer cleared on the first frame, the
+    indicator gone and the reply rendered afterwards
+  - *An LLM-executed trade appears inline **and** in the portfolio panels* — "✓ buy 4 NVDA ·
+    Executed: Filled 4 NVDA at $799.33." inline, and cash $10,000 → $6,802.68, a position row
+    marked live at 799.65, a heatmap tile, and a third P&L snapshot. One navigation
+  - *An LLM watchlist addition appears in the watchlist and begins streaming* — PYPL added by the
+    assistant, eleventh row, priced at 115.17 with a sparkline accumulating
+  - *History survives a page reload* — six turns back after a fresh navigation, two executed
+    actions and one refusal, **and the refusal still reads as a refusal**
+  - *The panel collapses and expands without disturbing the rest of the layout* — the other three
+    tracks measured 320/320 before and after, the accumulated series kept growing across the
+    toggle (51 → 52 points), and one navigation throughout
+  - The honesty case, checked explicitly: asked to buy 100,000 AAPL, the model replied "Mock
+    assistant: Buying 100000 AAPL." and the refusal rendered *inside that same turn*, in red,
+    quoting the backend — with cash unmoved
+- **Tests:** frontend 246 → **289**, backend 717 unchanged. Both suites green three consecutive
+  times, backend a fourth under coverage at **100%**, holding the floor from Checkpoints 1–6.
+  Lint, `tsc --noEmit`, `npm run build`, `ruff` all clean. `test/smoke_frontend.sh` passes end to
+  end including its new assistant section
+
+  **17 mutations added, 37 frontend mutations killed in total**, and the backend's 37 re-run and
+  still killed. One survived the first pass and **the survivor was my mutation, not a test gap**:
+  it inserted `setTurns(previous => previous)`, a no-op, so it proved only that the suite tolerates
+  dead code. Rewritten to append the user's half on a failed turn — a transcript claiming a message
+  the server never saw — it is killed by "appends nothing when the turn failed". Worth recording
+  because it is the first time the mutation rather than the test was at fault, and a survivor is
+  only evidence if the mutation actually changes behaviour
+- **Review:** `/code-review high` — **7 findings (1 MEDIUM, 6 LOW), all 7 fixed**
+  1. **MEDIUM — a dropped connection was treated as proof that nothing happened.** `POST /api/chat`
+     commits its trades and persists the turn before it responds, so a reply lost in transit leaves
+     real fills on the ledger. The panel handed the text back and invited a resend — which executes
+     the trades a second time — and never reached `refresh()`, so every panel stayed stale
+     indefinitely, since only the 30-second history poll runs unattended. It now branches on
+     `ApiError`: the server's own refusals restore the text, a transport failure refreshes the
+     account and says the outcome is unknown
+  2. LOW — the stored/local merge assumed the history read settles before the first turn is sent,
+     and nothing enforced it: a turn could be *included* in a response that arrived afterwards and
+     render twice, with ids that differ by construction so no dedupe would catch it. Nothing may be
+     sent until the transcript has landed
+  3. LOW — restoring the text clobbered a follow-up typed during the turn, which is the user's
+     newer intent
+  4. LOW — the collapsed rail rendered an expand button even with no `onToggle`: a control labelled
+     "Expand the assistant" that does nothing, and the only apparent way back
+  5. LOW — the comment claimed only the assistant's grid track changed while the code swapped all
+     four. The first three are now identical in each pair, so it is true
+  6. LOW — the whole transcript rebuilt on every SSE frame. `ChatPanel` is memoised
+  7. LOW — `frontend/CLAUDE.md` still described the chat sidebar as future work, in the same commit
+     that built it
+
+  `/security-review` **run inline; no HIGH or MEDIUM findings.** This is the first checkpoint that
+  renders *model-authored* text, so that was the question asked: `grep` confirms no
+  `dangerouslySetInnerHTML`, `innerHTML`, `eval` or `javascript:` anywhere in the app; every
+  `aria-label` and inline `style` in the chat components is a literal; `content`, `summary` and
+  `detail` reach the DOM only as JSX text nodes, which React escapes; and nothing linkifies, so a
+  model cannot produce a clickable attacker-controlled URL. Prompt injection reaching the ledger is
+  bounded as Checkpoint 4 established — every action the model returns is re-validated by
+  `app.portfolio` and `app.watchlist`
+
+  **Structure pass, inline.** Layering unchanged and still one-way; `ChatPanel` takes props and
+  reads no context, so it renders in a test with fixed data and no provider
+- **Gate 3 failed once, on a defect the suite could not see.** Adding a fourth column squeezed the
+  centre: `1fr` distributes what is *left*, so three rails growing toward their maxima took the
+  space first, and at 1200px the price chart rendered in **160 pixels** with the positions table cut
+  off. `minmax(340px, 1fr)` on the centre fixes it, with roomier maxima from `xl`. Measured after,
+  with no horizontal overflow at any width: 1024px → chart 340 (464 with the assistant collapsed),
+  1200px → 380, 1680px → rails unchanged by a collapse. **This is the third layout defect in two
+  checkpoints that only a browser could find**
+- **Diverged from plan:** two, both now in the spec
+  - **§10's chat panel entry gained the three rules above** — every action rendered, the
+    refused-versus-dropped distinction, and the append-don't-refetch rule. None contradicts the
+    original text; all three are things it did not say and the implementation needed
+  - **`test/smoke_frontend.sh` now runs its server with `LLM_MOCK=true`**, which is PLAN.md §9's
+    stated purpose for the flag: deterministic, free, no API key
+  - No new environment variables, no new endpoints, no backend change
+- **Resolved from Checkpoint 6's carried-forward list:** `list_trades()` is **still uncalled** —
+  Checkpoint 7 was its last named owner and no §10 component displays a trade blotter, so it is now
+  Checkpoint 10's to delete. Said plainly rather than moved on again
+- **Carried forward:**
+  - **`list_trades()` has outlived every owner named for it.** Checkpoint 10 deletes it, or Checkpoint
+    10 explains why it is still there. There is no later checkpoint that would want it
+  - **Layout is verified only by hand, and this is now the third defect it has cost.** Checkpoints 6
+    and 7 between them shipped a collapsed panel, a square plot and a 160-pixel chart, none visible
+    to jsdom. **Checkpoint 9 owns it**: a handful of width assertions at 1024, 1280 and 1680 in a
+    Playwright spec would have caught all three
+  - **The collapsed state does not survive a reload.** Deliberate — no persistence was in scope —
+    but a user who collapses the assistant gets it back on every load
+  - **Nothing measures the transcript's cost as it grows.** `ChatPanel` is memoised, which stops it
+    rebuilding on every SSE frame, but a hundred-turn conversation has never been rendered
+  - **The optimistic message is dropped on `finally`, and the authoritative pair arrives from the
+    provider in a separate commit.** In React 19's batching these land together; nothing pins that,
+    and a future change to either side could produce a one-frame flicker
+  - The render path is still unmeasured under load, `HISTORY_REFRESH_MS` is still pinned to the
+    backend's snapshot interval by hand, and frontend coverage is still not measured — all
+    unchanged from Checkpoint 6
+  - Mutation testing found something real for the **seventh checkpoint running**, though this time
+    the fault was in the mutation
