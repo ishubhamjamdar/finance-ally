@@ -241,11 +241,22 @@ class TestSnapshotTask:
         async with app.router.lifespan_context(app):
             task = app.state.snapshot_task
             assert task is not None and not task.done()
-            await asyncio.sleep(0.05)
             # Several, not one: at 10 ms a single point would mean the loop
             # wrote its first snapshot and then stopped, which is also what a
             # loop that never got the patched interval looks like.
-            assert snapshot_count() >= 2
+            #
+            # Waited for, not slept through. This was the last "sleep 50 ms,
+            # then assert two SQLite writes landed" in the suite — the exact
+            # shape Checkpoint 5's follow-up pass converted everywhere else
+            # after it cost two checkpoints of hunting, and it survived only
+            # because the file's *other* snapshot test was the one that failed
+            # first. It failed once here, during a Gate 3 run, while the
+            # end-to-end containers were building; forty runs afterwards could
+            # not reproduce it, which is what a load-sensitive bet on the
+            # scheduler looks like.
+            assert await wait_until(lambda: snapshot_count() >= 2), (
+                f"the snapshot loop wrote {snapshot_count()} rows, expected at least 2"
+            )
 
         assert task.cancelled() or task.done()
         assert app.state.snapshot_task is None
