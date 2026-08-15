@@ -591,7 +591,25 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 
 **Infrastructure**: A separate `docker-compose.test.yml` in `test/` that spins up the app container plus a Playwright container. This keeps browser dependencies out of the production image.
 
-**Environment**: Tests run with `LLM_MOCK=true` by default for speed and determinism.
+**Two app containers, not one.** `app-shared` is mutated by every spec that trades; `app-pristine`
+is touched by nothing, and the "fresh start shows $10,000" assertions run against it. With one
+container that assertion is really "this file ran before the ones that trade" — order dependence,
+which is what this checkpoint's review is meant to eliminate rather than manage. Neither mounts a
+volume, so each `up` starts from a database the backend creates and seeds itself.
+
+**A service may not be named `app`.** `.app` is an HSTS-preloaded gTLD and Chromium matches the
+single-label hostname against it, so every navigation to `http://app:8000` is force-upgraded to
+https and fails with `ERR_SSL_PROTOCOL_ERROR` before a spec runs. The preload list is compiled into
+the browser; no flag disables it.
+
+**Environment**: Tests run with `LLM_MOCK=true` by default for speed and determinism, and both
+`OPENROUTER_API_KEY` and `MASSIVE_API_KEY` are pinned *empty* rather than left unset — an unset
+variable is inherited from whoever runs the suite, which would make a "no network" run capable of
+spending a developer's credits.
+
+**Running it**: `test/e2e.sh [runs]` wraps the compose command with `--exit-code-from playwright`,
+without which `--abort-on-container-exit` reports its own success and a suite of failing specs
+exits zero.
 
 **Key Scenarios**:
 - Fresh start: default watchlist appears, $10k balance shown, prices are streaming
@@ -748,7 +766,7 @@ row to ⛔, write a log entry describing how far it got and what blocked it, and
 | 6 | Charts, portfolio visualisation, trade bar | 3, 5 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #10) |
 | 7 | Chat panel | 4, 6 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #11) |
 | 8 | Docker packaging + start/stop scripts | 7 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #12) |
-| 9 | End-to-end test suite | 8 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 9 | End-to-end test suite | 8 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #13) |
 | 10 | Polish, docs, and release readiness | 9 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 
 Legend: ⬜ not started · 🔨 in progress · ✅ complete · ⛔ blocked
@@ -2012,3 +2030,143 @@ defects and are now closed; the rest are restated below with what changed.
     server builds their own, which the Dockerfile supports and no CI verifies
   - Mutation testing found something real for the **eighth checkpoint running**, and for the first
     time in a language that is not Python or TypeScript
+
+#### Checkpoint 9 — End-to-end test suite
+
+- **Closed:** 2026-08-15 · branch `checkpoint-9-e2e-tests` · PR #13 · all four gates passed.
+  Gate 3 caught a **backend** flake that had nothing to do with this checkpoint's code, and fixing
+  it returned to Gate 2 as the rules require
+- **Built:** `test/` — the §12 scenarios, driving the image Checkpoint 8 builds. **No application
+  source changed**
+  - `test/docker-compose.test.yml` (**new**) — `app-shared`, `app-pristine` and a Playwright
+    runner on one network. Neither app mounts a volume, so every `up` starts from a database the
+    backend creates and seeds itself; `depends_on: service_healthy` uses the image's own
+    `HEALTHCHECK` rather than a sleep
+  - `test/e2e/` (**new**) — `Dockerfile` (browsers from Microsoft's image, this suite's one
+    dependency installed from the lockfile), `.dockerignore`, `playwright.config.ts`, and seven
+    spec files: `fresh-start`, `watchlist`, `trading`, `portfolio-visualisation`, `chat`,
+    `sse-resilience`, `layout`, plus `helpers.ts`
+  - `test/e2e.sh` (**new**) — the re-runnable harness Gate 3 requires: `test/e2e.sh 3` is the exit
+    criterion, and `--exit-code-from playwright` is what makes a failing suite fail the command
+  - `backend/tests/test_e2e_harness.py` (**new**, 41 tests) — the harness's own contract
+  - `test/mutate.py` — a fourth project, `e2e`, with 14 mutations
+- **Exit criteria:** all four met
+  - *`docker compose … up --abort-on-container-exit` exits zero* — via `test/e2e.sh`, which adds
+    `--exit-code-from playwright`. Without it the command reports **its own** success and a suite
+    of failing specs exits zero; that is not a detail, it is the difference between a gate and a
+    formality
+  - *Every §12 scenario has a spec* — seven scenarios, seven files, and
+    `test_e2e_harness.py::test_the_scenario_has_a_spec` maps them one by one so a deleted file is
+    a failure rather than a smaller suite. An eighth file, `layout.spec.ts`, covers the
+    measurements Checkpoints 6 and 7 both carried forward to here
+  - *The suite passes three consecutive runs* — **37 passed** in each, 36–38 s per run
+  - *No test depends on a real OpenRouter or Massive key* — `LLM_MOCK=true`, both keys pinned
+    empty rather than unset, no `env_file`, and four harness tests hold that shut
+- **Tests:** **37 end-to-end** (new), backend 779 → **820** (+41, all harness contract), frontend
+  289 unchanged. Backend green three consecutive times and a fourth under coverage at **100%**,
+  holding the floor from Checkpoints 1–8; frontend green three consecutive times. `ruff`,
+  `ruff format`, `eslint` and `tsc --noEmit` clean
+
+  **14 e2e mutations, all killed**, after three survived the first pass — every one a test
+  satisfied by a *comment* rather than by code (`--forbid-only` named in the comment above the
+  CMD; `app-pristine` named in `PRISTINE_URL` after the service was deleted; a scenario that could
+  be `.skip`-ed while its file still existed). That is the **ninth checkpoint running** where this
+  step found something real, and the second in a row where the fault was a test reading prose.
+  The packaging (21) and backend (37) mutations were re-run and all still killed
+- **Review:** `/code-review high` — **9 findings, 8 fixed**, the ninth being Gate 4 itself, which
+  runs after Gate 3 by the gate order and is this entry
+  1. **MEDIUM — the declared 1440px viewport was dead config.** A Playwright device descriptor
+     carries its own viewport and the project's `use` wins over the top-level one, so the whole
+     suite ran at 1280 — the single width where the `xl` grid sums to exactly its minimums with
+     zero slack, while the config believed it had 200px of headroom
+  2. **MEDIUM — the "history has settled" guard could not fail.** `chat-transcript` renders while
+     the history read is still in flight, `send()` returns early during it, and Enter bypasses the
+     disabled button — so a slow read would swallow the keystroke and fail fifteen seconds later
+     on a missing loading indicator. It now waits for the placeholder to clear. This is precisely
+     the Checkpoint 7 hazard the comment beside it cited
+  3. **MEDIUM — `test/e2e/` had no `.dockerignore`.** Docker does not read `.gitignore`, so a
+     developer's host `node_modules` would be copied over the Linux tree `npm ci` had just built —
+     darwin binaries in a noble image, failing at run time, not at build
+  4. `closeAllPositions` ignored every response status, so a refused sell left a position for the
+     next spec file — order dependence manufactured by the cleanup meant to prevent it
+  5. The fabricated SSE frame sent an ISO timestamp where the wire sends epoch seconds. `isQuote`
+     accepts it, so nothing failed; the feed panel's clock read a dash off a `NaN` date
+  6. `test/e2e.sh`'s cleanup did not pass `-v` as its own header claimed, leaking one anonymous
+     volume per run
+  7. `test/e2e.sh --no-build` ran `seq 1 --no-build`, executed the loop zero times, printed
+     "0 consecutive run(s) passed" and exited **0**
+  8. Both PowerShell scripts used `docker info *> $null` under `ErrorActionPreference = "Stop"`,
+     which in PS 5.1 turns a stopped daemon into an unhandled exception instead of the documented
+     idempotent exit — the concrete thing to test first when a Windows machine is available
+
+  `/security-review` not run: optional here by the gate definition, and this checkpoint adds no
+  application code, no untrusted input path and no secret handling. What it does add is a
+  *guarantee* about secrets — the suite pins both keys empty and reads no `.env` — and that is
+  asserted by `TestTheSuiteNeedsNoSecrets` and mutation-verified.
+
+  **Structure pass, inline.** The suite depends on the application only through HTTP and the DOM,
+  which is the point of an E2E layer; the one shared piece, `specs/helpers.ts`, holds the selectors
+  and the money parsing so a spec never re-derives either
+- **The first real run failed ten of thirty-seven, and every failure was worth having**
+  - **`app` is an HSTS-preloaded gTLD.** Chromium matches the single-label hostname against the
+    `.app` entry and force-upgrades to https, so every spec against the shared container died with
+    `ERR_SSL_PROTOCOL_ERROR` before an assertion ran — while the `app-pristine` specs passed, which
+    made it look like an application fault. The preload list is compiled into the browser, so no
+    launch flag disables it. The service is `app-shared`
+  - **`context.setOffline(true)` does not drop an established event-stream**, and `usePriceStream`
+    listens to `EventSource`, not to `window`. The outage is now *served by the test*:
+    `route.fulfill` returns real frames and then ends the body, which is exactly what a
+    server-side disconnect looks like to the client, and retries are refused until the recovery
+  - **The fabricated frame used the wrong shape** — `{"prices": [...]}` where the wire sends a map
+    keyed by ticker — so `parseFrame` discarded every one and the client behaved perfectly for a
+    feed sending it nothing usable
+  - Three assumptions about the app were simply wrong, and the browser corrected them: the rails
+    are `minmax(260px, 320px)` and **do** widen when the assistant collapses; a flat series draws a
+    polyline 1.5 pixels tall, which Playwright reports as *hidden*; and with ten tickers moving
+    twice a second, "no cell is flashing" is a state a live feed never reaches
+- **Gate 3 found a flake in the *backend* suite, and it was the last of a known family.** One run
+  in roughly forty failed — the run during which the end-to-end containers were building.
+  `TestSnapshotTask::test_the_lifespan_starts_it_and_shutdown_stops_it` slept 50 ms and asserted
+  two SQLite writes had landed: the exact shape Checkpoint 5's follow-up pass converted everywhere
+  else, which survived only because the *other* snapshot test in that file failed first and got
+  the fix. Proven rather than guessed — with a 30 ms write the old form fails **5/5** and
+  `wait_until` passes **5/5**, the same controlled experiment Checkpoint 5 used.
+
+  **A process failure worth recording beside it:** the failing run was piped through `tail -1`, so
+  the test's identity was lost and forty runs could not reproduce it. Checkpoint 4's log warns
+  about exactly this, in those words, and it was repeated anyway
+- **Diverged from plan:** five, all now in the spec
+  - **Two app containers**, not one — §12 updated with why
+  - **`test/e2e.sh`** is new: Gate 3 requires a re-runnable script, and the raw compose command
+    exits zero on a failing suite
+  - **An eighth spec file beyond §12's list**, `layout.spec.ts`, discharging the carried-forward
+    item from Checkpoints 6 and 7
+  - **The harness's contract is asserted from the backend suite** (`test_e2e_harness.py`). An odd
+    home for assertions about YAML and TypeScript, and the right one: it is the suite that already
+    runs in milliseconds on every change, and the failures it guards are silent
+  - **`test/mutate.py` has a fourth project.** No new environment variables; `FINALLY_*` remain
+    script-only
+- **Resolved from Checkpoint 8's carried-forward list:** `docker compose` is now genuinely
+  exercised — this checkpoint brings up a compose stack on every run, though of the *test* file
+  rather than the production one. The Windows scripts are still parse-checked rather than run, and
+  review finding 8 above is the first concrete defect found in them by reading
+- **Carried forward:**
+  - **Severing a connection the real server is feeding is still not covered.** The suite drops the
+    stream by serving it, which the client cannot distinguish from a real disconnect — but the
+    server's own behaviour when a client vanishes mid-stream is exercised by nothing. A spec that
+    stops the container mid-run would do it and needs a Docker socket the runner deliberately does
+    not have
+  - **The stalled-but-alive feed is still not exercised end to end**, unchanged from Checkpoint
+    5's follow-up: `STALL_AFTER_MS` is 30 s of frozen prices, and nothing wedges a live process
+    from outside. The mechanism is unit-tested, contract-tested and mutation-verified
+  - **Nothing runs any of this in CI.** The repo has two Claude workflows and no test workflow, so
+    the backend suite, the frontend suite and the end-to-end suite all run only where someone types
+    the command. **Checkpoint 10 should decide** whether release readiness means a workflow
+  - **The suite runs one browser.** Chromium only, at three widths; nothing checks Firefox or
+    WebKit, where the SVG and grid behaviour this app leans on differs most
+  - **Frontend coverage is still not measured** — unchanged since Checkpoint 6, and still
+    Checkpoint 10's to decide
+  - **`list_trades()` has outlived every owner named for it** and is now unambiguously Checkpoint
+    10's to delete. The `_unsubscribe` race, a ticker staying subscribed after its position closes,
+    and the mock's stop-list heuristic are all unchanged
+  - Mutation testing found something real for the **ninth checkpoint running**
