@@ -1,0 +1,44 @@
+# Convenience wrapper (PLAN.md §11). The scripts in scripts/ are the supported
+# path; this exists for anyone who would rather type `docker compose up`.
+#
+# It deliberately shares the image name, container name, port and volume with
+# scripts/start_mac.sh, so the two are two front doors to one deployment rather
+# than two parallel ones — a trade made through compose is still there after a
+# start_mac.sh, and neither leaves a second copy of the app behind.
+
+services:
+  finally:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: finally:latest
+    container_name: finally
+    ports:
+      # FINALLY_PORT matches the scripts' override, for a host that already has
+      # something on 8000. The container port is always 8000.
+      #
+      # Bound to loopback for the same reason start_mac.sh is: Compose's
+      # shorthand publishes on every interface, and an app with no login
+      # (PLAN.md §2) reachable from the network is a portfolio anyone can trade
+      # and a /api/chat that spends your OpenRouter credits.
+      - "${FINALLY_BIND:-127.0.0.1}:${FINALLY_PORT:-8000}:8000"
+    env_file:
+      # required: false — the app runs without a .env (simulator prices, chat
+      # answering 503 until a key arrives). A missing file is a degraded
+      # feature, not a reason to refuse to start.
+      - path: .env
+        required: false
+    volumes:
+      - finally-data:/app/db
+    restart: unless-stopped
+    # The other half of the Dockerfile's --timeout-graceful-shutdown. An open
+    # `/api/stream/prices` connection makes uvicorn take up to 3 seconds to
+    # shut down, and the measured default here is ~1 second before SIGKILL —
+    # which kills the lifespan mid-shutdown.
+    stop_grace_period: 15s
+
+volumes:
+  finally-data:
+    # Without an explicit name Compose would prefix the project name and create
+    # `finally_finally-data` — a second, empty database beside the scripts' one.
+    name: finally-data

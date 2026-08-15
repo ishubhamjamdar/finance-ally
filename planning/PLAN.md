@@ -524,10 +524,24 @@ FastAPI serves the static frontend files and all API routes on port 8000.
 The SQLite database persists via a named Docker volume:
 
 ```bash
-docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
+docker run -v finally-data:/app/db -p 127.0.0.1:8000:8000 --stop-timeout 15 \
+    --env-file .env finally
 ```
 
 The `db/` directory in the project root maps to `/app/db` in the container. The backend writes `finally.db` to this path.
+
+Three details in that command line are load-bearing, and each cost a defect to learn:
+
+- **`127.0.0.1:` on the publish.** A bare `-p 8000:8000` binds every interface, and FinAlly has
+  no login by design (§2) — on a shared network that is an open portfolio and a `POST /api/chat`
+  spending the host's OpenRouter credits. `FINALLY_BIND=0.0.0.0` is the deliberate opt-out
+- **`--stop-timeout`.** `/api/stream/prices` is a response that never ends, so uvicorn is given
+  `--timeout-graceful-shutdown 3` to close it — and whatever starts the container has to allow at
+  least that. Docker's own default was measured at **1.1 s**, not the 10 s usually quoted, which
+  SIGKILLs the lifespan mid-shutdown. A Dockerfile cannot declare its own stop timeout
+- **The image runs as a non-root user that owns `/app/db` before the volume covers it.** A fresh
+  named volume inherits the ownership of the image directory it is mounted over; without that,
+  the volume arrives owned by root and the first write is `unable to open database file`
 
 ### Start/Stop Scripts
 
@@ -544,6 +558,11 @@ The `db/` directory in the project root maps to `/app/db` in the container. The 
 **`scripts/start_windows.ps1`** / **`scripts/stop_windows.ps1`**: PowerShell equivalents for Windows.
 
 All scripts should be idempotent — safe to run multiple times.
+
+Each script reads `FINALLY_IMAGE`, `FINALLY_CONTAINER`, `FINALLY_VOLUME`, `FINALLY_PORT` and
+`FINALLY_BIND`, defaulting to the names `docker-compose.yml` uses. The defaults are what makes the
+two front doors one deployment; the overrides are what lets `test/smoke_docker.sh` drive the real
+scripts end to end without stopping the instance you are using.
 
 ### Optional Cloud Deployment
 
@@ -728,7 +747,7 @@ row to ⛔, write a log entry describing how far it got and what blocked it, and
 | 5 | Frontend scaffold + live prices | 2 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #8) |
 | 6 | Charts, portfolio visualisation, trade bar | 3, 5 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #10) |
 | 7 | Chat panel | 4, 6 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #11) |
-| 8 | Docker packaging + start/stop scripts | 7 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
+| 8 | Docker packaging + start/stop scripts | 7 | ✅ | ✅ | ✅ | ✅ | 100% | ✅ Complete (PR #12) |
 | 9 | End-to-end test suite | 8 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 | 10 | Polish, docs, and release readiness | 9 | ⬜ | ⬜ | ⬜ | ⬜ | — | ⬜ Not started |
 
@@ -1849,3 +1868,147 @@ defects and are now closed; the rest are restated below with what changed.
     unchanged from Checkpoint 6
   - Mutation testing found something real for the **seventh checkpoint running**, though this time
     the fault was in the mutation
+
+#### Checkpoint 8 — Docker packaging + start/stop scripts
+
+- **Closed:** 2026-08-14 · branch `checkpoint-8-docker-packaging` · PR #12 · all four gates passed.
+  Gate 3 failed once and returned to Gate 2, as the gate rules require
+- **Built:** the single-command launch of §2, and nothing else. **No application source changed —
+  not one file under `backend/app/` or `frontend/src/`**
+  - `Dockerfile` (**new**) — two stages. Node 20 builds the static export from the lockfile;
+    Python 3.12 installs the dependencies with a pinned `uv` copied from its own image, then takes
+    the export as a directory of files. Node never reaches the runtime image. Non-root `finally`
+    (uid 10001) owning `/app/db`; `HEALTHCHECK` through the interpreter already present, so no
+    `curl` is installed; exec-form `CMD` with `--timeout-graceful-shutdown 3`
+  - `.dockerignore` (**new**) — `.env` first and foremost, then `node_modules`, `frontend/out`,
+    the database files and everything else the image neither builds nor runs
+  - `docker-compose.yml` (**new**) — the convenience wrapper, sharing the image, container,
+    volume, port and bind address with the scripts so the two are one deployment
+  - `scripts/start_mac.sh`, `scripts/stop_mac.sh`, `scripts/start_windows.ps1`,
+    `scripts/stop_windows.ps1` (**new**) — idempotent, with `FINALLY_IMAGE` / `FINALLY_CONTAINER` /
+    `FINALLY_VOLUME` / `FINALLY_PORT` / `FINALLY_BIND` overrides
+  - `.env.example` (**new**) — all seven §5 variables. Checkpoint 10's scope; see divergences
+  - `backend/tests/test_packaging.py` (**new**, 62 tests) — the packaging contract, asserted
+  - `test/smoke_docker.sh` (**new**) — Gate 3's harness: clones the branch, builds, and drives the
+    real scripts against real containers
+  - `test/mutate.py` — a third project, `packaging`, with 21 mutations killed by the tests above
+- **Exit criteria:** all five met, by `test/smoke_docker.sh` — 47 checks, 0 failures, against a
+  clean clone and real containers
+  - *`docker build .` from a clean clone with no local toolchain assumed* — `git clone` of the
+    branch into a temp directory, asserted to contain no `node_modules`, no `out/`, no `.venv` and
+    no `.env`, then built: **220 MB**
+  - *The container serves both the UI and the API on port 8000* — `/api/health`, `/api/portfolio`,
+    `/api/watchlist` and `/` all 200, the UI is the export (`FinAlly`, `src="/_next/"`), SSE frames
+    arrive. Port 8000 is the *container* port, published to a spare host port because 8000 was
+    occupied on this machine; the binding is asserted to be `127.0.0.1`
+  - *A trade survives `stop_mac.sh` then `start_mac.sh`* — 5 AAPL bought, cash 10,000 → 9,050.20,
+    the same figure and the same position after the round trip
+  - *Running each script twice in a row is safe* — second start reports "already running" and exits
+    0; second stop reports "not running" and exits 0
+  - *Starts with `MASSIVE_API_KEY` empty, and with no `.env` beyond `OPENROUTER_API_KEY`* — both,
+    plus a third case with no `.env` at all; `SimulatorDataSource` and a working trade in each
+- **Tests:** backend 717 → **779** (+62, all packaging), frontend 289 unchanged. Backend green
+  three consecutive times and a fourth under coverage at **100%**, holding the floor from
+  Checkpoints 1–7; frontend green three consecutive times. `ruff`, `ruff format`, `eslint`,
+  `tsc --noEmit` and `npm run build` all clean. Both PowerShell scripts parse clean under a real
+  `pwsh` in a container — they cannot be *run* here, which is stated plainly below
+
+  **21 packaging mutations, all killed** after two survivors were fixed. Both survivors were
+  vacuous tests, not bad mutations — the **eighth checkpoint running** where this step found
+  something real:
+  - *Deleting `--stop-timeout` from `docker run` left `STOP_TIMEOUT=15` two screens above it*, and
+    the test searched the whole file for a number. It now reads the arguments the script actually
+    passes. This is the same defect the code review had already found in the loopback test, in a
+    second place
+  - *Flipping compose's `required: false` to `true` left the phrase in the comment explaining it.*
+    The test now strips comments first
+
+  The backend's 37 mutations were re-run and all still killed
+- **Review:** `/code-review high` — **7 findings (3 MEDIUM, 4 LOW), all 7 fixed**
+  1. **MEDIUM — an open SSE connection blocked shutdown until SIGKILL.** Uvicorn waits forever for
+     in-flight responses by default, and `/api/stream/prices` never ends: the SSE generator loops
+     until the *client* disconnects, which server shutdown does not cause. Reproduced with a stream
+     attached — "Waiting for connections to close", **exit 137**, the lifespan never run, the
+     snapshot task never awaited, the source never stopped. The reviewer noted the smoke check
+     passed only because it tested an idle container. Fixed with
+     `--timeout-graceful-shutdown 3`, and then **the fix was not enough**: `docker stop` on this
+     host was measured at **1.1 s** of grace, not 10, so the container declares its own
+     `--stop-timeout 15` (`stop_grace_period: 15s` in compose). Verified after: exit **0**,
+     "Application shutdown complete", 3.7 s. The smoke check now holds a stream open
+  2. **MEDIUM — `chown -R finally:finally /app` duplicated `.venv` into a layer.** A changed file
+     is a copied file, so the image carried the dependency tree twice. Only `/app/db` is written at
+     runtime: **309 MB → 220 MB**
+  3. **MEDIUM — the loopback test could not fail.** Reverting the publish left the now-dead `BIND=`
+     line carrying both `127.0.0.1` and `FINALLY_BIND`, so a test of the file's string bag stayed
+     green against the exact regression the security review had just found. It now parses the
+     publish argument itself
+  4. LOW — the `useradd` "block" regex was `.*` under `DOTALL` and matched to end of file, so "the
+     mkdir precedes the chown *in this instruction*" was really "they appear somewhere below"
+  5. LOW — `--help` printed a line of the script's own code (`set -euo pipefail`)
+  6. LOW — `smoke_docker.sh`'s cleanup deleted the image that `--no-build` exists to reuse, so the
+     documented fast path silently rebuilt every time and still reported success
+  7. LOW — the port-conflict guard read a missing `lsof` (exit 127) as "the port is free", so it
+     vanished silently on the Linux hosts the script claims to support. `ss` is tried next, and a
+     host with neither is told the check was skipped
+
+  `/security-review` **run and required for this checkpoint. One finding, fixed.** Every publish
+  bound `0.0.0.0`: `docker run -p 8000:8000` and Compose's shorthand both do, and FinAlly has no
+  login by design, so on any shared network that exposed the portfolio, the watchlist and a
+  `POST /api/chat` that spends the host's OpenRouter credits. All three publishes now default to
+  `127.0.0.1` with `FINALLY_BIND` to opt out — verified in the smoke run against `docker port`,
+  and mutation-verified in all three files. Also cleared: no secret enters the build context or the
+  image (asserted against `docker history` and the running filesystem), the image runs as uid
+  10001, and `NEXT_PUBLIC_API_BASE` is pinned empty in the build stage
+
+  **Structure pass, inline** — no new modules or layers, so the question was what Checkpoint 9
+  needs from this image. Verified rather than assumed: it runs with **no volume** (an ephemeral
+  database per test run), `LLM_MOCK=true` passes through `--env-file`/`-e` and the mock executed a
+  trade, and the `HEALTHCHECK` reports `healthy` — so `docker-compose.test.yml` can use
+  `depends_on: condition: service_healthy` instead of a sleep or a polling loop
+- **Gate 3 failed once, on a defect only a real run could find.** `start_mac.sh` aborted with exit
+  1 on any machine with no `.env` — a new user's first run, and this checkpoint's last exit
+  criterion. macOS ships **bash 3.2**, where expanding an *empty* array under `set -u` is an
+  "unbound variable" error, and `env_args` is empty exactly when there is no `.env` to pass. Every
+  hand-run until then happened to have one; the smoke script runs from a clone that does not. The
+  same run exposed a vacuous check of its own — "cash survived the restart" compared the empty
+  string to the empty string and reported ok inside a run of nineteen failures, so `check` now
+  fails when both sides are empty. Per the gate rules this returned to Gate 2 rather than being
+  patched forward
+- **Diverged from plan:** five, all now in the spec
+  - **`.env.example` is Checkpoint 8's, not Checkpoint 10's.** The README has referenced it since
+    before this checkpoint, both start scripts point at it when `.env` is missing, and
+    `.dockerignore` has to make an exception for it. Checkpoint 10 still owns the README pass
+  - **Every publish binds loopback by default** — §11's `-p 8000:8000` is now
+    `-p 127.0.0.1:8000:8000`, for the security reason above
+  - **`--stop-timeout` / `stop_grace_period` and `--timeout-graceful-shutdown`** are new, and §11
+    records why: without them the lifespan is killed mid-shutdown whenever a browser is on the page
+  - **The image runs as a non-root user and carries a `HEALTHCHECK`**; §11 described neither
+  - **`test/mutate.py` gained a third project.** Packaging mutations are killed by
+    `tests/test_packaging.py`, which reads the worktree through `app.paths.REPO_ROOT`
+  - No new *application* environment variables. `FINALLY_*` are read by the scripts and the compose
+    file, never by the app
+- **Resolved from Checkpoint 7's carried-forward list:** none of it belonged to this checkpoint.
+  `list_trades()` is still uncalled and is now unambiguously Checkpoint 10's to delete; the layout
+  is still verified only by hand and is still Checkpoint 9's; the collapsed chat state still does
+  not survive a reload; nothing yet measures the transcript's cost or the render path under load
+- **Carried forward:**
+  - **The Windows scripts are parse-checked, not run.** Both parse clean under a real `pwsh`, and
+    they are line-for-line twins of the shell versions, but no Windows host has executed them. The
+    bash 3.2 defect is exactly the kind of thing that parse-checking does not catch, and PowerShell
+    5.1 is the version most likely to differ. **Anyone with a Windows machine should run both
+    twice before Checkpoint 10 closes**
+  - **The 1.1-second `docker stop` grace is a measurement of this host, not a constant.** The fix
+    does not depend on it — the container declares 15 s — but the *number in the comments* does,
+    and a reader on a host with the usual 10 s default will find it surprising
+  - **`docker compose` is validated but never brought up.** `docker compose config` resolves and
+    the file is asserted to agree with the scripts on all five names, but Gate 3 drove the scripts;
+    nothing has run `docker compose up` end to end. Checkpoint 9 builds a second compose file and
+    should exercise this one while it is there
+  - **Nothing pins the base images by digest.** `node:20-slim`, `python:3.12-slim` and the `uv`
+    image are tag-pinned, so a rebuild months from now is not byte-identical. Deliberate for a
+    course project; worth a line in Checkpoint 10's README
+  - **The image is built for one architecture — whatever built it.** Every run here was
+    linux/arm64. Nothing produces a multi-arch image, so a student on an Intel Mac or an amd64
+    server builds their own, which the Dockerfile supports and no CI verifies
+  - Mutation testing found something real for the **eighth checkpoint running**, and for the first
+    time in a language that is not Python or TypeScript

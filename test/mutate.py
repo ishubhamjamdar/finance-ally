@@ -9,7 +9,7 @@ why the step survives being scoped down but must not be skipped.
     test/mutate.py                    # run every mutation for this checkpoint
     test/mutate.py --list             # show them without running anything
     test/mutate.py -k watchlist       # only mutations whose name matches
-    test/mutate.py --project frontend # only one side of the app
+    test/mutate.py --project frontend # one side: backend, frontend or packaging
 
 **It runs in a throwaway `git worktree`, never your working tree.** An earlier
 harness edited files in place and restored them in a `finally` — which a
@@ -371,6 +371,96 @@ FRONTEND_MUTATIONS: list[tuple[str, str, str, str]] = [
 ]
 
 
+#: (name, file relative to the *repo root*, snippet, replacement) — Checkpoint 8.
+#:
+#: The packaging files are not code, and the thing that kills these is
+#: `tests/test_packaging.py`. That is the point: Checkpoint 8's failures are
+#: silent — a baked secret, a database written outside the volume, two front
+#: doors with two databases — so the only question worth asking of those tests
+#: is whether they can fail at all.
+#:
+#: `app.paths.REPO_ROOT` resolves to the worktree, so the tests read the mutated
+#: copies rather than yours.
+#:
+#: Three of this checkpoint's invariants are **not** here, because no unit test
+#: can see them: that a fresh named volume inherits the runtime user's ownership,
+#: that `docker stop` reaches uvicorn, and that the export in the image is the
+#: one Node just built. Those are verified against a running container by
+#: `test/smoke_docker.sh`, and the Gate 3 notes record the two experiments run
+#: by hand to prove the first two fail when reverted.
+PACKAGING_MUTATIONS: list[tuple[str, str, str, str]] = [
+    # --- the secret must not enter the build context --------------------
+    ("dockerignore: let .env into the build context",
+     ".dockerignore", "# Secrets\n.env\n", "# Secrets\n"),
+    ("dockerignore: take the committed template out with it",
+     ".dockerignore", "!.env.example", "# (no exception)"),
+    ("dockerfile: inline an API base into every user's bundle",
+     "Dockerfile", 'ENV NEXT_PUBLIC_API_BASE=""',
+     'ENV NEXT_PUBLIC_API_BASE="http://localhost:8000"'),
+
+    # --- the database must land in the volume ---------------------------
+    ("dockerfile: write the database into the image, not the mount",
+     "Dockerfile", "ENV DB_PATH=/app/db/finally.db", "ENV DB_PATH=/app/finally.db"),
+    ("dockerfile: serve the frontend from somewhere it was not copied",
+     "Dockerfile", "    STATIC_DIR=/app/static", "    STATIC_DIR=/app/frontend"),
+    ("dockerfile: never copy the export in at all",
+     "Dockerfile", "COPY --from=frontend /build/out ./static",
+     "RUN mkdir -p ./static"),
+    ("dockerfile: create the mount point after handing it over",
+     "Dockerfile",
+     "    && mkdir -p /app/db \\\n    && chown finally:finally /app/db",
+     "    && chown finally:finally /app/db \\\n    && mkdir -p /app/db"),
+    ("dockerfile: chown the whole image, duplicating .venv into a layer",
+     "Dockerfile", "chown finally:finally /app/db", "chown -R finally:finally /app"),
+    ("dockerfile: run as root",
+     "Dockerfile", "USER finally", "# USER finally"),
+
+    # --- shutdown must reach the lifespan -------------------------------
+    ("dockerfile: wait forever for the open price stream",
+     "Dockerfile",
+     'CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", \\\n'
+     '     "--timeout-graceful-shutdown", "3"]',
+     'CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]'),
+    ("start_mac: let Docker SIGKILL the shutdown it asked for",
+     "scripts/start_mac.sh", '        --stop-timeout "$STOP_TIMEOUT" \\\n', ""),
+    ("start_mac: a grace period shorter than the server takes",
+     "scripts/start_mac.sh", "STOP_TIMEOUT=15", "STOP_TIMEOUT=1"),
+    ("compose: a grace period shorter than the server takes",
+     "docker-compose.yml", "stop_grace_period: 15s", "stop_grace_period: 1s"),
+    ("start_windows: a grace period shorter than the server takes",
+     "scripts/start_windows.ps1", "$StopTimeout = 15", "$StopTimeout = 1"),
+    ("dockerfile: shell-form CMD, so /bin/sh is PID 1 and eats the SIGTERM",
+     "Dockerfile",
+     'CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", \\\n'
+     '     "--timeout-graceful-shutdown", "3"]',
+     "CMD uvicorn app.main:app --host 0.0.0.0 --port 8000"),
+
+    # --- one deployment, not two ----------------------------------------
+    ("compose: let the project name prefix the volume",
+     "docker-compose.yml", "    name: finally-data", "    # unnamed"),
+    ("compose: refuse to start without a .env",
+     "docker-compose.yml", "        required: false", "        required: true"),
+    ("stop_mac: delete the portfolio along with the container",
+     "scripts/stop_mac.sh", "docker rm \"$CONTAINER\" >/dev/null",
+     "docker rm \"$CONTAINER\" >/dev/null\ndocker volume rm finally-data >/dev/null"),
+
+    # --- the security review's finding ----------------------------------
+    ("start_mac: publish on every interface",
+     "scripts/start_mac.sh", '--publish "${BIND}:${PORT}:8000"',
+     '--publish "${PORT}:8000"'),
+    ("start_windows: publish on every interface",
+     "scripts/start_windows.ps1", '"--publish", "${Bind}:${Port}:8000",',
+     '"--publish", "${Port}:8000",'),
+    ("compose: publish on every interface",
+     "docker-compose.yml", '- "${FINALLY_BIND:-127.0.0.1}:${FINALLY_PORT:-8000}:8000"',
+     '- "${FINALLY_PORT:-8000}:8000"'),
+]
+
+#: The packaging mutations are killed by this file alone; running the rest of
+#: the suite would only add ten seconds per mutation.
+PACKAGING_TESTS = "tests/test_packaging.py"
+
+
 def build_worktree() -> pathlib.Path:
     """A clean checkout of HEAD, isolated from the working tree.
 
@@ -428,7 +518,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="show mutations without running them")
     parser.add_argument("-k", metavar="SUBSTRING", default="", help="only matching mutations")
-    parser.add_argument("--project", choices=("backend", "frontend"), help="only one side")
+    parser.add_argument(
+        "--project", choices=("backend", "frontend", "packaging"), help="only one side"
+    )
     args = parser.parse_args()
 
     # (project, name, path relative to that project, old, new, tests)
@@ -438,6 +530,11 @@ def main() -> int:
     ] + [
         ("frontend", name, path, old, new, "")
         for name, path, old, new in FRONTEND_MUTATIONS
+    ] + [
+        # Paths are relative to the repo root; the tests that kill them run
+        # from backend/, and read the worktree through app.paths.REPO_ROOT.
+        ("packaging", name, path, old, new, PACKAGING_TESTS)
+        for name, path, old, new in PACKAGING_MUTATIONS
     ]
 
     selected = [
@@ -457,7 +554,7 @@ def main() -> int:
     python = VENV_PYTHON if VENV_PYTHON.exists() else pathlib.Path(sys.executable)
 
     wanted = {project for project, *_ in selected}
-    if "backend" in wanted and not VENV_PYTHON.exists():
+    if wanted & {"backend", "packaging"} and not VENV_PYTHON.exists():
         print("No backend/.venv — run `uv sync --extra dev` in backend/ first.")
         return 1
     if "frontend" in wanted:
@@ -467,14 +564,18 @@ def main() -> int:
     if "backend" in wanted and not backend_passes(backend, "tests/", python):
         print("  FAILED — the backend suite is red before any mutation. Fix that first.")
         return 1
+    if "packaging" in wanted and not backend_passes(backend, PACKAGING_TESTS, python):
+        print("  FAILED — the packaging tests are red in the worktree. Fix that first.")
+        return 1
     if "frontend" in wanted and not frontend_passes(frontend):
         print("  FAILED — the frontend suite is red before any mutation. Fix that first.")
         return 1
     print("  ok\n")
 
     survivors: list[str] = []
+    roots = {"backend": backend, "frontend": frontend, "packaging": root}
     for project, name, relpath, old, new, tests in selected:
-        path = (backend if project == "backend" else frontend) / relpath
+        path = roots[project] / relpath
         original = path.read_text()
         if original.count(old) != 1:
             print(f"STALE     {name}: snippet appears {original.count(old)}x in {relpath}")
@@ -483,9 +584,9 @@ def main() -> int:
         path.write_text(original.replace(old, new))
         try:
             unnoticed = (
-                backend_passes(backend, tests, python)
-                if project == "backend"
-                else frontend_passes(frontend)
+                frontend_passes(frontend)
+                if project == "frontend"
+                else backend_passes(backend, tests, python)
             )
         finally:
             path.write_text(original)

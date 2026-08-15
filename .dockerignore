@@ -1,0 +1,60 @@
+# What never enters the build context.
+#
+# Two jobs, and the first one is the important one: `.env` holds
+# OPENROUTER_API_KEY, and a build context that contains it is one `COPY . .`
+# away from a secret baked into a layer that `docker history` will happily
+# print. PLAN.md §11 passes the variables in at *run* time with --env-file, so
+# the file has no business being here at all. `backend/tests/test_packaging.py`
+# asserts this pattern is present, because the failure is silent.
+#
+# The second job is size and cache churn: node_modules is ~500 MB of files the
+# builder stage reinstalls from the lockfile anyway, and a stale frontend/out
+# would be uploaded only to be overwritten by `npm run build`.
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# VCS and tooling
+.git
+.gitignore
+.github
+.claude
+.mutation-worktree
+.playwright-mcp
+
+# Python
+**/__pycache__
+**/*.py[cod]
+**/.venv
+**/.pytest_cache
+**/.ruff_cache
+**/.coverage
+**/htmlcov
+
+# Node
+**/node_modules
+frontend/out
+frontend/.next
+frontend/tsconfig.tsbuildinfo
+
+# Runtime state — the database lives in a volume, never in the image
+db/*.db
+db/*.db-wal
+db/*.db-shm
+
+# Not needed to build or run the image
+backend/tests
+backend/market_data_demo.py
+planning
+test
+scripts
+docs
+*.md
+!backend/README.md
+LICENSE
+docker-compose.yml
+Dockerfile
+.DS_Store
+**/.DS_Store
