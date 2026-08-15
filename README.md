@@ -58,6 +58,21 @@ genuinely want to reach it from another machine. `FINALLY_PORT` moves it off 800
 | `MASSIVE_API_KEY` | No | Massive (Polygon.io) key for real market data; omit to use simulator |
 | `LLM_MOCK` | No | Set `true` for deterministic mock LLM responses (testing) |
 
+## Testing
+
+```bash
+# Backend unit tests
+cd backend && uv run --extra dev pytest
+
+# Frontend component tests
+cd frontend && npm test
+
+# End-to-end, in containers: the production image plus a Playwright runner.
+# Needs no API key — it runs with LLM_MOCK=true and the market simulator.
+test/e2e.sh          # one run
+test/e2e.sh 3        # three consecutive runs
+```
+
 ## Project Structure
 
 ```
@@ -65,7 +80,7 @@ finally/
 ├── frontend/    # Next.js static export
 ├── backend/     # FastAPI uv project
 ├── planning/    # Project documentation and agent contracts
-├── test/        # Playwright E2E tests
+├── test/        # Playwright E2E suite, smoke scripts, mutation harness
 ├── db/          # SQLite volume mount (runtime)
 └── scripts/     # Start/stop helpers
 ```

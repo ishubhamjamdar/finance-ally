@@ -57,10 +57,21 @@ export default defineConfig({
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
     video: "off",
-    // The dark terminal is desktop-first (PLAN.md §2). The layout spec
-    // overrides this per test; everything else runs at a realistic desktop.
-    viewport: { width: 1440, height: 900 },
   },
 
-  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+  projects: [
+    {
+      name: "chromium",
+      use: {
+        ...devices["Desktop Chrome"],
+        // **After** the spread, not in the top-level `use`. Every device
+        // descriptor carries its own viewport — `Desktop Chrome` is 1280×720 —
+        // and the project's `use` wins, so a viewport declared above was dead
+        // config and the whole suite ran at 1280: the width where the `xl`
+        // grid sums to exactly its minimums with zero slack. The layout spec
+        // sets its own sizes per test; everything else wants headroom.
+        viewport: { width: 1440, height: 900 },
+      },
+    },
+  ],
 });

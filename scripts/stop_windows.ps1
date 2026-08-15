@@ -29,8 +29,22 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     exit 0
 }
 
-docker info *> $null
-if ($LASTEXITCODE -ne 0) {
+# try/catch, not a bare redirect. In Windows PowerShell 5.1, redirecting a
+# native command's stderr turns its output into NativeCommandError records,
+# which `$ErrorActionPreference = "Stop"` promotes to a *terminating* error —
+# so with Docker Desktop stopped this script would die with an unhandled
+# exception instead of printing the line below and exiting 0, which is exactly
+# the idempotence the header promises.
+$daemonUp = $false
+try {
+    docker info *> $null
+    $daemonUp = ($LASTEXITCODE -eq 0)
+}
+catch {
+    $daemonUp = $false
+}
+
+if (-not $daemonUp) {
     Write-Host "The Docker daemon is not running - nothing to stop."
     exit 0
 }

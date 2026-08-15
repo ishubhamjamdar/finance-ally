@@ -24,9 +24,29 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE="${REPO}/test/docker-compose.test.yml"
-RUNS="${1:-1}"
+RUNS=1
 BUILD="--build"
-[ "${2:-}" = "--no-build" ] && BUILD=""
+
+# Order-independent, and a bad argument is refused rather than absorbed. The
+# first version read the run count from $1 and the flag from $2, so
+# `test/e2e.sh --no-build` ran `seq 1 --no-build`, executed the loop body zero
+# times, printed "0 consecutive run(s) passed" and exited 0 — a green result
+# from a suite that never started.
+for arg in "$@"; do
+    case "$arg" in
+        --no-build) BUILD="" ;;
+        ''|*[!0-9]*)
+            echo "Usage: test/e2e.sh [runs] [--no-build]" >&2
+            exit 2
+            ;;
+        *) RUNS="$arg" ;;
+    esac
+done
+
+if [ "$RUNS" -lt 1 ]; then
+    echo "runs must be at least 1" >&2
+    exit 2
+fi
 
 if ! docker info >/dev/null 2>&1; then
     echo "Docker is not running." >&2
@@ -34,7 +54,12 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 cleanup() {
-    docker compose -f "$COMPOSE" down --remove-orphans >/dev/null 2>&1
+    # -v as the header says. Container removal is what gives each run a fresh
+    # database — the app services mount nothing — but the runner's anonymous
+    # node_modules volume is not a container, and without this a three-run
+    # invocation left three dangling volumes behind. The volume is recreated
+    # from the image on the next `up`, so nothing is lost by removing it.
+    docker compose -f "$COMPOSE" down --volumes --remove-orphans >/dev/null 2>&1
 }
 trap cleanup EXIT
 

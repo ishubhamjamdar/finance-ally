@@ -122,15 +122,32 @@ export function tradeStatus(page: Page): Locator {
  */
 export async function closeAllPositions(page: Page): Promise<void> {
   const response = await page.request.get("/api/portfolio");
+  expect(response.ok(), "reading the portfolio for cleanup").toBeTruthy();
+
   const portfolio = (await response.json()) as {
     positions: { ticker: string; quantity: number }[];
   };
 
   for (const position of portfolio.positions) {
-    await page.request.post("/api/portfolio/trade", {
+    const sell = await page.request.post("/api/portfolio/trade", {
       data: { ticker: position.ticker, quantity: position.quantity, side: "sell" },
     });
+
+    // Checked, not fired and forgotten. A sell can legitimately be refused —
+    // 400 for a quote that has stopped updating, 503 after a failed failover —
+    // and a silent refusal leaves the position for the next spec file, where
+    // it surfaces as a wrong quantity in a money assertion rather than as the
+    // cleanup failure it is. Order dependence is this checkpoint's review
+    // focus, and this is the helper most able to create it.
+    expect(
+      sell.ok(),
+      `cleanup sell of ${position.quantity} ${position.ticker} failed: ${sell.status()} ${await sell.text()}`,
+    ).toBeTruthy();
   }
+
+  const after = await page.request.get("/api/portfolio");
+  const remaining = ((await after.json()) as { positions: unknown[] }).positions;
+  expect(remaining, "positions left behind after cleanup").toHaveLength(0);
 }
 
 /**

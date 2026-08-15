@@ -53,7 +53,13 @@ const STREAM = "**/api/stream/prices";
  * itself.
  */
 function frame(ticker: string, price: number): string {
-  const now = new Date().toISOString();
+  // Epoch **seconds**, as `PriceUpdate.to_dict` emits and `formatClock`
+  // multiplies back up — not an ISO string. `isQuote` validates only the
+  // ticker and the price, so an ISO string is accepted and every assertion
+  // here still passes, while the feed panel's "last update" renders a dash
+  // from a NaN date. The docstring above makes the case; this is the same
+  // class of defect, one that happens not to bite.
+  const now = Date.now() / 1000;
   return `data: ${JSON.stringify({
     [ticker]: {
       ticker,

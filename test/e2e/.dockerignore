@@ -1,0 +1,13 @@
+# Docker does not read .gitignore, and `COPY . .` in the runner Dockerfile
+# happens *after* `npm ci` has installed Linux binaries into the image.
+#
+# Without this file, anyone who has run `npm install` or `npx playwright test`
+# in this directory on their own machine ships a host `node_modules` into the
+# build context, and the copy overwrites the tree npm just built — on macOS,
+# darwin binaries inside a noble image. The failure is at run time, as a module
+# that will not load, not at build.
+node_modules
+report
+playwright-report
+test-results
+.gitignore

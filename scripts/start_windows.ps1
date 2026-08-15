@@ -61,8 +61,21 @@ function Test-Docker {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
         Write-Error "Docker is not installed. Install Docker Desktop: https://docker.com/get-started"
     }
-    docker info *> $null
-    if ($LASTEXITCODE -ne 0) {
+    # try/catch, not a bare redirect: in Windows PowerShell 5.1 a native
+    # command's redirected stderr becomes NativeCommandError records, which
+    # `$ErrorActionPreference = "Stop"` promotes to a terminating error — so a
+    # stopped Docker Desktop produced an unhandled exception rather than the
+    # message below.
+    $daemonUp = $false
+    try {
+        docker info *> $null
+        $daemonUp = ($LASTEXITCODE -eq 0)
+    }
+    catch {
+        $daemonUp = $false
+    }
+
+    if (-not $daemonUp) {
         Write-Error "Docker is installed but the daemon is not running. Start Docker Desktop and try again."
     }
 }

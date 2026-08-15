@@ -22,10 +22,19 @@ test.describe("the assistant", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/");
     await waitForPrice(page, "MSFT");
+
     // Nothing may be sent before the stored transcript has landed: the panel
     // appends turns rather than re-fetching, and a turn sent first can arrive
     // inside a history response and render twice (Checkpoint 7, review #2).
+    //
+    // Waiting for `chat-transcript` to be visible does **not** establish that
+    // — the container renders unconditionally, including while the history
+    // read is still in flight. `send()` returns early while `loading` is true
+    // and Enter bypasses the disabled attribute, so a slow history read would
+    // swallow the keystroke and fail fifteen seconds later on a missing
+    // loading indicator. The placeholder is the state that actually clears.
     await expect(page.getByTestId("chat-transcript")).toBeVisible();
+    await expect(page.getByText("Loading the conversation…")).toHaveCount(0);
   });
 
   test.afterEach(async ({ page }) => {

@@ -366,8 +366,15 @@ Gate 3's two harnesses live in `test/`:
 test/smoke.sh                # every exit criterion against a real server
 LIVE_LLM=1 test/smoke.sh     # ...including one live OpenRouter call
 test/smoke_docker.sh         # the container: clean-clone build, scripts, volume, shutdown
+test/e2e.sh 3                # the §12 browser scenarios, three consecutive runs
 python3 test/mutate.py       # mutation testing, in a throwaway git worktree
 ```
+
+The end-to-end suite drives the **built image**, not a dev server, and needs no
+key: `test/docker-compose.test.yml` runs it with `LLM_MOCK=true` and the market
+simulator. It is the only place the frontend and backend are tested together,
+so a change to a response shape that both sides agree on wrongly fails here and
+nowhere else.
 
 `tests/test_packaging.py` asserts the Dockerfile, compose file and scripts against each other —
 that `.env` cannot enter the build context, that `DB_PATH` stays inside the volume mount, and that
